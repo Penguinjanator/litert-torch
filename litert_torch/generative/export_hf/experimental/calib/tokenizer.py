@@ -262,8 +262,8 @@ class LFM2VLImagePreprocessor:
         transformers_model_path
     )
     self.special_tokens = {
-        'soi': tx_tokenizer.convert_tokens_to_ids('<|image_start|>'),
-        'eoi': tx_tokenizer.convert_tokens_to_ids('<|image_end|>'),
+        'soi': tx_tokenizer.convert_tokens_to_ids('<|image_start|>'),  # pyrefly: ignore[missing-attribute]
+        'eoi': tx_tokenizer.convert_tokens_to_ids('<|image_end|>'),  # pyrefly: ignore[missing-attribute]
     }
 
   def __call__(self, image_bytes: bytes) -> dict[str, np.ndarray]:

@@ -383,11 +383,11 @@ class Executor:
     mm_embedding = None
     for i in range(num_images):
       img = decode_state.images[i]
-      img_features = self.mm_encoder_runner(
+      img_features = self.mm_encoder_runner(  # pyrefly: ignore[not-callable]
           **img,
       )
       img_features = img_features['features']
-      mm_embedding = self.mm_adapter_runner(
+      mm_embedding = self.mm_adapter_runner(  # pyrefly: ignore[not-callable]
           soft_tokens=img_features,
       )['mm_embedding']
       mm_embs.append(mm_embedding)
@@ -400,7 +400,7 @@ class Executor:
           input_embeddings,
           decode_state.index_media,
           decode_state.index_feat_in_media,
-          mm_embedding[None, ...],
+          mm_embedding[None, ...],  # pyrefly: ignore[unsupported-operation]
       )
     else:
       interleaved_embeddings = input_embeddings
@@ -447,7 +447,7 @@ class Executor:
     if time_step + input_size > self.cache_length:
       raise ValueError('Prefill chunk exceeds the cache length.')
 
-    positions = np.arange(time_step, time_step + input_size, dtype=np.int32)
+    positions = np.arange(time_step, time_step + input_size, dtype=np.int32)  # pyrefly: ignore[no-matching-overload]
 
     prefill_masks = self.prefill_mask_runners[input_size](
         time_step=np.asarray(time_step, dtype=np.int32),
@@ -455,7 +455,7 @@ class Executor:
         valid_mask=valid_mask,
     )
 
-    input_embeds = decode_state.processed_embeds[
+    input_embeds = decode_state.processed_embeds[  # pyrefly: ignore[unsupported-operation]
         :, time_step : time_step + input_size
     ]
     rope_runner = self.prefill_rope_runners[input_size]
@@ -547,7 +547,7 @@ class Executor:
     if time_step < len(decode_state.token_ids[0]):
       processed_embeds = decode_state.processed_embeds
     else:
-      processed_embeds = np.concatenate(
+      processed_embeds = np.concatenate(  # pyrefly: ignore[no-matching-overload]
           [decode_state.processed_embeds, input_embeds], axis=1
       )
 
@@ -738,7 +738,7 @@ class ConversationExecutor(Executor):
           time_step=self.decode_state.time_step,
           generate=False,
           done=False,
-          processed_embeds=self.decode_state.processed_embeds[
+          processed_embeds=self.decode_state.processed_embeds[  # pyrefly: ignore[unsupported-operation]
               :, : self.decode_state.time_step, :
           ],
           images=self.decode_state.images,
