@@ -230,6 +230,9 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
   def get_max_cache_shape(self) -> int:
     return self.max_cache_len
 
+  def get_max_length(self) -> int:
+    return self.max_cache_len
+
   @classmethod
   def _infer_cache_shape_from_config(
       cls,
@@ -412,6 +415,9 @@ class LiteRTLMConvCacheLayer(
     return 0
 
   def get_max_cache_shape(self) -> int:
+    return self.conv_kernel_size
+
+  def get_max_length(self) -> int:
     return self.conv_kernel_size
 
   @classmethod

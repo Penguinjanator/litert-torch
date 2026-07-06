@@ -1,5 +1,4 @@
-#!/usr/bin/env bash
-# Copyright 2024 The LiteRT Torch Authors.
+# Copyright 2026 The LiteRT Torch Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Main entry point for NPU packer."""
 
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+from absl import app
+from litert_torch.generative.export_hf.experimental.litert_lm_npu_compiler import litert_lm_npu_compiler
 
-IGNORE_LARGE_TESTS="--ignore-glob=*_large.py --ignore-glob=*equivalence_test.py"
-if [[ "$RUN_LARGE_TESTS" == "true" ]]; then
-  IGNORE_LARGE_TESTS=""
-fi
 
-# TODO(b/362799258) Setup CIs to test odml-torch path and remove test ignore
-PYTHONPATH=$SCRIPT_DIR:$PYTHONPATH \
-    python -m pytest $IGNORE_LARGE_TESTS $SCRIPT_DIR -n auto
+def main(argv):
+  app.run(litert_lm_npu_compiler.main, argv=argv)
+
+
+if __name__ == '__main__':
+  app.run(main)
