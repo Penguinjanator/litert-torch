@@ -56,6 +56,8 @@ def load_models(
     mm_adapter_model_path: str | None = None,
     enable_calibration: bool = False,
     enable_min_max_calibration_update: bool = True,
+    ema_smoothing_factor: float = 0.95,
+    use_profiler_based_calibration: bool = False,
 ) -> tfl_sampling_executor.TflSamplingExecutorConfig:
   """Loads the models."""
   if isinstance(model_path, tuple):
@@ -177,4 +179,6 @@ def load_models(
       mm_adapter_model_entry=mm_adapter_model_entry,
       enable_calibration=enable_calibration,
       enable_min_max_calibration_update=enable_min_max_calibration_update,
+      ema_smoothing_factor=ema_smoothing_factor,
+      use_profiler_based_calibration=use_profiler_based_calibration,
   )

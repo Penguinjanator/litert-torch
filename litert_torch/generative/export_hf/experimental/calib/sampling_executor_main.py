@@ -128,6 +128,12 @@ _ENABLE_MIN_MAX_CALIBRATION_UPDATE = flags.DEFINE_bool(
     ' model is already heavily quantized. Using min/max will help us to find'
     ' the true range for k/v cache and rope signals.',
 )
+_USE_PROFILER_BASED_CALIBRATION = flags.DEFINE_bool(
+    'use_profiler_based_calibration',
+    False,
+    'Use profiler-based calibration.',
+)
+
 
 _ENABLE_FORMATTING = flags.DEFINE_bool(
     'enable_formatting',
@@ -176,13 +182,17 @@ def main(argv: Sequence[str]) -> None:
       mm_adapter_model_path=_MM_ADAPTER_MODEL_PATH.value,
       enable_calibration=_ENABLE_CALIBRATION.value,
       enable_min_max_calibration_update=_ENABLE_MIN_MAX_CALIBRATION_UPDATE.value,
+      use_profiler_based_calibration=_USE_PROFILER_BASED_CALIBRATION.value,
   )
 
   if _ENABLE_FORMATTING.value:
     assert (
         _TRANSFORMERS_MODEL_PATH.value is not None
     ), 'Transformers model path is required for formatting.'
-    messages = [{'role': 'user', 'content': prompt}]
+    if isinstance(prompt, list) and all(isinstance(m, dict) for m in prompt):
+      messages = prompt
+    else:
+      messages = [{'role': 'user', 'content': prompt}]
     tokenizer = config.tokenizer_config.make().tx_tokenizer
     prompt = tokenizer.apply_chat_template(  # pyrefly: ignore[missing-attribute]
         messages,
