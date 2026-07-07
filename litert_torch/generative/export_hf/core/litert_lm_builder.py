@@ -231,6 +231,11 @@ def build_llm_metadata(
       else:
         sampler_params.type = sampler_params_pb2.SamplerParameters.TOP_P
 
+  if gen_config and getattr(gen_config, 'suppress_tokens', None):
+    suppress_tokens = gen_config.suppress_tokens
+    for s_token in suppress_tokens:
+      llm_metadata.suppress_tokens.ids.append(s_token)
+
   if chat_templates is not None:
     if isinstance(chat_templates, str):
       if export_config.experimental_transpile_chat_template_for_minijinja:

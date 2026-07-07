@@ -292,6 +292,8 @@ def export_text_prefill_decode_model(
         not has_dynamic_shape
     ), 'Dynamic shape is not supported for split cache.'
     model.set_attn_implementation('lrt_split_cache_attention')
+    # In case of the attn_implementation is not set.
+    model.config._attn_implementation = 'lrt_split_cache_attention'  # pylint: disable=protected-access
   else:
     model.set_attn_implementation('lrt_transposed_attention')
 
