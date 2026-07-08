@@ -132,6 +132,12 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
       ret["valid_mask"] = valid_mask
 
     cache_runtime_args = {"cache_position": input_pos}
+    if kwargs.get("apply_gpu_composites", False):
+      param_tensor = kwargs.get("param_tensor", None)
+      cache_runtime_args["apply_gpu_composites"] = True
+      cache_runtime_args["param_tensor"] = param_tensor
+      ret["apply_gpu_composites"] = True
+      ret["param_tensor"] = param_tensor
     kv_cache.set_cache_runtime_args(cache_runtime_args)
 
     ret.update({
@@ -189,6 +195,8 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
       mask,
       **kwargs,
   ):
+    if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
+      kwargs["apply_gpu_composites"] = True
     inputs = self.adapt_inputs(
         tokens,
         None,
@@ -240,6 +248,10 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
               dtype=torch.bool if use_bool_mask else torch.float32,
           ),
       }
+      if export_config.extra_kwargs.get("apply_gpu_composites", False):
+        inputs["param_tensor"] = torch.ones(
+            (1, 1, 1, 7), dtype=torch.int32
+        )
 
       inputs.update(kv_cache_inputs)
       if export_config.prefill_length_dim is not None:
@@ -271,6 +283,8 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       mask,
       **kwargs,
   ):
+    if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
+      kwargs["apply_gpu_composites"] = True
     inputs = self.adapt_inputs(
         tokens,
         None,
@@ -318,6 +332,10 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
             dtype=torch.bool if use_bool_mask else torch.float32,
         ),
     }
+    if export_config.extra_kwargs.get("apply_gpu_composites", False):
+      inputs["param_tensor"] = torch.ones(
+          (1, 1, 1, 7), dtype=torch.int32
+      )
 
     inputs.update(kv_cache_inputs)
     if export_config.cache_length_dim is not None:

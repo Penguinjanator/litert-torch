@@ -32,6 +32,8 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder(
       mask,
       **kwargs,
   ):
+    if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
+      kwargs["apply_gpu_composites"] = True
     inputs = self.adapt_inputs(
         None,
         embeddings,
@@ -76,6 +78,8 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder(
       mask,
       **kwargs,
   ):
+    if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
+      kwargs["apply_gpu_composites"] = True
     inputs = self.adapt_inputs(
         None,
         embeddings,

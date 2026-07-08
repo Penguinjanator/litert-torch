@@ -18,6 +18,7 @@ import math
 from typing import Optional
 import jaxtyping as jt
 from litert_torch.generative.custom_ops import bmm_4d as bmm_lib
+from litert_torch.generative.export_hf.experimental.composites import sdpa as gpu_sdpa
 import torch
 import torch.nn.functional as F
 import transformers
@@ -136,6 +137,29 @@ def transposed_attention(
         "Timestamp indices not passed to attention module. The model is not"
         " passing the kwargs correctly."
     )
+
+  apply_gpu_composites = kwargs.get("apply_gpu_composites", False)
+  if apply_gpu_composites:
+    is_global = kwargs.get("is_global", None)
+    if is_global is None:
+      is_sliding = getattr(module, "is_sliding", False)
+      is_global = not is_sliding
+    sdpa_out = gpu_sdpa.scaled_dot_product_attention_transposed(
+        query=query,
+        key=key,
+        value=value,
+        head_size=h,
+        k_ts_idx=key_ts_idx,
+        v_ts_idx=value_ts_idx,
+        mask=attention_mask,
+        scale=scaling,
+        softcap=softcap,
+        param_tensor=kwargs.get("param_tensor", None),
+        is_global=is_global,
+    )
+    # b, kg, t, h
+    sdpa_out = sdpa_out.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
+    return sdpa_out, None
 
   # 1, bk, gt, h
   sdpa_out = scaled_dot_product_attention_transposed(

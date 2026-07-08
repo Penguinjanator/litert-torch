@@ -25,12 +25,13 @@ Shape annotations used here:
 """
 
 import copy
-from typing import Any, Dict, List, Tuple
+from typing import List, Tuple
 
 import jaxtyping as jt
 import litert_torch.generative.custom_ops.dynamic_update_slice as tfl_dus
 from litert_torch.generative.export_hf.core import exportable_module_config
 import litert_torch.generative.export_hf.core.cache_base as cache_base_lib
+from litert_torch.generative.export_hf.experimental.composites import cache_update as gpu_cache_update
 import torch
 import torch.utils._pytree as pytree
 from transformers import cache_utils
@@ -97,6 +98,36 @@ def _update_kv_impl(
 ):
   """Updates the cache buffer using tfl.dynamic_update_slice."""
   cache_dim = 4
+
+  apply_gpu_composites = kwargs.get("apply_gpu_composites", False)
+  if apply_gpu_composites:
+    param_tensor = kwargs.get("param_tensor", None)
+    if param_tensor is not None:
+      positions = cache_position[0]
+      k_slice_indices = _get_slice_indices(
+          positions.clone(), cache_dim, k_ts_idx
+      )
+      v_slice_indices = _get_slice_indices(
+          positions.clone(), cache_dim, v_ts_idx
+      )
+      # Extract values to pass into cache_update_composite
+      _, bk_size, v_dim2, v_dim3 = value_state.shape
+      head_size = v_dim2 if v_ts_idx == 3 else v_dim3
+      cache_size = v_dim3 if v_ts_idx == 3 else v_dim2
+      k, v = gpu_cache_update.cache_update(
+          k_slice,
+          v_slice.transpose(-2, -1),
+          param_tensor,
+          key_state,
+          value_state,
+          indices_k=k_slice_indices,
+          indices_v=v_slice_indices,
+          kv_heads=bk_size,
+          kv_batch_size=1,
+          cache_len=cache_size,
+          head_size=head_size,
+      )
+      return k, v
 
   positions = cache_position[0]  # The position of the first input token.
   k_slice_indices = _get_slice_indices(positions.clone(), cache_dim, k_ts_idx)
