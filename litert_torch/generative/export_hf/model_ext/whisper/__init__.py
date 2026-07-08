@@ -12,13 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Export HF model extensions."""
 
-from litert_torch.generative.export_hf.model_ext.gemma3 import patch as _
-from litert_torch.generative.export_hf.model_ext.gemma3n import patch as _
-from litert_torch.generative.export_hf.model_ext.gemma4 import patch as _
-from litert_torch.generative.export_hf.model_ext.lfm2 import patch as _
-from litert_torch.generative.export_hf.model_ext.moonshine import patch as _
-from litert_torch.generative.export_hf.model_ext.parakeet import patch as _
-from litert_torch.generative.export_hf.model_ext.qwen3 import patch as _
-from litert_torch.generative.export_hf.model_ext.whisper import patch as _
+"""Whisper ASR model extensions."""
