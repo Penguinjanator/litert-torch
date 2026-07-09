@@ -107,7 +107,10 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
 
     ret = {}
     if embeddings is not None:
-      ret["inputs_embeds"] = embeddings
+      if self.export_config.experimental_use_fp16:
+        ret["inputs_embeds"] = embeddings.half()
+      else:
+        ret["inputs_embeds"] = embeddings
     else:
       ret["input_ids"] = tokens
 

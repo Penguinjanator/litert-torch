@@ -152,11 +152,13 @@ def patch_builtin_tuple_for_export():
 @progress.task('Load source model')
 def load_model(
     model_path: str,
+    export_config: exportable_module.ExportableModuleConfig,
     trust_remote_code: bool = False,
     auto_model_override: str | None = None,
     task: ExportTask | str = ExportTask.TEXT_GENERATION,
 ) -> SourceModelArtifacts:
   """Loads model from checkpoint."""
+  del export_config  # Unused.
 
   config = transformers.AutoConfig.from_pretrained(
       model_path,

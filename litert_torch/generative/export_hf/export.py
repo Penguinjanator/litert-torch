@@ -42,6 +42,7 @@ def run_export_tasks(
   task = export_config.task
   source_model_artifacts = export_lib.load_model(
       model_path,
+      export_config,
       trust_remote_code=trust_remote_code,
       auto_model_override=auto_model_override,
       task=task,

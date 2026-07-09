@@ -22,6 +22,7 @@ from litert_torch.generative.export_hf.experimental.composites import sdpa as gp
 import torch
 import torch.nn.functional as F
 import transformers
+from litert_torch.backend import composite
 
 
 def scaled_dot_product_attention_transposed(
@@ -88,7 +89,14 @@ def scaled_dot_product_attention_transposed(
     mask = torch.cat(mask_to_bc, dim=-2)  # 1, 1, gt, s
 
   padded_logits = logits + mask
-  probs = F.softmax(padded_logits, dim=-1).type_as(key)
+  attrs = {"axis": -1}
+  builder = composite.StableHLOCompositeBuilder(
+      name="odml.softmax", attr=attrs
+  )
+  padded_logits = builder.mark_inputs(padded_logits)
+  probs = F.softmax(padded_logits, dim=-1)
+  probs = builder.mark_outputs(probs)
+  probs = probs.type_as(key)
   if v_ts_idx == 3:
     bmm_fn = bmm_lib.bmm_4d
   else:

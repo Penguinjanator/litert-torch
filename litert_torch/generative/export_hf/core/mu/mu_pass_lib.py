@@ -74,6 +74,25 @@ try:
         out.replace_by(mean_op.results[0])
         rewriter.erase_op(mul_op)
 
+  @HFTransformersOptimize.register_rewrite_pattern(tfl.CastOp)
+  def fuse_fp32cast_fc_fp16cast(op: tfl.CastOp, rewriter) -> None:
+    """A pattern that fuse fp32 fp16 fc with cast ops."""
+
+    with mm.MatchingContext():
+      mm.match(op.name == "tfl.cast")
+      fc_op = mm.op("tfl.fully_connected", None, [op.operands[0]])
+      top_cast_op = mm.op("tfl.cast", None, [fc_op.operands[0]])
+      out = op.results[0]
+
+      with core.OpBuildingContext(op):
+        new_fc = tfl.fully_connected(
+            input=top_cast_op.operands[0],
+            filter=fc_op.operands[1],
+            bias=fc_op.operands[2] if len(fc_op.operands) > 2 else None,
+        )
+        out.replace_by(new_fc)
+        rewriter.erase_op(op)
+
 except ImportError:
   _is_mu_available = False
   MuModuleOp = Any

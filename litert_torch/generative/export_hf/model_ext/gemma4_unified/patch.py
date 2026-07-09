@@ -37,7 +37,9 @@ class Gemma4UnifiedRMSNorm(torch.nn.Module):
     self.hidden_size = dim
 
   def forward(self, hidden_states):
-    return normalization.rms_norm_with_hlfb(
+    x_dtype = hidden_states.dtype
+    hidden_states = hidden_states.float()
+    ret = normalization.rms_norm_with_hlfb(
         hidden_states,
         self.weight
         if self.with_scale
@@ -45,6 +47,7 @@ class Gemma4UnifiedRMSNorm(torch.nn.Module):
         self.variance_epsilon,
         torch.ones((self.hidden_size,), dtype=torch.float32),
     )
+    return ret.to(x_dtype)
 
   def extra_repr(self):
     return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -65,6 +68,4 @@ def gemma4_litert_patch():
     yield
   finally:
     modeling_gemma4_unified.Gemma4UnifiedRMSNorm = original_norm
-
-
 # pytype: enable=import-error

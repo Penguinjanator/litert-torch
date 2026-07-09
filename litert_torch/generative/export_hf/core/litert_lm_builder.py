@@ -380,10 +380,17 @@ def package_model(
     builder.add_hf_tokenizer(tokenizer_model_path)
   else:
     builder.add_sentencepiece_tokenizer(tokenizer_model_path)
-  builder.add_tflite_model(
-      exported_model_artifacts.prefill_decode_model_path,  # pyrefly: ignore[bad-argument-type]
-      litertlm_builder.TfLiteModelType.PREFILL_DECODE,
-  )
+  if export_config.experimental_use_fp16:
+    builder.add_tflite_model(
+        exported_model_artifacts.prefill_decode_model_path,  # pyrefly: ignore[bad-argument-type]
+        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        prefer_activation_type='fp32_fp16',
+    )
+  else:
+    builder.add_tflite_model(
+        exported_model_artifacts.prefill_decode_model_path,  # pyrefly: ignore[bad-argument-type]
+        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+    )
   if exported_model_artifacts.embedder_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.embedder_model_path,

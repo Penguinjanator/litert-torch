@@ -55,6 +55,7 @@ class ExportableModuleConfig:
   bundle_litert_lm: bool = True
   # Experimental configs
   experimental_use_mixed_precision: bool = False
+  experimental_use_fp16: bool = False
   export_vision_encoder: bool = True
   export_audio_encoder: bool = True
   input_sec: float = 1.0

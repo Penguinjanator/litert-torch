@@ -342,8 +342,11 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     k_cache_shape, v_cache_shape = cls._infer_cache_shape_from_config(
         model_config, layer_index, export_config
     )
-    keys = torch.zeros(k_cache_shape, dtype=torch.float32)
-    values = torch.zeros(v_cache_shape, dtype=torch.float32)
+    cache_dtype = (
+        torch.float16 if export_config.experimental_use_fp16 else torch.float32
+    )
+    keys = torch.zeros(k_cache_shape, dtype=cache_dtype)
+    values = torch.zeros(v_cache_shape, dtype=cache_dtype)
     return cls(
         keys,
         values,
