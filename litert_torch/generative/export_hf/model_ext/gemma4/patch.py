@@ -15,6 +15,7 @@
 """Patches for Gemma4 model for on-device deployment."""
 
 import contextlib
+from litert_torch.backend import optimization_barrier as optimization_barrier_lib
 from litert_torch.generative.export_hf.model_ext import patches as patches_lib
 from litert_torch.generative.layers import normalization
 import torch
@@ -54,6 +55,7 @@ class Gemma4RMSNorm(torch.nn.Module):
 try:
   from transformers.models.gemma4 import modeling_gemma4  # pylint: disable=g-import-not-at-top
 
+  Gemma4TextModel = modeling_gemma4.Gemma4TextModel
   Gemma4VisionEncoder = modeling_gemma4.Gemma4VisionEncoder
   Gemma4VisionPatchEmbedder = modeling_gemma4.Gemma4VisionPatchEmbedder
   Gemma4VisionPooler = modeling_gemma4.Gemma4VisionPooler
@@ -61,6 +63,7 @@ except ImportError:
   Gemma4VisionEncoder = torch.nn.Module
   Gemma4VisionPatchEmbedder = torch.nn.Module
   Gemma4VisionPooler = torch.nn.Module
+  Gemma4TextModel = torch.nn.Module
 
 
 class LiteRTGemma4VisionPatchEmbedder(Gemma4VisionPatchEmbedder):
@@ -93,6 +96,42 @@ class LiteRTGemma4VisionPatchEmbedder(Gemma4VisionPatchEmbedder):
         padding_positions.unsqueeze(-1), 0.0, position_embeddings
     )
     return position_embeddings
+
+
+class LiteRTGemma4TextModel(Gemma4TextModel):
+  """Gemma4 text model."""
+
+  def project_per_layer_inputs(
+      self,
+      inputs_embeds: torch.Tensor,
+      per_layer_inputs: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    if not self.hidden_size_per_layer_input:
+      raise RuntimeError(
+          "Attempting to call project_per_layer_inputs() from a model"
+          " initialized with a config that does not support per-layer"
+          f" embeddings. {self.config}"
+      )
+
+    per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+    per_layer_projection, _ = optimization_barrier_lib.optimization_barrier(
+        (per_layer_projection, inputs_embeds)
+    )
+    per_layer_projection *=  self.per_layer_model_projection_scale
+
+    per_layer_projection = per_layer_projection.reshape(
+        *inputs_embeds.shape[:-1],
+        self.config.num_hidden_layers,
+        self.hidden_size_per_layer_input,
+    )
+    per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+
+    if per_layer_inputs is None:
+      return per_layer_projection
+
+    return (
+        per_layer_projection + per_layer_inputs
+    ) * self.per_layer_input_scale
 
 
 class LiteRTGemma4VisionPooler(Gemma4VisionPooler):
@@ -191,6 +230,9 @@ def gemma4_litert_patch():
   original_pooler = modeling_gemma4.Gemma4VisionPooler
   modeling_gemma4.Gemma4VisionPooler = LiteRTGemma4VisionPooler
 
+  original_text_model = modeling_gemma4.Gemma4TextModel
+  modeling_gemma4.Gemma4TextModel = LiteRTGemma4TextModel
+
   try:
     yield
   finally:
@@ -198,4 +240,7 @@ def gemma4_litert_patch():
     modeling_gemma4.Gemma4VisionEncoder = original_vision_encoder
     modeling_gemma4.Gemma4VisionPatchEmbedder = original_patch_embedder
     modeling_gemma4.Gemma4VisionPooler = original_pooler
+    modeling_gemma4.Gemma4TextModel = original_text_model
+
+
 # pytype: enable=import-error
