@@ -255,6 +255,10 @@ def build_llm_metadata(
         fld.suffix = pts[1]
 
   llm_metadata.max_num_tokens = context_length
+  if export_config.llm_metadata_max_num_tokens_override:
+    llm_metadata.max_num_tokens = (
+        export_config.llm_metadata_max_num_tokens_override
+    )
 
   model_type = litert_lm_model_type_override or model.config.model_type
 
@@ -321,6 +325,8 @@ def package_model(
   litert_lm_model_type_override = export_config.litert_lm_model_type_override
   tokenizer = source_model_artifacts.tokenizer
   tokenizer_model_path = exported_model_artifacts.tokenizer_model_path
+  if export_config.tokenizer_path_override:
+    tokenizer_model_path = export_config.tokenizer_path_override
   if export_config.jinja_chat_template_override:
     if os.path.exists(export_config.jinja_chat_template_override):
       chat_templates_path = export_config.jinja_chat_template_override
