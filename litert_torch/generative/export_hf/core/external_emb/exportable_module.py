@@ -92,8 +92,16 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder(
         **kwargs,
     )
     inputs |= self.attention_kwargs()
-    output = self.model(**inputs)
-    return {"kv_cache": output.past_key_values, "logits": output.logits}
+    output = self.model(**inputs, output_hidden_states=self.export_verifier)
+    if self.export_verifier:
+      extra_outputs = {"activations": output["hidden_states"][-1]}
+    else:
+      extra_outputs = {}
+    return {
+        "kv_cache": output.past_key_values,
+        "logits": output.logits,
+        **extra_outputs,
+    }
 
   def _get_input(
       self, batch_size, decode_length, decode_length_dim, model_config

@@ -57,6 +57,11 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
   ):
     super().__init__(export_config)
     self.model = model
+    self.export_verifier = export_config.assistant_model is not None
+    if self.export_verifier:
+      self.mtp_verifier_step = export_config.mtp_verifier_step
+    else:
+      self.mtp_verifier_step = 0
 
   def adapt_inputs(
       self,
@@ -300,8 +305,17 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
         **kwargs,
     )
     inputs |= self.attention_kwargs()
-    output = self.model(**inputs)
-    return {"kv_cache": output.past_key_values, "logits": output.logits}
+    output = self.model(**inputs, output_hidden_states=self.export_verifier)
+    if self.export_verifier:
+      extra_outputs = {"activations": output["hidden_states"][-1]}
+    else:
+      extra_outputs = {}
+
+    return {
+        "kv_cache": output.past_key_values,
+        "logits": output.logits,
+        **extra_outputs,
+    }
 
   def _get_input(
       self, batch_size, decode_length, decode_length_dim, model_config
@@ -350,4 +364,32 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       decode_dynamic_shapes.update(kv_cache_dynamic_shapes)
     else:
       decode_dynamic_shapes = {}
-    return {"decode": (inputs, decode_dynamic_shapes)}
+    decode_graph = {"decode": (inputs, decode_dynamic_shapes)}
+    if self.export_verifier:
+      verify_length = self.mtp_verifier_step
+      tokens, tokens_dynamic_shape = self._get_input(
+          batch_size,
+          verify_length,
+          export_config.prefill_length_dim,
+          model_config,
+      )
+      inputs = {
+          **tokens,
+          "input_pos": torch.ones((verify_length), dtype=torch.int32),
+          "mask": torch.ones(
+              (1, 1, verify_length, cache_length), dtype=torch.bool
+          ),
+      }
+      inputs.update(kv_cache_inputs)
+      if export_config.cache_length_dim is not None:
+        decode_dynamic_shapes = {
+            **tokens_dynamic_shape,
+            "mask": {3: export_config.cache_length_dim},
+            "input_pos": None,
+        }
+        decode_dynamic_shapes.update(kv_cache_dynamic_shapes)
+      else:
+        decode_dynamic_shapes = {}
+      decode_graph["verify"] = (inputs, decode_dynamic_shapes)
+
+    return decode_graph

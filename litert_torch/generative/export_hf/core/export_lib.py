@@ -355,35 +355,36 @@ def export_text_prefill_decode_model(
             prefill_module.eval(),
             sample_kwargs=sample_prefill_inputs,
         )
-    sample_decode_inputs, decode_dynamic_shapes = (
-        decode_module.get_sample_inputs(text_model_config)['decode']
-    )
-    if has_dynamic_shape:
-      decode_ep = torch.export.export(
-          decode_module,
-          args=(),
-          kwargs=sample_decode_inputs,
-          dynamic_shapes=decode_dynamic_shapes,
-      )
+    for signature_name, (
+        sample_decode_inputs,
+        decode_dynamic_shapes,
+    ) in decode_module.get_sample_inputs(text_model_config).items():
+      if has_dynamic_shape:
+        decode_ep = torch.export.export(
+            decode_module,
+            args=(),
+            kwargs=sample_decode_inputs,
+            dynamic_shapes=decode_dynamic_shapes,
+        )
 
-      decode_ep = fx_infra.safe_run_decompositions(
-          decode_ep, fx_infra.decomp.pre_lower_decomp()
-      )
+        decode_ep = fx_infra.safe_run_decompositions(
+            decode_ep, fx_infra.decomp.pre_lower_decomp()
+        )
 
-      decode_ep = decode_ep.run_decompositions(torch_tfl.decomps)
+        decode_ep = decode_ep.run_decompositions(torch_tfl.decomps)
 
-      converter.add_signature(
-          'decode',
-          decode_ep.module(),
-          sample_kwargs=sample_decode_inputs,
-          dynamic_shapes=decode_dynamic_shapes,
-      )
-    else:
-      converter.add_signature(
-          'decode',
-          decode_module.eval(),
-          sample_kwargs=sample_decode_inputs,
-      )
+        converter.add_signature(
+            signature_name,
+            decode_ep.module(),
+            sample_kwargs=sample_decode_inputs,
+            dynamic_shapes=decode_dynamic_shapes,
+        )
+      else:
+        converter.add_signature(
+            signature_name,
+            decode_module.eval(),
+            sample_kwargs=sample_decode_inputs,
+        )
 
     with patch_builtin_tuple_for_export():
       lrt_model = converter.convert(

@@ -78,6 +78,9 @@ class ExportableModuleConfig:
   experimental_lightweight_conversion: bool = False
   experimental_transpile_chat_template_for_minijinja: bool = False
 
+  assistant_model: str | None = None
+  mtp_verifier_step: int = 5
+
   # AOT Compilation.
   aot_backend: str | None = None
   aot_soc_model: str | None = None
