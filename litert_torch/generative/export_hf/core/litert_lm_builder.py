@@ -399,6 +399,11 @@ def package_model(
         exported_model_artifacts.vision_adapter_model_path,
         litertlm_builder.TfLiteModelType.VISION_ADAPTER,
     )
+  if exported_model_artifacts.eoi_model_path:
+    builder.add_tflite_model(
+        exported_model_artifacts.eoi_model_path,
+        litertlm_builder.TfLiteModelType.END_OF_VISION,
+    )
   if exported_model_artifacts.auxiliary_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.auxiliary_model_path,

@@ -22,6 +22,7 @@ from litert_torch.generative.export_hf.model_ext.gemma3n import vision_exportabl
 from litert_torch.generative.export_hf.model_ext.gemma4 import exportable_module as gemma4_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_exportable_module as gemma4_split_cache_exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
+from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
 import transformers
 
 
@@ -75,16 +76,25 @@ def get_vision_exportables(
     return (
         gemma3_vision_exportable.LiteRTExportableModuleForGemma3VisionEncoder,
         gemma3_vision_exportable.LiteRTExportableModuleForGemma3VisionAdapter,
+        None,
     )
   elif model_config.model_type == 'gemma3n':
     return (
         gemma3n_vision_exportable.LiteRTExportableModuleForGemma3nVisionEncoder,
         gemma3n_vision_exportable.LiteRTExportableModuleForGemma3nVisionAdapter,
+        None,
     )
   elif model_config.model_type == 'gemma4':
     return (
         gemma4_vision_exportable.LiteRTExportableModuleForGemma4VisionEncoder,
         gemma4_vision_exportable.LiteRTExportableModuleForGemma4VisionAdapter,
+        None,
+    )
+  elif model_config.model_type == 'gemma4_unified':
+    return (
+        gemma4_unified_vision_exportable.LiteRTExportableModuleForGemma4UnifiedVisionEncoder,
+        None,
+        gemma4_unified_vision_exportable.LiteRTExportableModuleForGemma4UnifiedEndOfImage,
     )
   else:
     raise ValueError(f'Unsupported model type: {model_config.model_type}')
