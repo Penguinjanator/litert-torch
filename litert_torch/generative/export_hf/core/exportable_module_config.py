@@ -104,6 +104,7 @@ class ExportableModuleConfig:
         self.split_cache = False
         self.externalize_embedder = False
         self.externalize_rope = False
+        self.bundle_litert_lm = False
       case _:
         self.export_vision_encoder = False
         self.export_audio_encoder = False

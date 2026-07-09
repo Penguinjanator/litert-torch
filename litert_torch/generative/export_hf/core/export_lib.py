@@ -19,6 +19,7 @@ import dataclasses
 import gc
 import json
 import os
+from typing import Any
 
 import huggingface_hub
 from litert_torch import fx_infra
@@ -165,6 +166,18 @@ def load_model(
       dtype=torch.float32,
       trust_remote_code=trust_remote_code,
   )
+
+  if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
+    model_cls = model_ext_exportables.get_speech_model_cls(config.model_type)
+    model = model_cls(model_path, override_transformers=True)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+    return SourceModelArtifacts(
+        model=model,
+        model_config=config,
+        text_model_config=config,
+        tokenizer=tokenizer,
+    )
+
   config._attn_implementation = 'lrt_transposed_attention'  # pylint: disable=protected-access
 
   if task == ExportTask.TEXT_GENERATION:
@@ -587,6 +600,82 @@ def export_vision_encoder_models(
       vision_encoder_model_path=vision_encoder_path,
       vision_adapter_model_path=adapter_path,
       eoi_model_path=eoi_path,
+  )
+
+
+@progress.task('Export ASR models')
+def export_asr_models(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+):
+  """Exports ASR models."""
+  asr_model = source_model_artifacts.model
+  model_config = source_model_artifacts.model_config
+  quantization_recipe = export_config.quantization_recipe
+  work_dir = export_config.work_dir
+
+  exportables = model_ext_exportables.get_speech_exportables(model_config)
+  encode_module_cls = exportables[0]
+  decode_module_cls: Any = exportables[1] if len(exportables) > 1 else None
+
+  encode_module = encode_module_cls(asr_model, export_config)
+  encoder_sample_inputs_dict = encode_module.get_sample_inputs(model_config)
+  encoder_inputs, _ = encoder_sample_inputs_dict['encode']
+
+  decode_module = None
+  if decode_module_cls is not None:
+    with torch.no_grad():
+      encoder_output = encode_module(*encoder_inputs)
+    decode_module = decode_module_cls(
+        asr_model, export_config, encoder_output=encoder_output
+    )
+
+  converter = converter_utils.Converter()
+
+  converter.add_signature(
+      'encode',
+      encode_module.eval(),
+      sample_args=encoder_inputs,
+  )
+
+  if decode_module is not None:
+    decoder_sample_inputs_dict = decode_module.get_sample_inputs(model_config)
+    for signature_name, (sample_args, _) in decoder_sample_inputs_dict.items():
+      converter.add_signature(
+          signature_name,
+          decode_module.eval(),
+          sample_args=sample_args,
+      )
+
+  with patch_builtin_tuple_for_export():
+    lrt_model = converter.convert(
+        lightweight_conversion=export_config.experimental_lightweight_conversion,
+        strict_export=False,
+    )
+
+  lrt_model = mu_pass_lib.update_model(lrt_model)  # pyrefly: ignore[bad-argument-type]
+  if export_config.experimental_use_mixed_precision:
+    print('Applying mixed precision to model...')
+    lrt_model = mu_pass_lib.apply_mixed_precision(lrt_model)
+
+  model_path = os.path.join(work_dir, 'asr_model.tflite')  # pyrefly: ignore[no-matching-overload]
+  lrt_model.export(model_path)
+
+  del lrt_model
+  del converter
+  gc.collect()
+
+  quantization_recipe_list = (
+      quantization_recipe.split(',') if quantization_recipe else [None]
+  )
+  for recipe in quantization_recipe_list:
+    model_path = maybe_quantize_model(model_path, recipe)
+    gc.collect()
+
+  return dataclasses.replace(
+      exported_model_artifacts,
+      prefill_decode_model_path=model_path,
   )
 
 

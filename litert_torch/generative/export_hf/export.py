@@ -189,19 +189,24 @@ def export(
 
   # TODO(weiyiw): Move this to the exportable module config.
   export_tasks = []
-  export_tasks.append(export_lib.export_text_prefill_decode_model)
-  if export_config.aot_backend is not None:
-    export_tasks.append(export_lib.aot_compile_model)
-  if export_config.externalize_embedder:
-    export_tasks.append(export_lib.export_embedder_model)
-  if export_config.split_cache:
-    export_tasks.append(export_lib.export_auxiliary_model)
-  export_tasks.append(export_lib.export_additional_models)
-  if export_config.export_vision_encoder:
-    export_tasks.append(export_lib.export_vision_encoder_models)
-  export_tasks.append(export_lib.export_tokenizer)
-  if export_config.bundle_litert_lm:
-    export_tasks.append(litert_lm_builder.package_model)
+  if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
+    export_tasks.append(export_lib.export_asr_models)
+    if export_config.aot_backend is not None:
+      export_tasks.append(export_lib.aot_compile_model)
+  else:
+    export_tasks.append(export_lib.export_text_prefill_decode_model)
+    if export_config.aot_backend is not None:
+      export_tasks.append(export_lib.aot_compile_model)
+    if export_config.externalize_embedder:
+      export_tasks.append(export_lib.export_embedder_model)
+    if export_config.split_cache:
+      export_tasks.append(export_lib.export_auxiliary_model)
+    export_tasks.append(export_lib.export_additional_models)
+    if export_config.export_vision_encoder:
+      export_tasks.append(export_lib.export_vision_encoder_models)
+    export_tasks.append(export_lib.export_tokenizer)
+    if export_config.bundle_litert_lm:
+      export_tasks.append(litert_lm_builder.package_model)
 
   exported_model_artifacts = run_export_tasks(
       export_tasks,

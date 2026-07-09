@@ -23,6 +23,11 @@ from litert_torch.generative.export_hf.model_ext.gemma4 import exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_exportable_module as gemma4_split_cache_exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
+from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as moonshine_lib
+from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
+from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_tdt as parakeet_tdt_lib
+from litert_torch.generative.export_hf.model_ext.qwen3 import qwen3_asr as qwen3_asr_lib
+from litert_torch.generative.export_hf.model_ext.whisper import whisper as whisper_lib
 import transformers
 
 
@@ -136,3 +141,19 @@ def get_speech_exportables(
         speech_exportables.LiteRTExportableModuleForAsrEncode,
         speech_exportables.LiteRTExportableModuleForAsrDecode,
     )
+
+
+def get_speech_model_cls(model_type: str):
+  """Gets ASR model class by model type."""
+  if model_type == 'parakeet_ctc':
+    return parakeet_ctc_lib.ParakeetCTC
+  elif model_type == 'parakeet_tdt':
+    return parakeet_tdt_lib.ParakeetTDT
+  elif model_type == 'whisper':
+    return whisper_lib.Whisper
+  elif model_type == 'moonshine':
+    return moonshine_lib.Moonshine
+  elif model_type == 'qwen3_asr':
+    return qwen3_asr_lib.Qwen3Asr
+  else:
+    raise ValueError(f'Unsupported speech model type: {model_type}')
