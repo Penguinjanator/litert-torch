@@ -159,7 +159,6 @@ def load_model(
     task: ExportTask | str = ExportTask.TEXT_GENERATION,
 ) -> SourceModelArtifacts:
   """Loads model from checkpoint."""
-  del export_config  # Unused.
 
   config = transformers.AutoConfig.from_pretrained(
       model_path,
@@ -190,12 +189,18 @@ def load_model(
     auto_model_cls = transformers.__dict__[auto_model_override]
 
   with model_ext_patches.get_patch_context(config.model_type):
-    model = auto_model_cls.from_pretrained(
-        model_path,
-        config=config,
-        torch_dtype=torch.float32,
-        trust_remote_code=trust_remote_code,
-    )
+    if export_config.use_random_weights:
+      model = auto_model_cls.from_config(
+          config=config,
+          torch_dtype=torch.float32,
+          trust_remote_code=trust_remote_code)
+    else:
+      model = auto_model_cls.from_pretrained(
+          model_path,
+          config=config,
+          torch_dtype=torch.float32,
+          trust_remote_code=trust_remote_code,
+      )
 
   if task == ExportTask.TEXT_GENERATION:
     model.generation_config.cache_implementation = 'static'

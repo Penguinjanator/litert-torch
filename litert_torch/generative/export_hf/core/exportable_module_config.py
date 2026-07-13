@@ -74,6 +74,7 @@ class ExportableModuleConfig:
   sampler_temperature: float | None = None
   sampler_top_k: int | None = None
   jinja_chat_template_override: str | None = None
+  use_random_weights: bool = False
 
   experimental_lightweight_conversion: bool = False
   experimental_transpile_chat_template_for_minijinja: bool = False
