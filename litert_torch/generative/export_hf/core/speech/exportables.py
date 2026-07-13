@@ -43,7 +43,11 @@ class LiteRTExportableModuleForAsrEncode(
     processor = self.asr_model.get_processor()
     sr = processor.get_sampling_rate()
     input_sec = getattr(self.export_config, "input_sec", 1.0)
-    dummy_audio = np.zeros(int(input_sec * sr), dtype=np.float32)
+    if model_config.model_type.startswith("parakeet"):
+      duration = input_sec - 0.01  # Parakeet processor adds extra 10ms.
+    else:
+      duration = input_sec
+    dummy_audio = np.zeros(int(duration * sr), dtype=np.float32)
     processed = processor.process(dummy_audio)
     encoder_inputs = self.asr_model.get_encoder_sample_input(processed)
     return {"encode": (encoder_inputs, {})}
