@@ -23,44 +23,35 @@ import torch
 from torch.nn import functional as F
 import transformers
 
+# Fixed chunk length for Qwen3ASRAudioAttention.
+_CHUNK_LEN = 13
 
-def _apply_interleaved_mrope(
-    freqs: torch.Tensor, mrope_section: list[int]
+
+def _audio_attention_forward(
+    self, hidden_states: torch.Tensor, **kwargs
 ) -> torch.Tensor:
-  """Interleave MRoPE without in-place slice assignment for GPU inference."""
-  assert mrope_section == [24, 20, 20]
-  # freqs shape: [3, c, s, 64]
-  _, c, s, _ = freqs.shape
-  freqs_60 = freqs[:, :, :, :60]  # [3, c, s, 60]
-  freqs_t = freqs_60[0].reshape(c, s, 20, 3)
-  freqs_h = freqs_60[1].reshape(c, s, 20, 3)
-  freqs_w = freqs_60[2].reshape(c, s, 20, 3)
-  mfreqs_t = freqs_t[..., 0]  # [c, s, 20]
-  mfreqs_h = freqs_h[..., 1]  # [c, s, 20]
-  mfreqs_w = freqs_w[..., 2]  # [c, s, 20]
-  mfreqs_60 = torch.stack([mfreqs_t, mfreqs_h, mfreqs_w], dim=-1)  # [c,s,20,3]
-  mfreqs_60 = mfreqs_60.reshape(c, s, 60)  # [c, s, 60]
-  freqs_tail = freqs[0, :, :, 60:]  # [c, s, 4]
-  return torch.cat([mfreqs_60, freqs_tail], dim=-1)  # [c, s, 64]
+  """Patched Qwen3ASRAudioAttention.forward() to avoid splits and loops."""
+  seqlen, _ = hidden_states.size()
+  num_chunks = seqlen // _CHUNK_LEN
 
+  q = self.q_proj(hidden_states).reshape(seqlen, self.num_heads, -1)
+  k = self.k_proj(hidden_states).reshape(seqlen, self.num_heads, -1)
+  v = self.v_proj(hidden_states).reshape(seqlen, self.num_heads, -1)
 
-def _rotary_forward(
-    self, x: torch.Tensor, position_ids: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """Qwen3ASRThinkerTextRotaryEmbedding.forward() for GPU inference."""
-  assert position_ids.ndim == 3
-  assert position_ids.shape[0] == 3
-  assert position_ids.shape[1] == 1
-  position_ids = position_ids.unsqueeze(2).float()  # [3, 1, 1, pos]
-  # Replacing expand with torch.cat() ends up to make this tensor as INT
-  # probably because converter treats it as weights. So, leave as is for now.
-  inv_freq = self.inv_freq.reshape(1, 1, -1, 1).expand(3, -1, -1, -1)
-  freqs = (inv_freq @ position_ids).transpose(2, 3)
-  freqs = _apply_interleaved_mrope(freqs, self.mrope_section)
-  emb = torch.cat([freqs, freqs], dim=-1)
-  cos = emb.cos() * self.attention_scaling
-  sin = emb.sin() * self.attention_scaling
-  return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+  q = q.view(num_chunks, _CHUNK_LEN, self.num_heads, self.head_dim)
+  k = k.view(num_chunks, _CHUNK_LEN, self.num_heads, self.head_dim)
+  v = v.view(num_chunks, _CHUNK_LEN, self.num_heads, self.head_dim)
+
+  q = q.transpose(1, 2)
+  k = k.transpose(1, 2)
+  v = v.transpose(1, 2)
+
+  attn_output, _ = asr_model._sdpa(
+      self, q, k, v, attention_mask=None, scaling=self.scaling, **kwargs
+  )
+  attn_output = attn_output.view(seqlen, -1)
+  attn_output = self.out_proj(attn_output)
+  return attn_output
 
 
 class Qwen3AsrDecoder(torch.nn.Module):
@@ -68,12 +59,8 @@ class Qwen3AsrDecoder(torch.nn.Module):
 
   def __init__(self, model: torch.nn.Module, override_transformers: bool):
     super().__init__()
-    self._model = model.thinker.model
-    self._lm_head = model.thinker.lm_head
-    if override_transformers:
-      # Replace rotary embedding with GPU-compatible version.
-      rotary_emb = self._model.rotary_emb
-      rotary_emb.forward = types.MethodType(_rotary_forward, rotary_emb)
+    self._model = model.model.language_model
+    self._lm_head = model.lm_head
 
   def forward(
       self,
@@ -87,12 +74,11 @@ class Qwen3AsrDecoder(torch.nn.Module):
     # sequence dimension (dim=1).
     full_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
     # Prepare position ids here to remove BROADCAST_TO ops.
-    position_ids = torch.arange(0, full_embeds.shape[1]).reshape(1, 1, -1).int()
+    position_ids = torch.arange(0, full_embeds.shape[1]).reshape(1, -1).int()
     decoder_outputs = self._model(
         inputs_embeds=full_embeds,
         attention_mask=attention_mask,
-        # The hard coded `3` is for temporal, height and width.
-        position_ids=torch.cat([position_ids] * 3, dim=0),
+        position_ids=position_ids,
     )
     prompt_len = prompt_embeds.shape[1]
     logits = self._lm_head(decoder_outputs.last_hidden_state[:, prompt_len:, :])
@@ -110,34 +96,42 @@ class Qwen3AsrEncoder(torch.nn.Module):
 
   def __init__(self, model: torch.nn.Module):
     super().__init__()
-    self._encoder = model.thinker.audio_tower
+    self._encoder = model.model.audio_tower
+    self._projector = model.model.multi_modal_projector
     prefix_ids = torch.LongTensor(self._INPUT_IDS_PREFIX).unsqueeze(0)
-    self._prefix_embeds = model.thinker.model.embed_tokens(prefix_ids)
+    self._prefix_embeds = model.model.language_model.embed_tokens(prefix_ids)
     postfix_ids = torch.LongTensor(self._INPUT_IDS_POSTFIX).unsqueeze(0)
-    self._postfix_embeds = model.thinker.model.embed_tokens(postfix_ids)
+    self._postfix_embeds = model.model.language_model.embed_tokens(postfix_ids)
 
   def forward(self, input_features: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """Simplifed version of Qwen3ASRAudioEncoder.forward()."""
-    padded_embeds = F.gelu(self._encoder.conv2d1(input_features.unsqueeze(1)))
-    padded_embeds = F.gelu(self._encoder.conv2d2(padded_embeds))
-    padded_embeds = F.gelu(self._encoder.conv2d3(padded_embeds))
-    b, c, f, t = padded_embeds.size()
-    padded_embeds = self._encoder.conv_out(
-        padded_embeds.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
+    batch_size, num_mel_bins, padded_feature_length = input_features.shape
+    chunk_len = self._encoder.n_window * 2
+    num_chunks = padded_feature_length // chunk_len
+    chunked = (
+        input_features.view(batch_size, num_mel_bins, num_chunks, chunk_len)
+        .permute(0, 2, 1, 3)
+        .reshape(batch_size * num_chunks, 1, num_mel_bins, chunk_len)
     )
-    positional_embeds = self._encoder.positional_embedding.positional_embedding[
-        : padded_embeds.shape[1], :
-    ].unsqueeze(0)
+    conv_out = F.gelu(self._encoder.conv2d1(chunked))
+    conv_out = F.gelu(self._encoder.conv2d2(conv_out))
+    conv_out = F.gelu(self._encoder.conv2d3(conv_out))
+    b, c, f, t = conv_out.size()
+    conv_out = self._encoder.conv_out(
+        conv_out.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
+    )
+    conv_out += self._encoder.positional_embedding.positional_embedding[:t]
 
-    hidden_states = (padded_embeds + positional_embeds).view(b * t, -1)
+    hidden_states = conv_out.view(b * t, -1)
     cu_seqlens = torch.arange(0, b + 1).int() * t
     for layer in self._encoder.layers:
       hidden_states = layer(hidden_states, cu_seqlens)[0]
 
     hidden_states = self._encoder.ln_post(hidden_states)
-    hidden_states = self._encoder.proj1(hidden_states)
-    hidden_states = self._encoder.act(hidden_states)
-    hidden_states = self._encoder.proj2(hidden_states).unsqueeze(0)
+    hidden_states = self._projector.linear_1(hidden_states)
+    hidden_states = self._projector.act(hidden_states)
+    hidden_states = self._projector.linear_2(hidden_states)
+    hidden_states = hidden_states.view(batch_size, num_chunks * t, -1)
 
     prompt_embeds = torch.cat(
         [self._prefix_embeds, hidden_states, self._postfix_embeds], dim=1
@@ -160,34 +154,35 @@ class Qwen3AsrProcessor(asr_model.TransformersProcessor):
 class Qwen3Asr(asr_model.AsrModel):
   """Wrapper for Qwen3ASRForConditionalGeneration for encoder outputs."""
 
-  HF_MODEL_ID = 'Qwen/Qwen3-ASR-0.6B'
+  HF_MODEL_ID = 'Qwen/Qwen3-ASR-0.6B-hf'
 
   def __init__(
       self, model_id: str = HF_MODEL_ID, override_transformers: bool = False
   ):
     super().__init__(override_transformers)
-    import qwen_asr  # pylint: disable=g-import-not-at-top,unused-import
-    factory = transformers.AutoModel
+    factory = transformers.Qwen3ASRForConditionalGeneration
     self._model = factory.from_pretrained(model_id).float().eval()
+    if override_transformers:
+      modeling_qwen3_asr = transformers.models.qwen3_asr.modeling_qwen3_asr
+      for module in self._model.modules():
+        if isinstance(module, modeling_qwen3_asr.Qwen3ASRAudioAttention):
+          module.forward = types.MethodType(_audio_attention_forward, module)
     self._replace_normalizations(self._model)
     self._replace_rmsnorms(self._model)
     self._encoder = Qwen3AsrEncoder(self._model).eval()
     self._decoder = Qwen3AsrDecoder(self._model, override_transformers).eval()
     self._processor = Qwen3AsrProcessor(model_id)
 
-  def _replace_rmsnorms(self, module: torch.nn.Module, parent: str = ''):
-    """Replaces Qwen3ASRTextRMSNorm with composite ops for GPU inference."""
-    import qwen_asr  # pylint: disable=g-import-not-at-top
-    qwen3_asr = qwen_asr.core.transformers_backend.modeling_qwen3_asr
+  def _replace_rmsnorms(self, module: torch.nn.Module):
+    """Replaces Qwen3RMSNorm with composite ops for GPU inference."""
+    modeling_qwen3 = transformers.models.qwen3.modeling_qwen3
     for name, child in list(module.named_children()):
-      full_name = f'{parent}.{name}'
-      if isinstance(child, qwen3_asr.Qwen3ASRTextRMSNorm):
-        print(f'Replacing {full_name} with AsrRMSNorm')
+      if isinstance(child, modeling_qwen3.Qwen3RMSNorm):
         setattr(module, name, asr_model.AsrRMSNorm(
             child.variance_epsilon, child.weight
         ))
       else:
-        self._replace_rmsnorms(child, full_name)
+        self._replace_rmsnorms(child)
 
   def get_encoder(self) -> torch.nn.Module:
     return self._encoder
@@ -199,7 +194,7 @@ class Qwen3Asr(asr_model.AsrModel):
     return self._processor
 
   def get_encoder_sample_input(
-      self, processed_audio: tuple[str, torch.Tensor]
+      self, processed_audio: dict[str, torch.Tensor]
   ) -> tuple[torch.Tensor, ...]:
     return (processed_audio['input_features'],)
 
@@ -218,12 +213,15 @@ class Qwen3Asr(asr_model.AsrModel):
 
   def run_original_model(
       self, processed_audio: dict[str, torch.Tensor]
-  ) -> dict[str, torch.Tensor]:
+  ) -> asr_model.AsrModel.OriginalModelOutput:
     out = self._model.generate(
         **processed_audio,
-        generation_config=transformers.GenerationConfig(output_logits=True),
+        generation_config=transformers.GenerationConfig(
+            return_dict_in_generate=True, output_logits=True
+        ),
     )
+    prompt_len = processed_audio['input_ids'].shape[1]
     return asr_model.AsrModel.OriginalModelOutput(
-        logits=torch.from_numpy(np.array(out.logits).transpose(1, 0, 2)),
-        tokens=out.sequences,
+        logits=torch.stack(out.logits, dim=0).transpose(0, 1),
+        tokens=out.sequences[:, prompt_len:],
     )
