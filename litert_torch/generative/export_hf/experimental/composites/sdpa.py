@@ -16,6 +16,7 @@
 
 import math
 from typing import Optional
+from litert_torch.backend import composite
 from litert_torch.generative.custom_ops import bmm_4d as bmm_lib
 from litert_torch.generative.export_hf.experimental.composites import runtime_batched_matmul
 import torch
@@ -116,7 +117,13 @@ def scaled_dot_product_attention_transposed(
       )
     else:
       padded_logits = logits + mask
-  probs = F.softmax(padded_logits, dim=-1).type_as(key)
+
+  attrs = {"axis": -1}
+  builder = composite.StableHLOCompositeBuilder(name="odml.softmax", attr=attrs)
+  padded_logits = builder.mark_inputs(padded_logits)
+  probs = F.softmax(padded_logits, dim=-1)
+  probs = builder.mark_outputs(probs)
+  probs = probs.type_as(key)
   if param_tensor is not None:
     bmm_fn = lambda x, y: runtime_batched_matmul.runtime_bmm(
         x, y, param_tensor, is_global=is_global, is_src=True
