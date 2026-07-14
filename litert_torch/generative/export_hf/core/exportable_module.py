@@ -15,12 +15,11 @@
 """Exportable modules."""
 
 import abc
-from litert_torch.generative.export_hf.core import cache as _
+from litert_torch.generative.export_hf.core import cache as cache_lib
 from litert_torch.generative.export_hf.core import cache_base as kv_cache_lib
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import utils
 import torch
-
 
 ExportableModuleConfig = exportable_module_config.ExportableModuleConfig
 
@@ -53,7 +52,10 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
   """Base class for exportable modules for decoder-only LM."""
 
   def __init__(
-      self, model: torch.nn.Module, export_config: ExportableModuleConfig
+      self,
+      model: torch.nn.Module,
+      export_config: ExportableModuleConfig,
+      source_model_artifacts=None,
   ):
     super().__init__(export_config)
     self.model = model
@@ -62,6 +64,7 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
       self.mtp_verifier_step = export_config.mtp_verifier_step
     else:
       self.mtp_verifier_step = 0
+    self.source_model_artifacts = source_model_artifacts
 
   def adapt_inputs(
       self,
@@ -121,8 +124,18 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
 
     valid_mask = None
     if tokens is not None:
-      pad_token_id = getattr(text_config, "pad_token_id", 0)
-      if pad_token_id is None:
+      pad_token_id = None
+      if (
+          getattr(self.source_model_artifacts, "tokenizer", None) is not None
+          and getattr(
+              self.source_model_artifacts.tokenizer, "pad_token_id", None
+          )
+          is not None
+      ):
+        pad_token_id = self.source_model_artifacts.tokenizer.pad_token_id
+      if pad_token_id is None and getattr(text_config, "pad_token_id", None) is not None:
+        pad_token_id = text_config.pad_token_id
+      if pad_token_id is None or pad_token_id < 0:
         pad_token_id = 0
       valid_mask = tokens != pad_token_id
     elif input_pos is not None:
@@ -174,7 +187,13 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
     if export_config.cache_length_dim is not None:
       flat_shapes = []
       for layer in kv_cache.layers:
-        if hasattr(layer, "conv_state"):
+        if isinstance(layer, cache_lib.LiteRTLMConvCacheLayer):
+          if getattr(layer, "recurrent_states", None) is not None:
+            flat_shapes.append(None)
+            flat_shapes.append(None)
+          else:
+            flat_shapes.append(None)
+        elif hasattr(layer, "conv_state") or hasattr(layer, "conv_states"):
           flat_shapes.append(None)
         else:
           k_ts_idx = getattr(layer, "k_ts_idx")
@@ -257,9 +276,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
           ),
       }
       if export_config.extra_kwargs.get("apply_gpu_composites", False):
-        inputs["param_tensor"] = torch.ones(
-            (1, 1, 1, 7), dtype=torch.int32
-        )
+        inputs["param_tensor"] = torch.ones((1, 1, 1, 7), dtype=torch.int32)
 
       inputs.update(kv_cache_inputs)
       if export_config.prefill_length_dim is not None:
@@ -350,9 +367,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
         ),
     }
     if export_config.extra_kwargs.get("apply_gpu_composites", False):
-      inputs["param_tensor"] = torch.ones(
-          (1, 1, 1, 7), dtype=torch.int32
-      )
+      inputs["param_tensor"] = torch.ones((1, 1, 1, 7), dtype=torch.int32)
 
     inputs.update(kv_cache_inputs)
     if export_config.cache_length_dim is not None:

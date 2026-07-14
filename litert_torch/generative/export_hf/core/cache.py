@@ -368,12 +368,15 @@ class LiteRTLMConvCacheLayer(
   def __init__(
       self,
       conv_states: torch.Tensor,
+      recurrent_states: torch.Tensor | None = None,
       batch_size: int = 1,
       **kwargs,
   ):
     cache_utils.LinearAttentionCacheLayerMixin.__init__(self)
     self.conv_states = conv_states
+    self.recurrent_states = recurrent_states
     self.is_conv_states_initialized = True
+    self.is_recurrent_states_initialized = recurrent_states is not None
     self.batch_size = batch_size
     self.is_initialized = True
     self.conv_kernel_size = conv_states.shape[-1]
@@ -438,9 +441,12 @@ class LiteRTLMConvCacheLayer(
   def update_recurrent_state(
       self, recurrent_states: torch.Tensor, **kwargs
   ) -> torch.Tensor:
-    raise NotImplementedError(
-        "Recurrent state is not supported in LiteRTLMConvCacheLayer."
-    )
+    if self.recurrent_states is None:
+      raise ValueError(
+          "recurrent_states is not initialized in LiteRTLMConvCacheLayer."
+      )
+    self.recurrent_states.copy_(recurrent_states)
+    return self.recurrent_states
 
   def get_mask_sizes(self, cache_position: torch.Tensor):
     return self.conv_kernel_size, 0
@@ -462,25 +468,56 @@ class LiteRTLMConvCacheLayer(
       export_config: ExportableModuleConfig,
       **kwargs,
   ) -> "LiteRTLMConvCacheLayer":
-    assert model_config.layer_types[layer_index] == "conv"
-    c_state_shape = (
-        export_config.batch_size,
-        model_config.hidden_size,
-        model_config.conv_L_cache - 1,
-    )
-    c_state = torch.zeros(c_state_shape, dtype=torch.float32)
+    layer_type = model_config.layer_types[layer_index]
+    assert layer_type in (
+        "conv",
+        "linear_attention",
+    ), f"Unsupported layer type: {layer_type}"
     batch_size = kwargs.pop("batch_size", export_config.batch_size)
-    return cls(
-        c_state,
-        batch_size=batch_size,
-        **kwargs,
-    )
+    if layer_type == "conv":
+      c_state_shape = (
+          batch_size,
+          model_config.hidden_size,
+          model_config.conv_L_cache - 1,
+      )
+      c_state = torch.zeros(c_state_shape, dtype=torch.float32)
+      return cls(
+          c_state,
+          batch_size=batch_size,
+          **kwargs,
+      )
+    else:
+      key_dim = (
+          model_config.linear_key_head_dim * model_config.linear_num_key_heads
+      )
+      value_dim = (
+          model_config.linear_value_head_dim
+          * model_config.linear_num_value_heads
+      )
+      conv_dim = key_dim * 2 + value_dim
+      conv_L_cache = model_config.linear_conv_kernel_dim - 1
+      c_state_shape = (batch_size, conv_dim, conv_L_cache)
+      r_state_shape = (
+          batch_size,
+          model_config.linear_num_value_heads,
+          model_config.linear_key_head_dim,
+          model_config.linear_value_head_dim,
+      )
+      c_state = torch.zeros(c_state_shape, dtype=torch.float32)
+      r_state = torch.zeros(r_state_shape, dtype=torch.float32)
+      return cls(
+          conv_states=c_state,
+          recurrent_states=r_state,
+          batch_size=batch_size,
+          **kwargs,
+      )
 
 
 LAYER_TYPE_TO_CLASS = {
     "full_attention": LiteRTLMCacheLayer,
     "sliding_attention": LiteRTLMCacheLayer,
     "conv": LiteRTLMConvCacheLayer,
+    "linear_attention": LiteRTLMConvCacheLayer,
 }
 
 
@@ -560,9 +597,16 @@ def _flatten_kvc_t(
   layer_types = []
   for i, layer in enumerate(kvc.layers):
     if isinstance(layer, LiteRTLMConvCacheLayer):
-      layer_types.append("conv")
-      flattened.append(layer.conv_states)
-      flat_names.append(f"c_{i}")
+      if layer.recurrent_states is not None:
+        layer_types.append("linear_attention")
+        flattened.append(layer.conv_states)
+        flat_names.append(f"c_{i}")
+        flattened.append(layer.recurrent_states)
+        flat_names.append(f"r_{i}")
+      else:
+        layer_types.append("conv")
+        flattened.append(layer.conv_states)
+        flat_names.append(f"c_{i}")
     elif isinstance(layer, LiteRTLMCacheLayer):
       layer_types.append("full_attention")
       flattened.append(layer.keys)
@@ -592,6 +636,16 @@ def _unflatten_kvc_t(
       layers.append(
           LiteRTLMConvCacheLayer(
               conv_states=values[c_cache_idx],
+              batch_size=batch_size,
+          )
+      )
+    elif layer_type == "linear_attention":
+      c_cache_idx = flat_names.index(f"c_{i}")
+      r_cache_idx = flat_names.index(f"r_{i}")
+      layers.append(
+          LiteRTLMConvCacheLayer(
+              conv_states=values[c_cache_idx],
+              recurrent_states=values[r_cache_idx],
               batch_size=batch_size,
           )
       )

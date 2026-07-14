@@ -326,8 +326,8 @@ def export_text_prefill_decode_model(
     prefill_module_cls, decode_module_cls = get_prefill_decode_exportable_cls(
         source_model_artifacts.model_config, export_config
     )
-    prefill_module = prefill_module_cls(model, export_config)
-    decode_module = decode_module_cls(model, export_config)
+    prefill_module = prefill_module_cls(model, export_config, source_model_artifacts)
+    decode_module = decode_module_cls(model, export_config, source_model_artifacts)
     converter = converter_utils.Converter()
     sample_prefill_inputs = prefill_module.get_sample_inputs(text_model_config)
     for signature_name, (
