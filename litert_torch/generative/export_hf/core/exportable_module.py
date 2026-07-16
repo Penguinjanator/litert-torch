@@ -17,6 +17,8 @@
 import abc
 from litert_torch.generative.export_hf.core import cache as cache_lib
 from litert_torch.generative.export_hf.core import cache_base as kv_cache_lib
+from litert_torch.generative.export_hf.core import attention as _
+from litert_torch.generative.export_hf.core.split_cache import attention as _
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import utils
 import torch

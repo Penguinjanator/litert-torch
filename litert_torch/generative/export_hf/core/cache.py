@@ -426,9 +426,9 @@ class LiteRTLMConvCacheLayer(
     if seq_len > 1:
       if valid_mask is not None:
         L_state = self.conv_kernel_size
-        num_real = valid_mask.sum()
+        num_real = valid_mask.to(torch.int32).sum(dtype=torch.int32)
         start = num_real
-        idx = torch.arange(L_state, device=conv_states.device) + start
+        idx = torch.arange(L_state, device=conv_states.device, dtype=torch.int32) + start
         next_state = padded_input[:, :, idx]
       else:
         next_state = padded_input[:, :, -self.conv_kernel_size:]
