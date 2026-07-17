@@ -146,6 +146,52 @@ class ExportLibTest(parameterized.TestCase):
     self.assertEqual(config.input_sec, 1.0)
     self.assertEqual(config.stateful_after, -1)
 
+  def test_gpu_dynamic_shapes_config_rules(self):
+    # Only prefill
+    config = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        prefill_lengths=[32, 128],
+        cache_length=1024,
+        enable_gpu_dynamic_prefill=True,
+    )
+    self.assertEqual(config.prefill_lengths, [37, 131])
+    self.assertEqual(config.cache_length, 1024)
+
+    # Only cache
+    config = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        prefill_lengths=[32, 128],
+        cache_length=1024,
+        enable_gpu_dynamic_cache=True,
+    )
+    self.assertEqual(config.prefill_lengths, [32, 128])
+    self.assertEqual(config.cache_length, 1031)
+
+    # Both
+    config = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        prefill_lengths=[32, 128],
+        cache_length=1024,
+        enable_gpu_dynamic_prefill=True,
+        enable_gpu_dynamic_cache=True,
+    )
+    self.assertEqual(config.prefill_lengths, [37, 131])
+    self.assertEqual(config.cache_length, 1031)
+
+  def test_gpu_dynamic_shapes_conflict(self):
+    with self.assertRaises(ValueError):
+      export_lib.exportable_module_config.ExportableModuleConfig(
+          model="dummy_model",
+          enable_dynamic_shape=True,
+          enable_gpu_dynamic_prefill=True,
+      )
+    with self.assertRaises(ValueError):
+      export_lib.exportable_module_config.ExportableModuleConfig(
+          model="dummy_model",
+          enable_dynamic_shape=True,
+          enable_gpu_dynamic_cache=True,
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

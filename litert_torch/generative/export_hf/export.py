@@ -87,6 +87,8 @@ def export(
     cache_length: int | None = None,
     quantization_recipe: str | None = None,
     enable_dynamic_shape: bool | None = None,
+    enable_gpu_dynamic_prefill: bool | None = None,
+    enable_gpu_dynamic_cache: bool | None = None,
     externalize_embedder: bool | None = None,
     single_token_embedder: bool | None = None,
     k_ts_idx: int | None = None,
@@ -129,6 +131,10 @@ def export(
     cache_length: The length of the cache.
     quantization_recipe: The quantization recipes to use, separated by comma.
     enable_dynamic_shape: Whether to enable dynamic shape.
+    enable_gpu_dynamic_prefill: Whether to enable GPU dynamic shapes (magic
+      numbers) for prefill lengths.
+    enable_gpu_dynamic_cache: Whether to enable GPU dynamic shapes (magic
+      numbers) for cache length.
     externalize_embedder: Whether to externalize the embedder.
     single_token_embedder: Whether to use a single token embedder.
     k_ts_idx: The index of time step dimension in the key tensor.

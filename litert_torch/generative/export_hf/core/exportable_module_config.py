@@ -19,6 +19,7 @@ import enum
 import pprint
 from typing import Any
 
+from litert_torch.generative.export_hf.core import utils
 import torch
 
 
@@ -43,6 +44,10 @@ class ExportableModuleConfig:
   quantization_recipe: str | None = "dynamic_wi8_afp32"
   # For dynamic shape
   enable_dynamic_shape: bool = False
+  # If True, prefill lengths are adjusted to magic numbers for GPU execution.
+  enable_gpu_dynamic_prefill: bool = False
+  # If True, cache length is adjusted to a magic number for GPU execution.
+  enable_gpu_dynamic_cache: bool = False
   # Export configs
   externalize_embedder: bool = False
   single_token_embedder: bool = False
@@ -120,6 +125,19 @@ class ExportableModuleConfig:
       self.externalize_rope = True
       if self.cache_implementation is None:
         self.cache_implementation = "LiteRTLMSplitCache"
+
+    if self.enable_gpu_dynamic_prefill or self.enable_gpu_dynamic_cache:
+      if self.enable_dynamic_shape:
+        raise ValueError(
+            "enable_dynamic_shape and enable_gpu_dynamic_prefill/cache"
+            " cannot be both True."
+        )
+    if self.enable_gpu_dynamic_prefill:
+      self.prefill_lengths = [
+          utils.get_magic_number_for(l) for l in self.prefill_lengths
+      ]
+    if self.enable_gpu_dynamic_cache:
+      self.cache_length = utils.get_magic_number_for(self.cache_length)
 
     if self.enable_dynamic_shape:
       self.prefill_length_dim = torch.export.Dim(
