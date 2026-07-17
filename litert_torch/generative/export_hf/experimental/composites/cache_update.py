@@ -60,9 +60,13 @@ def cache_update(
   )
 
   out_k = tfl_dus.dynamic_update_slice(
-      cache_k, key_proj, [x for x in indices_k]
-  ) + (runtime_param_tensor.sum() * 0)
+      cache_k,
+      key_proj + (runtime_param_tensor.sum() * 0),
+      [x for x in indices_k],
+  )
   out_v = tfl_dus.dynamic_update_slice(
-      cache_v, value_proj.transpose(-2, -1), [x for x in indices_v]
-  ) + (runtime_param_tensor.sum() * 0)
+      cache_v,
+      value_proj.transpose(-2, -1) + (runtime_param_tensor.sum() * 0),
+      [x for x in indices_v],
+  )
   return builder.mark_outputs(out_k, out_v)
