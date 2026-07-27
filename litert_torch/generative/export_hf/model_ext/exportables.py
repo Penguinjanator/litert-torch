@@ -23,6 +23,7 @@ from litert_torch.generative.export_hf.model_ext.gemma4 import exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_exportable_module as gemma4_split_cache_exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
+from litert_torch.generative.export_hf.model_ext.lfm2_vl import vision_exportable as lfm2_vl_vision_exportable
 from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as moonshine_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_tdt as parakeet_tdt_lib
@@ -100,6 +101,12 @@ def get_vision_exportables(
         gemma4_unified_vision_exportable.LiteRTExportableModuleForGemma4UnifiedVisionEncoder,
         None,
         gemma4_unified_vision_exportable.LiteRTExportableModuleForGemma4UnifiedEndOfImage,
+    )
+  elif model_config.model_type == 'lfm2_vl':
+    return (
+        lfm2_vl_vision_exportable.LiteRTExportableModuleForLFM2VisionEncoder,
+        lfm2_vl_vision_exportable.LiteRTExportableModuleForLFM2VisionAdapter,
+        None,
     )
   else:
     raise ValueError(f'Unsupported model type: {model_config.model_type}')

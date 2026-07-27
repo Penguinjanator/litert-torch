@@ -19,6 +19,7 @@ from litert_torch.generative.export_hf.model_ext.gemma3n import patch as _
 from litert_torch.generative.export_hf.model_ext.gemma4 import patch as _
 from litert_torch.generative.export_hf.model_ext.gemma4_unified import patch as _
 from litert_torch.generative.export_hf.model_ext.lfm2 import patch as _
+from litert_torch.generative.export_hf.model_ext.lfm2_vl import patch as _
 from litert_torch.generative.export_hf.model_ext.moonshine import patch as _
 from litert_torch.generative.export_hf.model_ext.parakeet import patch as _
 from litert_torch.generative.export_hf.model_ext.qwen3 import patch as _
