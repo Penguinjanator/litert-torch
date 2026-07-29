@@ -85,7 +85,6 @@ class TflSamplingExecutorConfig:
   use_profiler_based_calibration: bool = False
 
 
-
 def load_model(
     path: str, enable_calibration: bool = False
 ) -> calibrator.CalibrationInterpreter:
@@ -239,8 +238,8 @@ class Executor:
         if self.config.use_profiler_based_calibration:
           if not self.config.enable_min_max_calibration_update:
             raise ValueError(
-                "Profiler-based calibration only supports min-max update. "
-                "Set enable_min_max_calibration_update=True."
+                'Profiler-based calibration only supports min-max update. '
+                'Set enable_min_max_calibration_update=True.'
             )
           mode = calibrator.CalibrationMode.CALIBRATION_PROFILER_BASED
         else:
@@ -275,7 +274,10 @@ class Executor:
       temp_output_path = output_path + '.tmp'
       interp.save_calibration_result(temp_output_path, extra_metadata)
       os.replace(temp_output_path, output_path)
-      print(f'--- Saved calibration results for {model_name} to {output_path}')
+      print(
+          f'--- Saved calibration results for {model_name} to '
+          f'{output_path}'
+      )
 
   def load_calibration_results(self, output_dir: str):
     """Loads the calibration results."""
@@ -844,6 +846,8 @@ def try_run_signature_with_quant_dequant(signature_input, signature_runner):
 
 def is_quantized(tensor_detail):
   """Returns whether the tensor is quantized."""
+  if tensor_detail['dtype'] == np.float32:
+    return False
   quant_params = tensor_detail['quantization_parameters']
   return len(quant_params['scales']) > 0
 
@@ -874,3 +878,195 @@ def try_get_dequantized_output(
           signature_output[k], quant_params
       ).astype(np.float32)
   return signature_output
+
+
+@dataclasses.dataclass(kw_only=True)
+class TflEncodingExecutorConfig:
+  """Sampling executor config for TFLite embedding models."""
+
+  embedder_model_entries: dict[int, TFLModelEntry] | None = None
+  encoder_model_entries: dict[int, TFLModelEntry] | None = None
+  combined_model_entries: dict[int, TFLModelEntry] | None = None
+
+  tokenizer_config: tokenizer_lib.TokenizerConfig
+
+  per_layer_embedder_model_entries: dict[int, TFLModelEntry] | None = None
+
+  mm_encoder_model_entry: TFLModelEntry | None = None
+  mm_adapter_model_entry: TFLModelEntry | None = None
+
+  audio_adapter_model_entry: TFLModelEntry | None = None
+
+  enable_calibration: bool = False
+  enable_min_max_calibration_update: bool = True
+  ema_smoothing_factor: float = 0.95
+  use_profiler_based_calibration: bool = False
+
+
+class EncodingExecutor:
+  """Executor for TFLite embedding/encoder models."""
+
+  def __init__(
+      self,
+      config: TflEncodingExecutorConfig,
+  ):
+    self.config = config
+    self.interpreters: dict[str, calibrator.CalibrationInterpreter] = {}
+
+    self.embedder_runners = {}
+    if config.embedder_model_entries:
+      for input_length, model_entry in config.embedder_model_entries.items():
+        self.embedder_runners[input_length] = self._get_interpreter(
+            model_entry.path, config.enable_calibration
+        ).get_signature_runner(model_entry.signature_name)
+
+    self.encoder_runners = {}
+    if config.encoder_model_entries:
+      for input_length, model_entry in config.encoder_model_entries.items():
+        self.encoder_runners[input_length] = self._get_interpreter(
+            model_entry.path, config.enable_calibration
+        ).get_signature_runner(model_entry.signature_name)
+
+    self.combined_runners = {}
+    if config.combined_model_entries:
+      for input_length, model_entry in config.combined_model_entries.items():
+        self.combined_runners[input_length] = self._get_interpreter(
+            model_entry.path, config.enable_calibration
+        ).get_signature_runner(model_entry.signature_name)
+
+    self.mm_encoder_runner = None
+    if config.mm_encoder_model_entry is not None:
+      self.mm_encoder_runner = self._get_interpreter(
+          config.mm_encoder_model_entry.path, config.enable_calibration
+      ).get_signature_runner(config.mm_encoder_model_entry.signature_name)
+
+    self.mm_adapter_runner = None
+    if config.mm_adapter_model_entry is not None:
+      self.mm_adapter_runner = self._get_interpreter(
+          config.mm_adapter_model_entry.path, config.enable_calibration
+      ).get_signature_runner(config.mm_adapter_model_entry.signature_name)
+
+    self.audio_adapter_runner = None
+    if config.audio_adapter_model_entry is not None:
+      self.audio_adapter_runner = self._get_interpreter(
+          config.audio_adapter_model_entry.path, config.enable_calibration
+      ).get_signature_runner(config.audio_adapter_model_entry.signature_name)
+
+    self.tokenizer = config.tokenizer_config.make()
+
+  def _get_interpreter(
+      self, path: str, enable_calibration: bool
+  ) -> calibrator.CalibrationInterpreter:
+    """Returns a calibration interpreter for the given path."""
+    if path not in self.interpreters:
+      if self.config.enable_min_max_calibration_update:
+        qsv_update_func = qsu.min_max_update
+      else:
+        qsv_update_func = functools.partial(
+            qsu.moving_average_update,
+            smoothing_factor=self.config.ema_smoothing_factor,
+        )
+
+      if enable_calibration:
+        if self.config.use_profiler_based_calibration:
+          if not self.config.enable_min_max_calibration_update:
+            raise ValueError(
+                'Profiler-based calibration only supports min-max update. '
+                'Set enable_min_max_calibration_update=True.'
+            )
+          mode = calibrator.CalibrationMode.CALIBRATION_PROFILER_BASED
+        else:
+          mode = calibrator.CalibrationMode.CALIBRATION
+      else:
+        mode = calibrator.CalibrationMode.INFERENCE
+
+      self.interpreters[path] = calibrator.CalibrationInterpreter(
+          path,
+          mode=mode,
+          qsv_update_func=qsv_update_func,
+      )
+    return self.interpreters[path]
+
+  def encode_text(
+      self,
+      request: str | tokenizer_lib.Request,
+  ):
+    """Encodes the text and returns L2 normalized embeddings."""
+    if isinstance(request, str):
+      tokens = self.tokenizer.tokenize(request)[None, :]
+      images = None
+      index_media = None
+      index_feat_in_media = None
+    else:
+      tokens, images, index_media, index_feat_in_media = (
+          self.tokenizer.process_request(request)
+      )
+
+    num_input_tokens = len(tokens[0])
+
+    runners_dict = (
+        self.combined_runners
+        if self.combined_runners
+        else self.embedder_runners
+    )
+    # Find the smallest input size that is larger than the current input size.
+    available_input_size = [
+        x for x in runners_dict.keys() if x >= num_input_tokens
+    ]
+    if available_input_size:
+      input_size = min(available_input_size)
+    else:
+      input_size = max(x for x in runners_dict.keys())
+
+    padded_tokens = np.pad(tokens, ((0, 0), (0, input_size - num_input_tokens)))
+
+    if self.combined_runners:
+      encodings = try_run_signature_with_quant_dequant(
+          {'token_ids': padded_tokens},
+          self.combined_runners[input_size],
+      )['encodings']
+    else:
+      # The valid_mask is usually needed for encoder attention matching
+      input_mask = np.zeros((1, input_size), dtype=np.float32)
+      input_mask[0, :num_input_tokens] = 1.0
+
+      embeds = try_run_signature_with_quant_dequant(
+          {'token_ids': padded_tokens},
+          self.embedder_runners[input_size],
+      )['embeddings']
+
+      if images is not None and len(images) > 0:
+        num_images = len(images)
+        mm_embs = []
+        mm_embedding = None
+        for i in range(num_images):
+          img = images[i]
+          img_features = self.mm_encoder_runner(
+              **img,
+          )['features']
+          mm_embedding = self.mm_adapter_runner(
+              soft_tokens=img_features,
+          )['mm_embedding']
+          mm_embs.append(mm_embedding)
+        if mm_embs:
+          mm_embedding = np.concatenate(mm_embs, axis=0)
+
+        embeds = tokenizer_lib.interleave_media_features_in_text(
+            embeds,
+            index_media,
+            index_feat_in_media,
+            mm_embedding[None, ...],
+        )
+
+      encodings = try_run_signature_with_quant_dequant(
+          {
+              'embeddings': embeds,
+              'input_mask': input_mask,
+          },
+          self.encoder_runners[input_size],
+      )['encodings']
+
+    l2_normed_encodings = encodings / np.linalg.norm(
+        encodings, axis=1, keepdims=True
+    )
+    return l2_normed_encodings
