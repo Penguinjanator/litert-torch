@@ -16,6 +16,7 @@
 
 import contextlib
 from litert_torch.backend import optimization_barrier as optimization_barrier_lib
+from litert_torch.generative.export_hf.experimental.composites import rope as rope_composite
 from litert_torch.generative.export_hf.model_ext import patches as patches_lib
 from litert_torch.generative.layers import normalization
 import torch
@@ -106,6 +107,7 @@ try:
         self,
         original_attn: modeling_gemma4.Gemma4TextAttention,
         fuse_qkv: bool = False,
+        use_rope_composite: bool = False,
     ):
       super().__init__()
       self.o_proj = original_attn.o_proj
@@ -126,6 +128,7 @@ try:
       self.layer_type = original_attn.layer_type
 
       self.fuse_qkv = fuse_qkv and not self.is_kv_shared_layer
+      self.use_rope_composite = use_rope_composite
 
       self.q_proj = original_attn.q_proj
 
@@ -165,6 +168,41 @@ try:
           self.k_size = k_out_features
           self.v_size = v_out_features
 
+    def _get_rope_base(self) -> float:
+      rope_base = 500000.0
+      if hasattr(self.config, "rope_parameters") and self.config.rope_parameters:
+        if isinstance(self.config.rope_parameters, dict):
+          rope_base = float(
+              self.config.rope_parameters.get("rope_theta", rope_base)
+          )
+        elif hasattr(self.config.rope_parameters, "rope_theta"):
+          rope_base = float(
+              getattr(self.config.rope_parameters, "rope_theta", rope_base)
+          )
+      elif hasattr(self.config, "rope_theta"):
+        rope_base = float(getattr(self.config, "rope_theta", rope_base))
+
+      is_local = getattr(self, "is_sliding", False)
+      num_local = getattr(self.config, "num_local_layers_per_global", 0)
+      if num_local > 0 and (self.layer_idx + 1) % (num_local + 1) != 0:
+        is_local = True
+      elif hasattr(self.config, "layer_types") and self.config.layer_types:
+        if (
+            self.layer_idx < len(self.config.layer_types)
+            and self.config.layer_types[self.layer_idx] == "sliding_attention"
+        ):
+          is_local = True
+
+      if is_local:
+        rope_base = float(
+            getattr(
+                self.config,
+                "rope_local_base_freq",
+                getattr(self.config, "local_rope_theta", 10000.0),
+            )
+        )
+      return rope_base
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -181,10 +219,26 @@ try:
       if self.is_kv_shared_layer:
         query_states = self.q_proj(hidden_states).view(hidden_shape)
         query_states = self.q_norm(query_states)
-        query_states = modeling_gemma4.apply_rotary_pos_emb(
-            query_states, cos, sin, unsqueeze_dim=2
-        )
-        query_states = query_states.transpose(1, 2)
+        if kwargs.get("apply_gpu_composites", False) or getattr(
+            self, "use_rope_composite", False
+        ):
+          position_ids = kwargs.get("position_ids", None)
+          if position_ids is None:
+            seq_len = query_states.shape[1]
+            position_ids = torch.arange(
+                seq_len, device=query_states.device
+            ).unsqueeze(0)
+
+          rope_base = self._get_rope_base()
+          query_states = query_states.transpose(1, 2)
+          query_states = rope_composite.apply_mldrift_compatible_rope(
+              query_states, position_ids, base=rope_base, head_dim=self.head_dim
+          )
+        else:
+          query_states = modeling_gemma4.apply_rotary_pos_emb(
+              query_states, cos, sin, unsqueeze_dim=2
+          )
+          query_states = query_states.transpose(1, 2)
 
         key_states, value_states = shared_kv_states[self.layer_type]
         key_states = key_states.to(query_states.device)
@@ -204,17 +258,36 @@ try:
 
         query_states = q.view(hidden_shape)
         query_states = self.q_norm(query_states)
-        query_states = modeling_gemma4.apply_rotary_pos_emb(
-            query_states, cos, sin, unsqueeze_dim=2
-        )
-        query_states = query_states.transpose(1, 2)
 
         key_states = k.view(hidden_shape)
         key_states = self.k_norm(key_states)
-        key_states = modeling_gemma4.apply_rotary_pos_emb(
-            key_states, cos, sin, unsqueeze_dim=2
-        )
-        key_states = key_states.transpose(1, 2)
+
+        if getattr(self, "use_rope_composite", False):
+          position_ids = kwargs.get("position_ids", None)
+          if position_ids is None:
+            seq_len = query_states.shape[1]
+            position_ids = torch.arange(
+                seq_len, device=query_states.device
+            ).unsqueeze(0)
+
+          rope_base = self._get_rope_base()
+          query_states = query_states.transpose(1, 2)
+          key_states = key_states.transpose(1, 2)
+          query_states = rope_composite.apply_mldrift_compatible_rope(
+              query_states, position_ids, base=rope_base, head_dim=self.head_dim
+          )
+          key_states = rope_composite.apply_mldrift_compatible_rope(
+              key_states, position_ids, base=rope_base, head_dim=self.head_dim
+          )
+        else:
+          query_states = modeling_gemma4.apply_rotary_pos_emb(
+              query_states, cos, sin, unsqueeze_dim=2
+          )
+          query_states = query_states.transpose(1, 2)
+          key_states = modeling_gemma4.apply_rotary_pos_emb(
+              key_states, cos, sin, unsqueeze_dim=2
+          )
+          key_states = key_states.transpose(1, 2)
 
         value_states = self.v_norm(v.view(hidden_shape))
         value_states = value_states.transpose(1, 2)
@@ -305,9 +378,11 @@ try:
     """Dynamic model patch for Gemma4 export."""
     fuse_gate_up = export_config.fuse_gate_up
     fuse_qkv = export_config.fuse_qkv
+    use_rope = export_config.use_rope_composite
     print(
-        f"Gemma4 model patch applied. fuse_gate_up={fuse_gate_up},"
-        f" fuse_qkv={fuse_qkv}"
+        "Gemma4 model patch applied. "
+        f"fuse_gate_up={fuse_gate_up}, fuse_qkv={fuse_qkv}, "
+        f"use_rope_composite={use_rope}"
     )
 
     replaced_modules = []
@@ -320,9 +395,16 @@ try:
           setattr(module, child_name, fused)
           replaced_modules.append((module, child_name, child))
         elif isinstance(child, modeling_gemma4.Gemma4TextAttention):
-          if fuse_qkv:
-            print(f"Replacing Attention: {child_name} (fuse_qkv={fuse_qkv})")
-            fused = FusedGemma4TextAttention(child, fuse_qkv=fuse_qkv)
+          if fuse_qkv or use_rope:
+            print(
+                f"Replacing Attention: {child_name} "
+                f"(fuse_qkv={fuse_qkv}, use_rope={use_rope})"
+            )
+            fused = FusedGemma4TextAttention(
+                child,
+                fuse_qkv=fuse_qkv,
+                use_rope_composite=use_rope,
+            )
             setattr(module, child_name, fused)
             replaced_modules.append((module, child_name, child))
         else:

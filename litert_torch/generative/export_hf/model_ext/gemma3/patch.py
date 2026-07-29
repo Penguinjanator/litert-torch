@@ -15,6 +15,7 @@
 """Patches for Gemma3."""
 
 import contextlib
+from litert_torch.generative.export_hf.experimental.composites import rope as rope_composite
 from litert_torch.generative.export_hf.model_ext import patches as patches_lib
 from litert_torch.generative.layers import normalization
 import torch
@@ -90,6 +91,7 @@ class FusedGemma3Attention(torch.nn.Module):
       self,
       original_attn: modeling_gemma3.Gemma3Attention,
       fuse_qkv: bool = False,
+      use_rope_composite: bool = False,
   ):
     super().__init__()
     self.o_proj = original_attn.o_proj
@@ -108,6 +110,7 @@ class FusedGemma3Attention(torch.nn.Module):
     self.is_sliding = original_attn.is_sliding
 
     self.fuse_qkv = fuse_qkv
+    self.use_rope_composite = use_rope_composite
 
     self.q_proj = original_attn.q_proj
     self.k_proj = original_attn.k_proj
@@ -168,20 +171,70 @@ class FusedGemma3Attention(torch.nn.Module):
     query_states = self.q_norm(query_states)
     key_states = self.k_norm(key_states)
 
-    cos, sin = position_embeddings
-    query_states, key_states = modeling_gemma3.apply_rotary_pos_emb(
-        query_states, key_states, cos, sin
-    )
+    if getattr(self, "use_rope_composite", False):
+      position_ids = kwargs.get("position_ids", None)
+      if position_ids is None:
+        seq_len = query_states.shape[2]
+        position_ids = torch.arange(
+            seq_len, device=query_states.device
+        ).unsqueeze(0)
+
+      rope_base = 500000.0
+      if hasattr(self.config, "rope_parameters") and self.config.rope_parameters:
+        if isinstance(self.config.rope_parameters, dict):
+          rope_base = float(
+              self.config.rope_parameters.get("rope_theta", rope_base)
+          )
+        elif hasattr(self.config.rope_parameters, "rope_theta"):
+          rope_base = float(
+              getattr(self.config.rope_parameters, "rope_theta", rope_base)
+          )
+      elif hasattr(self.config, "rope_theta"):
+        rope_base = float(getattr(self.config, "rope_theta", rope_base))
+
+      is_local = getattr(self, "is_sliding", False)
+      num_local = getattr(self.config, "num_local_layers_per_global", 0)
+      if num_local > 0 and (self.layer_idx + 1) % (num_local + 1) != 0:
+        is_local = True
+      elif hasattr(self.config, "layer_types") and self.config.layer_types:
+        if (
+            self.layer_idx < len(self.config.layer_types)
+            and self.config.layer_types[self.layer_idx] == "sliding_attention"
+        ):
+          is_local = True
+
+      if is_local:
+        rope_base = float(
+            getattr(
+                self.config,
+                "rope_local_base_freq",
+                getattr(self.config, "local_rope_theta", 10000.0),
+            )
+        )
+
+      query_states = rope_composite.apply_mldrift_compatible_rope(
+          query_states, position_ids, base=rope_base, head_dim=self.head_dim
+      )
+      key_states = rope_composite.apply_mldrift_compatible_rope(
+          key_states, position_ids, base=rope_base, head_dim=self.head_dim
+      )
+    else:
+      cos, sin = position_embeddings
+      query_states, key_states = modeling_gemma3.apply_rotary_pos_emb(
+          query_states, key_states, cos, sin
+      )
 
     if past_key_values is not None:
       key_states, value_states = past_key_values.update(
           key_states, value_states, self.layer_idx
       )
 
+    # pytype: disable=attribute-error
     attention_interface = modeling_gemma3.ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation,  # pylint: disable=protected-access
         modeling_gemma3.eager_attention_forward,
     )
+    # pytype: enable=attribute-error
 
     attn_output, attn_weights = attention_interface(
         self,
@@ -220,9 +273,11 @@ def patch_gemma3_model(model, export_config):
   """Dynamic model patch for Gemma3 export."""
   fuse_gate_up = export_config.fuse_gate_up
   fuse_qkv = export_config.fuse_qkv
+  use_rope = export_config.use_rope_composite
   print(
-      f"Gemma3 model patch applied. fuse_gate_up={fuse_gate_up},"
-      f" fuse_qkv={fuse_qkv}"
+      "Gemma3 model patch applied. "
+      f"fuse_gate_up={fuse_gate_up}, fuse_qkv={fuse_qkv}, "
+      f"use_rope_composite={use_rope}"
   )
 
   replaced_modules = []
@@ -235,9 +290,16 @@ def patch_gemma3_model(model, export_config):
         setattr(module, child_name, fused)
         replaced_modules.append((module, child_name, child))
       elif isinstance(child, modeling_gemma3.Gemma3Attention):
-        if fuse_qkv:
-          print(f"Replacing Attention: {child_name} (fuse_qkv={fuse_qkv})")
-          fused = FusedGemma3Attention(child, fuse_qkv=fuse_qkv)
+        if fuse_qkv or use_rope:
+          print(
+              f"Replacing Attention: {child_name} "
+              f"(fuse_qkv={fuse_qkv}, use_rope={use_rope})"
+          )
+          fused = FusedGemma3Attention(
+              child,
+              fuse_qkv=fuse_qkv,
+              use_rope_composite=use_rope,
+          )
           setattr(module, child_name, fused)
           replaced_modules.append((module, child_name, child))
       else:

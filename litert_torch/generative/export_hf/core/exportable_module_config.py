@@ -65,6 +65,7 @@ class ExportableModuleConfig:
   export_audio_encoder: bool = True
   fuse_gate_up: bool = False
   fuse_qkv: bool = False
+  use_rope_composite: bool = False
   input_sec: float = 1.0
   # If >= 0, the model runs in stateful mode after this many tokens.
   stateful_after: int = -1
@@ -107,6 +108,13 @@ class ExportableModuleConfig:
 
   def __post_init__(self):
     """Refines configuration based on task-specific rules."""
+    if isinstance(self.prefill_lengths, int):
+      self.prefill_lengths = [self.prefill_lengths]
+    elif isinstance(self.prefill_lengths, str):
+      self.prefill_lengths = [
+          int(x) for x in self.prefill_lengths.split(",") if x
+      ]
+
     # pylint: disable=g-bool-id-comparison
     match self.task:
       case ExportTask.IMAGE_TEXT_TO_TEXT:

@@ -17,6 +17,7 @@
 from absl.testing import parameterized
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.model_ext.gemma4 import patch
+from litert_torch.generative.layers import rotary_position_embedding as rotary_pos_emb
 import torch
 from transformers.models.gemma4 import modeling_gemma4
 
@@ -40,6 +41,42 @@ def _get_dummy_gemma4_text_config():
   return config
 
 
+class MockCacheLayer:
+
+  def __init__(self, k_ts_idx=2, v_ts_idx=3):
+    self.k_ts_idx = k_ts_idx
+    self.v_ts_idx = v_ts_idx
+
+  def get_k_ts_idx(self):
+    return self.k_ts_idx
+
+  def get_v_ts_idx(self):
+    return self.v_ts_idx
+
+
+class MockCache:
+
+  def __init__(self, k_ts_idx=2, v_ts_idx=3):
+    self.layers = [MockCacheLayer(k_ts_idx, v_ts_idx)]
+
+  def update(self, key_states, value_states, layer_idx, **kwargs):
+    if kwargs.get("apply_gpu_composites", False):
+      b, n, s, h = key_states.shape
+      k = key_states.reshape(1, b * n, s, h)
+      v = value_states.reshape(1, b * n, s, h).transpose(-2, -1)
+      return k, v
+    else:
+      return key_states, value_states
+
+
+def _get_dummy_position_embeddings(batch_size, seq_len, head_dim):
+  c = torch.randn(batch_size, seq_len, head_dim // 2)
+  s = torch.randn(batch_size, seq_len, head_dim // 2)
+  cos = torch.cat([c, c], dim=-1)
+  sin = torch.cat([s, s], dim=-1)
+  return (cos, sin)
+
+
 class PatchTest(parameterized.TestCase):
 
   def test_fused_gemma4_attention_qkv(self):
@@ -51,9 +88,9 @@ class PatchTest(parameterized.TestCase):
     seq_len = 4
     hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
 
-    cos = torch.randn(batch_size, seq_len, config.head_dim)
-    sin = torch.randn(batch_size, seq_len, config.head_dim)
-    position_embeddings = (cos, sin)
+    position_embeddings = _get_dummy_position_embeddings(
+        batch_size, seq_len, config.head_dim
+    )
     attention_mask = torch.ones(
         (batch_size, 1, seq_len, seq_len), dtype=torch.bool
     )
@@ -95,6 +132,51 @@ class PatchTest(parameterized.TestCase):
     self.assertTrue(
         torch.allclose(expected_output, actual_output, rtol=1e-5, atol=1e-5),
         "Fused Gate+Up MLP Output Mismatch.\n"
+        f"Expected: {expected_output}\nActual: {actual_output}",
+    )
+
+  def test_fused_gemma4_attention_rope_composite(self):
+    config = _get_dummy_gemma4_text_config()
+    original_attn = modeling_gemma4.Gemma4TextAttention(config, layer_idx=0)
+    fused_attn = patch.FusedGemma4TextAttention(
+        original_attn, use_rope_composite=True
+    )
+
+    batch_size = 2
+    seq_len = 4
+    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
+
+    rope_base = float(getattr(config, "rope_theta", 500000.0))
+    cos, sin = rotary_pos_emb.build_rope(
+        position_ids[0], n_elem=config.head_dim, base=int(rope_base)
+    )
+    cos = torch.cat([cos, cos], dim=-1)
+    sin = torch.cat([sin, sin], dim=-1)
+    position_embeddings = (cos, sin)
+    attention_mask = torch.ones(
+        (batch_size, 1, seq_len, seq_len), dtype=torch.bool
+    )
+    shared_kv_states = {}
+
+    with torch.no_grad():
+      expected_output, _ = original_attn(
+          hidden_states=hidden_states,
+          position_embeddings=position_embeddings,
+          attention_mask=attention_mask,
+          shared_kv_states=shared_kv_states,
+      )
+      actual_output, _ = fused_attn(
+          hidden_states=hidden_states,
+          position_embeddings=position_embeddings,
+          attention_mask=attention_mask,
+          shared_kv_states=shared_kv_states,
+          position_ids=position_ids,
+      )
+
+    self.assertTrue(
+        torch.allclose(expected_output, actual_output, rtol=1e-5, atol=1e-5),
+        "RoPE Composite Attention Output Mismatch.\n"
         f"Expected: {expected_output}\nActual: {actual_output}",
     )
 
