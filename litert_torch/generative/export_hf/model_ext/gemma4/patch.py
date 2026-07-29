@@ -248,6 +248,57 @@ try:
       attn_output = self.o_proj(attn_output)
       return attn_output, attn_weights
 
+  class LiteRTGemma4TextRouter(torch.nn.Module):
+    """LiteRT compatible Gemma4 Text Router."""
+
+    def __init__(self, config):
+      super().__init__()
+      self.config = config
+      self.hidden_size = config.hidden_size
+      self.scalar_root_size = self.hidden_size**-0.5
+      self.eps = config.rms_norm_eps
+
+      self.norm = Gemma4RMSNorm(self.hidden_size, eps=self.eps, with_scale=False)
+      self.proj = torch.nn.Linear(
+          config.hidden_size, config.num_experts, bias=False
+      )
+      self.scale = torch.nn.Parameter(torch.ones(self.hidden_size))
+      self.per_expert_scale = torch.nn.Parameter(torch.ones(config.num_experts))
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+      hidden_states = self.norm(hidden_states)
+      hidden_states = hidden_states * self.scale * self.scalar_root_size
+
+      expert_scores = self.proj(hidden_states)  # [B*S, E]
+      router_probabilities = torch.nn.functional.softmax(expert_scores, dim=-1)
+
+      # topk returns both values (probabilities) and indices directly
+      top_k_weights, top_k_index = torch.topk(
+          router_probabilities,
+          k=self.config.top_k_experts,
+          dim=-1,
+      )  # both [B*S, K]
+      top_k_index = top_k_index.int()
+
+      expert_ids = torch.arange(
+          self.config.num_experts,
+          dtype=top_k_index.dtype,
+          device=top_k_index.device,
+      )
+
+      match_mask = top_k_index.unsqueeze(-1) == expert_ids
+      float_mask = match_mask.to(self.per_expert_scale.dtype)
+      scales = torch.matmul(float_mask, self.per_expert_scale)
+
+      # Normalize the top-k weights so they sum to 1 per token
+      top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
+      top_k_weights = top_k_weights * scales
+
+      return router_probabilities, top_k_weights, top_k_index
+
+
   @patches_lib.register_model_patch(["gemma4"])
   @contextlib.contextmanager
   def patch_gemma4_model(model, export_config):
@@ -470,6 +521,9 @@ def gemma4_litert_patch():
   original_text_model = modeling_gemma4.Gemma4TextModel
   modeling_gemma4.Gemma4TextModel = LiteRTGemma4TextModel
 
+  original_text_router = modeling_gemma4.Gemma4TextRouter
+  modeling_gemma4.Gemma4TextRouter = LiteRTGemma4TextRouter
+
   try:
     yield
   finally:
@@ -478,6 +532,7 @@ def gemma4_litert_patch():
     modeling_gemma4.Gemma4VisionPatchEmbedder = original_patch_embedder
     modeling_gemma4.Gemma4VisionPooler = original_pooler
     modeling_gemma4.Gemma4TextModel = original_text_model
+    modeling_gemma4.Gemma4TextRouter = original_text_router
 
 
 # pytype: enable=import-error

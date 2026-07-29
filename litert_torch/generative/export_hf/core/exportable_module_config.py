@@ -89,6 +89,8 @@ class ExportableModuleConfig:
   assistant_model: str | None = None
   mtp_verifier_step: int = 5
 
+  moe_exports_implementation: str = "litert_moe"
+
   # AOT Compilation.
   aot_backend: str | None = None
   aot_soc_model: str | None = None
@@ -127,6 +129,7 @@ class ExportableModuleConfig:
       self.externalize_rope = True
       if self.cache_implementation is None:
         self.cache_implementation = "LiteRTLMSplitCache"
+      self.moe_exports_implementation = "litert_moe_sequential"
 
     if self.enable_gpu_dynamic_prefill or self.enable_gpu_dynamic_cache:
       if self.enable_dynamic_shape:

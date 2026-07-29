@@ -44,6 +44,7 @@ from litert_torch.generative.export_hf.model_ext import extension as model_ext_e
 from litert_torch.generative.export_hf.model_ext import patches as model_ext_patches
 from litert_torch.generative.tools import tokenizer_to_sentencepiece_lib as tokenizer_lib
 import torch
+from torch import nn
 import transformers
 
 from ai_edge_litert.aot import aot_compile
@@ -150,6 +151,47 @@ def patch_builtin_tuple_for_export():
       del tuple_dict['to']
 
 
+def pre_split_model_experts(model: nn.Module) -> nn.Module:
+  """Splits 3D expert weight tensors into separate parameters to bypass LiteRT constant folding."""
+  for module in model.modules():
+    # Identify native MoE Experts modules
+    if (
+        hasattr(module, 'gate_up_proj')
+        and getattr(module, 'num_experts', None) is not None
+    ):
+
+      # 1. Pre-split gate_up_proj [num_experts, out_features, in_features]
+      gate_up_splits = torch.unbind(module.gate_up_proj.data, dim=0)
+      module.split_gate_up_proj = nn.ParameterList(
+          [nn.Parameter(w) for w in gate_up_splits]
+      )
+      delattr(module, 'gate_up_proj')  # Deletes the original 3D parameter
+
+      # 2. Pre-split down_proj [num_experts, out_features, in_features]
+      down_splits = torch.unbind(module.down_proj.data, dim=0)
+      module.split_down_proj = nn.ParameterList(
+          [nn.Parameter(w) for w in down_splits]
+      )
+      delattr(module, 'down_proj')
+
+      # 3. Pre-split optional biases if they exist
+      if getattr(module, 'gate_up_bias', None) is not None:
+        gate_up_bias_splits = torch.unbind(module.gate_up_bias.data, dim=0)
+        module.split_gate_up_bias = nn.ParameterList(
+            [nn.Parameter(b) for b in gate_up_bias_splits]
+        )
+        delattr(module, 'gate_up_bias')
+
+      if getattr(module, 'down_bias', None) is not None:
+        down_bias_splits = torch.unbind(module.down_bias.data, dim=0)
+        module.split_down_bias = nn.ParameterList(
+            [nn.Parameter(b) for b in down_bias_splits]
+        )
+        delattr(module, 'down_bias')
+
+  return model
+
+
 @progress.task('Load source model')
 def load_model(
     model_path: str,
@@ -178,6 +220,10 @@ def load_model(
     )
 
   config._attn_implementation = 'lrt_transposed_attention'  # pylint: disable=protected-access
+
+  config._experts_implementation = export_config.moe_exports_implementation  # pylint: disable=protected-access
+  if hasattr(config, 'text_config'):
+    config.text_config._experts_implementation = export_config.moe_exports_implementation  # pylint: disable=protected-access
 
   if task == ExportTask.TEXT_GENERATION:
     auto_model_cls = transformers.AutoModelForCausalLM
@@ -240,6 +286,9 @@ def load_model(
         tokenizer.chat_template = chat_template_dict['chat_template']  # pyrefly: ignore[missing-attribute]
     except Exception as e:  # pylint: disable=broad-exception-caught
       print(f'Failed to load chat template: {e}')
+
+  if export_config.moe_exports_implementation == 'litert_moe_sequential':
+    model = pre_split_model_experts(model)
 
   return SourceModelArtifacts(
       model=model,
