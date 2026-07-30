@@ -396,7 +396,12 @@ class Executor:
 
   def encode_images(self, decode_state: DecodeState):
     """Encodes the images."""
-    if decode_state.images is None or len(decode_state.images) == 0:
+    if (
+        decode_state.images is None
+        or len(decode_state.images) == 0
+        or self.mm_encoder_runner is None
+        or self.mm_adapter_runner is None
+    ):
       return decode_state
 
     num_images = len(decode_state.images)
@@ -404,24 +409,24 @@ class Executor:
     mm_embedding = None
     for i in range(num_images):
       img = decode_state.images[i]
-      img_features = self.mm_encoder_runner(  # pyrefly: ignore[not-callable]
+      img_features = self.mm_encoder_runner(
           **img,
       )
       img_features = img_features['features']
-      mm_embedding = self.mm_adapter_runner(  # pyrefly: ignore[not-callable]
+      mm_embedding = self.mm_adapter_runner(
           soft_tokens=img_features,
       )['mm_embedding']
       mm_embs.append(mm_embedding)
-    if mm_embs:
+    if mm_embs and mm_embedding is not None:
       mm_embedding = np.concatenate(mm_embs, axis=0)
     input_embeddings = decode_state.processed_embeds
 
-    if mm_embs:
+    if mm_embs and mm_embedding is not None:
       interleaved_embeddings = tokenizer_lib.interleave_media_features_in_text(
           input_embeddings,
           decode_state.index_media,
           decode_state.index_feat_in_media,
-          mm_embedding[None, ...],  # pyrefly: ignore[unsupported-operation]
+          mm_embedding[None, ...],
       )
     else:
       interleaved_embeddings = input_embeddings
@@ -1035,7 +1040,12 @@ class EncodingExecutor:
           self.embedder_runners[input_size],
       )['embeddings']
 
-      if images is not None and len(images) > 0:
+      if (
+          images is not None
+          and len(images) > 0
+          and self.mm_encoder_runner is not None
+          and self.mm_adapter_runner is not None
+      ):
         num_images = len(images)
         mm_embs = []
         mm_embedding = None
@@ -1048,15 +1058,15 @@ class EncodingExecutor:
               soft_tokens=img_features,
           )['mm_embedding']
           mm_embs.append(mm_embedding)
-        if mm_embs:
+        if mm_embs and mm_embedding is not None:
           mm_embedding = np.concatenate(mm_embs, axis=0)
 
-        embeds = tokenizer_lib.interleave_media_features_in_text(
-            embeds,
-            index_media,
-            index_feat_in_media,
-            mm_embedding[None, ...],
-        )
+          embeds = tokenizer_lib.interleave_media_features_in_text(
+              embeds,
+              index_media,
+              index_feat_in_media,
+              mm_embedding[None, ...],
+          )
 
       encodings = try_run_signature_with_quant_dequant(
           {

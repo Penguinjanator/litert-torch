@@ -237,7 +237,7 @@ def compile_litertlm(
     temp_dir_path = pathlib.Path(temp_dir)
     logging.info('Unpacking %s to %s', input_litertlm, temp_dir)
 
-    litertlm_peek.peek_litertlm_file(input_litertlm, temp_dir, sys.stdout)
+    litertlm_peek.peek_litertlm_file(str(input_litertlm), temp_dir, sys.stdout)
 
     toml_path = temp_dir_path / 'model.toml'
     if not toml_path.exists():
@@ -256,15 +256,17 @@ def compile_litertlm(
           model_path = temp_dir_path / relative_data_path
 
           should_compile = False
-          extra_flags = []
+          extra_flags: list[str] = []
 
           if model_type in configs:
             if isinstance(configs[model_type], list):
               should_compile = True
-              extra_flags = configs[model_type]
+              extra_flags = list(configs[model_type])
             elif isinstance(configs[model_type], dict):
               should_compile = configs[model_type].get('compile', True)
-              extra_flags = configs[model_type].get('flags', [])
+              raw_flags = configs[model_type].get('flags', [])
+              if isinstance(raw_flags, list):
+                extra_flags = list(raw_flags)
 
           if (
               should_compile
@@ -329,10 +331,13 @@ def compile_litertlm(
             # Resolve plugin directory from ai_edge_litert package
             try:
               apply_plugin_module = sys.modules[ApplyPlugin.__module__]
-              if apply_plugin_module and hasattr(
-                  apply_plugin_module, '__file__'
-              ):
-                apply_plugin_file = pathlib.Path(apply_plugin_module.__file__)
+              file_path = (
+                  getattr(apply_plugin_module, '__file__', None)
+                  if apply_plugin_module
+                  else None
+              )
+              if file_path is not None:
+                apply_plugin_file = pathlib.Path(file_path)
                 package_root = apply_plugin_file.parent.parent.parent
                 plugin_dir = package_root / 'vendors' / backend / 'compiler'
                 if not plugin_dir.exists():
