@@ -48,9 +48,9 @@ def build_llm_metadata(
     )
     llm_metadata.llm_model_type.gemma3n.end_of_image_token.token_str = eoi_token  # pyrefly: ignore[bad-assignment]
     llm_metadata.llm_model_type.gemma3n.image_tensor_height = (
-        image_processor.size['height']
+        image_processor.size['height']  # pyrefly: ignore[missing-attribute]
     )
     llm_metadata.llm_model_type.gemma3n.image_tensor_width = (
-        image_processor.size['width']
+        image_processor.size['width']  # pyrefly: ignore[missing-attribute]
     )
   return llm_metadata

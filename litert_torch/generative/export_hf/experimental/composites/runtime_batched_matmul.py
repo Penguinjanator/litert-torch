@@ -32,7 +32,7 @@ def runtime_bmm(
       "rhs_cache_update": True,  # If input is coming from cache_update custom.
   }
   builder = composite.StableHLOCompositeBuilder(
-      name="odml.runtime_bmm", attr=attrs  # pyrefly: ignore[bad-argument-type]
+      name="odml.runtime_bmm", attr=attrs
   )
   a, b, param_tensor = builder.mark_inputs(a, b, param_tensor)
 

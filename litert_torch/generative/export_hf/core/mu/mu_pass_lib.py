@@ -74,7 +74,7 @@ try:
         out.replace_by(mean_op.results[0])
         rewriter.erase_op(mul_op)
 
-  @HFTransformersOptimize.register_rewrite_pattern(tfl.CastOp)
+  @HFTransformersOptimize.register_rewrite_pattern(tfl.CastOp)  # pyrefly: ignore[bad-argument-type]
   def fuse_fp32cast_fc_fp16cast(op: tfl.CastOp, rewriter) -> None:
     """A pattern that fuse fp32 fp16 fc with cast ops."""
 

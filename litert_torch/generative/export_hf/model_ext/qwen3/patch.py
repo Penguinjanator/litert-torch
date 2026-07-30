@@ -180,9 +180,8 @@ class FusedQwen3Attention(torch.nn.Module):
       rope_base = 1000000.0
       if hasattr(self.config, "rope_parameters") and self.config.rope_parameters:
         if isinstance(self.config.rope_parameters, dict):
-          rope_base = float(
-              self.config.rope_parameters.get("rope_theta", rope_base)
-          )
+          val = self.config.rope_parameters.get("rope_theta", rope_base)
+          rope_base = float(val) if val is not None else rope_base
         elif hasattr(self.config.rope_parameters, "rope_theta"):
           rope_base = float(
               getattr(self.config.rope_parameters, "rope_theta", rope_base)
@@ -250,7 +249,7 @@ def qwen3_litert_patch():
   """Qwen3 patch."""
   print("Qwen3 patch applied.")
   original_norm = modeling_qwen3.Qwen3RMSNorm
-  modeling_qwen3.Qwen3RMSNorm = Qwen3RMSNorm
+  modeling_qwen3.Qwen3RMSNorm = Qwen3RMSNorm  # pyrefly: ignore[bad-assignment]
 
   attn_funs = transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS
   original_sdpa = attn_funs.get("sdpa")

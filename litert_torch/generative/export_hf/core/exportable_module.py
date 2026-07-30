@@ -137,7 +137,7 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
         pad_token_id = self.source_model_artifacts.tokenizer.pad_token_id
       if pad_token_id is None and getattr(text_config, "pad_token_id", None) is not None:
         pad_token_id = text_config.pad_token_id
-      if pad_token_id is None or pad_token_id < 0:
+      if not isinstance(pad_token_id, int) or pad_token_id < 0:
         pad_token_id = 0
       valid_mask = tokens != pad_token_id
     elif input_pos is not None:

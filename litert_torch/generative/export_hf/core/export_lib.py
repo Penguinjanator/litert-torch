@@ -216,7 +216,7 @@ def load_model(
         model=model,
         model_config=config,
         text_model_config=config,
-        tokenizer=tokenizer,
+        tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
     )
 
   config._attn_implementation = 'lrt_transposed_attention'  # pylint: disable=protected-access
@@ -369,7 +369,7 @@ def export_text_prefill_decode_model(
       ), 'Dynamic shape is not supported for split cache.'
       model.set_attn_implementation('lrt_split_cache_attention')
       # In case of the attn_implementation is not set.
-      model.config._attn_implementation = 'lrt_split_cache_attention'  # pylint: disable=protected-access
+      model.config._attn_implementation = 'lrt_split_cache_attention'  # pylint: disable=protected-access  # pyrefly: ignore[missing-attribute]
     else:
       model.set_attn_implementation('lrt_transposed_attention')
 
