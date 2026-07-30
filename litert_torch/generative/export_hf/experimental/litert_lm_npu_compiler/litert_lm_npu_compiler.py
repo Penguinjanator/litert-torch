@@ -14,12 +14,14 @@
 # ==============================================================================
 """Tool for compiling TFLite models inside .litertlm file for NPU."""
 
+import contextlib
 import json
 import os
 import pathlib
 import re
 import sys
 import tempfile
+
 try:
   import tomllib
 except ImportError:
@@ -45,36 +47,63 @@ def _open(path: str | pathlib.Path, mode: str = 'r'):
     return gfile.Open(str(path), mode)
   return open(path, mode)
 
+
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('input_litertlm', None, 'Path to input .litertlm file.')
-flags.DEFINE_string('output_litertlm', None, 'Path to output .litertlm file.')
-flags.DEFINE_enum(
-    'backend', None, ['qualcomm', 'mediatek'], 'Target NPU backend.'
+
+def _define_flag(define_fn, name, *args, **kwargs):
+  try:
+    return define_fn(name, *args, **kwargs)
+  except flags.DuplicateFlagError:
+    return flags.FLAGS[name]
+
+
+_define_flag(
+    flags.DEFINE_string, 'input_litertlm', None, 'Path to input .litertlm file.'
 )
-flags.DEFINE_string(
-    'soc_model', None, 'Target SoC model (e.g., SM8850, MT6993).'
+_define_flag(
+    flags.DEFINE_string,
+    'output_litertlm',
+    None,
+    'Path to output .litertlm file.',
 )
-flags.DEFINE_string(
+_define_flag(
+    flags.DEFINE_enum,
+    'backend',
+    None,
+    ['qualcomm', 'mediatek'],
+    'Target NPU backend.',
+)
+_define_flag(
+    flags.DEFINE_string,
+    'soc_model',
+    None,
+    'Target SoC model (e.g., SM8850, MT6993).',
+)
+_define_flag(
+    flags.DEFINE_string,
     'compile_configs',
     None,
     'JSON string or path to JSON file containing compilation flags for each'
     ' model type.',
 )
-flags.DEFINE_string(
+_define_flag(
+    flags.DEFINE_string,
     'model_name',
     None,
     'Model name to use default configurations (e.g., gemma4_2b).',
 )
-flags.DEFINE_bool(
+_define_flag(
+    flags.DEFINE_bool,
     'disable_weight_sharing',
     False,
     'Disable weight sharing for Qualcomm backend compiler.',
 )
-flags.DEFINE_bool(
+_define_flag(
+    flags.DEFINE_bool,
     'disable_aux_compilation',
     False,
-    'Disable compilation of the aux model.',
+    'Disable compiling aux model.',
 )
 
 
@@ -121,6 +150,9 @@ def _resolve_subgraphs_to_compile(
   return None
 
 
+_DEFAULT_INTERMEDIATE_ARTIFACTS_DIR = 'intermediate_compiler_artifacts'
+
+
 def compile_litertlm(
     input_litertlm: str | pathlib.Path,
     output_litertlm: str | pathlib.Path,
@@ -130,6 +162,8 @@ def compile_litertlm(
     model_name: str | None = None,
     disable_weight_sharing: bool = False,
     disable_aux_compilation: bool = False,
+    intermediate_dir: str | pathlib.Path | None = None,
+    keep_temporary_files: bool = False,
 ) -> None:
   """Compiles LiteRT-LM models inside a package for the target NPU.
 
@@ -138,8 +172,8 @@ def compile_litertlm(
     output_litertlm: Path to the output .litertlm file.
     backend: Target backend ('qualcomm' or 'mediatek').
     soc_model: SoC model ID (e.g. 'SM8850', 'MT6993').
-    compile_configs: Optional JSON string or dictionary representing
-      compilation configs.
+    compile_configs: Optional JSON string or dictionary representing compilation
+      configs.
     model_name: Optional model name to resolve model-specific default configs.
     disable_weight_sharing: If True, disables weight sharing for Qualcomm.
     disable_aux_compilation: If True, disables compiling auxiliary model.
@@ -185,7 +219,21 @@ def compile_litertlm(
 
   soc_manufacturer = _get_soc_manufacturer(backend)
 
-  with tempfile.TemporaryDirectory() as temp_dir:
+  if intermediate_dir:
+    temp_dir_path = pathlib.Path(intermediate_dir)
+    temp_dir_path.mkdir(parents=True, exist_ok=True)
+    ctx = contextlib.nullcontext(str(temp_dir_path))
+  elif keep_temporary_files:
+    temp_dir_path = (
+        pathlib.Path(str(output_litertlm)).parent
+        / _DEFAULT_INTERMEDIATE_ARTIFACTS_DIR
+    )
+    temp_dir_path.mkdir(parents=True, exist_ok=True)
+    ctx = contextlib.nullcontext(str(temp_dir_path))
+  else:
+    ctx = tempfile.TemporaryDirectory()
+
+  with ctx as temp_dir:
     temp_dir_path = pathlib.Path(temp_dir)
     logging.info('Unpacking %s to %s', input_litertlm, temp_dir)
 
@@ -241,11 +289,7 @@ def compile_litertlm(
           if model_type == 'aux' and disable_aux_compilation:
             should_compile = False
 
-          if (
-              should_compile
-              and model_type == 'aux'
-              and backend != 'qualcomm'
-          ):
+          if should_compile and model_type == 'aux' and backend != 'qualcomm':
             raise ValueError(
                 'Compiling aux model is only supported for Qualcomm backend.'
             )
@@ -312,7 +356,7 @@ def compile_litertlm(
                   input_model=input_model,
                   output_model=output_model,
                   soc_manufacturer=soc_manufacturer,
-                  soc_model=soc_model.upper(),
+                  soc_model=soc_model,
                   **kwargs,
               )
               os.replace(compiled_model_path, model_path)
@@ -330,6 +374,9 @@ def compile_litertlm(
               raise
 
     logging.info('Repacking to %s', output_litertlm)
+    output_dir = os.path.dirname(output_litertlm)
+    if output_dir and not os.path.exists(output_dir):
+      os.makedirs(output_dir, exist_ok=True)
     builder = litertlm_builder.LitertLmFileBuilder.from_toml_file(
         str(toml_path)
     )

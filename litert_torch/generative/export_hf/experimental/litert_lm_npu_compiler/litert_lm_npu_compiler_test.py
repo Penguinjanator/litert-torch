@@ -17,7 +17,6 @@
 import json
 import os
 import pathlib
-import sys
 from unittest import mock
 
 from absl.testing import absltest
@@ -230,7 +229,7 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
         input_litertlm=input_litertlm_path,
         output_litertlm=output_litertlm_path,
         backend='qualcomm',
-        soc_model='sm8550',
+        soc_model='SM8550',
         compile_configs=json.dumps({
             'prefill_decode': ['--qualcomm_enable_weight_sharing=true'],
             'aux': ['--qualcomm_optimization_level=O3'],
@@ -345,10 +344,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
         input_litertlm=input_litertlm_path,
         output_litertlm=output_litertlm_path,
         backend='qualcomm',
-        soc_model='sm8550',
+        soc_model='SM8550',
     )
 
-    self.assertEqual(len(compiled_instances), 2)
+    self.assertLen(compiled_instances, 2)
     prefill_decode_call = None
     aux_call = None
     for inst in compiled_instances:
@@ -380,7 +379,7 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     def apply_plugin_init_side_effect(*args, **kwargs):
       instance_mock = mock.MagicMock()
 
-      def compile_call_side_effect(*args, **kwargs):
+      def compile_call_side_effect(**kwargs):
         input_model = kwargs.get('input_model')
         output_model = kwargs.get('output_model')
         model_path = input_model.path
@@ -435,7 +434,7 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     )
 
     # Only prefill_decode should be compiled, aux should be skipped (not in configs for mediatek)
-    self.assertEqual(len(compiled_instances), 1)
+    self.assertLen(compiled_instances, 1)
     inst = compiled_instances[0]
     inst.assert_called_once()
     kwargs = inst.call_args[1]
@@ -502,11 +501,11 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
         input_litertlm=input_litertlm_path,
         output_litertlm=output_litertlm_path,
         backend='qualcomm',
-        soc_model='sm8550',
+        soc_model='SM8550',
         disable_weight_sharing=True,
     )
 
-    self.assertEqual(len(compiled_instances), 2)
+    self.assertLen(compiled_instances, 2)
 
     prefill_decode_call = None
     for inst in compiled_instances:
@@ -619,17 +618,19 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
         input_litertlm=input_litertlm_path,
         output_litertlm=output_litertlm_path,
         backend='qualcomm',
-        soc_model='sm8550',
+        soc_model='SM8550',
         disable_aux_compilation=True,
     )
 
     # Only prefill_decode should be compiled, aux should be skipped (disabled by flag)
-    self.assertEqual(len(compiled_instances), 1)
+    self.assertLen(compiled_instances, 1)
     inst = compiled_instances[0]
     inst.assert_called_once()
     args, kwargs = inst.call_args
     input_model = kwargs.get('input_model') or args[0]
-    self.assertTrue('prefill_decode' in str(input_model.path))
+    self.assertIn('prefill_decode', str(input_model.path))
+
+
 
 
 if __name__ == '__main__':
