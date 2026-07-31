@@ -25,7 +25,7 @@ Shape annotations used here:
 """
 
 import copy
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import jaxtyping as jt
 import litert_torch.generative.custom_ops.dynamic_update_slice as tfl_dus
@@ -373,13 +373,13 @@ class LiteRTLMConvCacheLayer(
       **kwargs,
   ):
     cache_utils.LinearAttentionCacheLayerMixin.__init__(self)
-    self.conv_states = conv_states
-    self.recurrent_states = recurrent_states
-    self.is_conv_states_initialized = True
-    self.is_recurrent_states_initialized = recurrent_states is not None
+    self.conv_states: Any = conv_states
+    self.recurrent_states: Any = recurrent_states
+    self.is_conv_states_initialized: Any = True
+    self.is_recurrent_states_initialized: Any = recurrent_states is not None
     self.batch_size = batch_size
     self.is_initialized = True
-    self.conv_kernel_size = conv_states.shape[-1]
+    self.conv_kernel_size: int = conv_states.shape[-1]
     self.keys = torch.zeros((1, 1, 1, 1))
     self.values = torch.zeros((1, 1, 1, 1))
 
@@ -403,6 +403,7 @@ class LiteRTLMConvCacheLayer(
   def update_conv_state(
       self,
       conv_states: torch.Tensor,
+      state_idx: int = 0,
       **kwargs) -> torch.Tensor:
     seq_len = conv_states.shape[-1]
     cache_kwargs = self.get_cache_runtime_args()
@@ -439,7 +440,7 @@ class LiteRTLMConvCacheLayer(
     return self.conv_states
 
   def update_recurrent_state(
-      self, recurrent_states: torch.Tensor, **kwargs
+      self, recurrent_states: torch.Tensor, state_idx: int = 0, **kwargs
   ) -> torch.Tensor:
     if self.recurrent_states is None:
       raise ValueError(
