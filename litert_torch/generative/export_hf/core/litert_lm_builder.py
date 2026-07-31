@@ -370,6 +370,23 @@ def package_model(
     with open(llm_metadata_path, 'wb') as f:
       f.write(llm_metadata.SerializeToString())
 
+  executor_metadata_builder = (
+      metadata_builder_lib.get_executor_metadata_builder(
+          source_model_artifacts.model.config  # pyrefly: ignore[bad-argument-type]
+      )
+  )
+  if executor_metadata_builder:
+    executor_metadata = executor_metadata_builder(
+        source_model_artifacts,
+        export_config,
+        exported_model_artifacts,
+    )
+    executor_metadata_path = os.path.join(work_dir, 'executor_metadata.pb')  # pyrefly: ignore[no-matching-overload]
+    with open(executor_metadata_path, 'wb') as f:
+      f.write(executor_metadata.SerializeToString())
+  else:
+    executor_metadata_path = None
+
   builder = litertlm_builder.LitertLmFileBuilder()
   builder.add_system_metadata(
       litertlm_builder.Metadata(
@@ -379,6 +396,8 @@ def package_model(
       )
   )
   builder.add_llm_metadata(llm_metadata_path)
+  if executor_metadata_path:
+    builder.add_executor_metadata(executor_metadata_path)
   assert (
       tokenizer_model_path is not None
   ), 'Exported tokenizer model path is not found.'

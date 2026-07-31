@@ -33,12 +33,14 @@ class Gemma3RMSNorm(torch.nn.Module):
     self.hidden_size = dim
 
   def forward(self, hidden_states):
+    dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
     return normalization.rms_norm_with_hlfb(
         hidden_states,
         self.weight + 1.0,
         self.variance_epsilon,
         torch.ones((self.hidden_size,), dtype=torch.float32),
-    )
+    ).to(dtype)
 
   def extra_repr(self):
     return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
