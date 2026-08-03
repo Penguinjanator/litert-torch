@@ -164,6 +164,7 @@ def compile_litertlm(
     disable_aux_compilation: bool = False,
     intermediate_dir: str | pathlib.Path | None = None,
     keep_temporary_files: bool = False,
+    overwrite: bool = True,
 ) -> None:
   """Compiles LiteRT-LM models inside a package for the target NPU.
 
@@ -177,11 +178,26 @@ def compile_litertlm(
     model_name: Optional model name to resolve model-specific default configs.
     disable_weight_sharing: If True, disables weight sharing for Qualcomm.
     disable_aux_compilation: If True, disables compiling auxiliary model.
+    intermediate_dir: If set, intermediate artifacts will be stored here. If not
+      set and keep_temporary_files is True, intermediate artifacts will be
+      stored in a temporary directory.
+    keep_temporary_files: If True, keep intermediate artifacts.
+    overwrite: If True, overwrite existing output file. If False, raise an error
+      if the output file already exists.
 
   Raises:
     ValueError: If compile options are invalid.
     RuntimeError: If compilation fails.
   """
+  if (
+      overwrite
+      and output_litertlm
+      and isinstance(output_litertlm, pathlib.Path)
+  ):
+    if output_litertlm.exists():
+      output_litertlm.unlink()
+  elif overwrite and output_litertlm and os.path.exists(str(output_litertlm)):
+    os.remove(str(output_litertlm))
   configs = {}
   if compile_configs:
     if isinstance(compile_configs, dict):
@@ -264,9 +280,9 @@ def compile_litertlm(
               extra_flags = list(configs[model_type])
             elif isinstance(configs[model_type], dict):
               should_compile = configs[model_type].get('compile', True)
-              raw_flags = configs[model_type].get('flags', [])
-              if isinstance(raw_flags, list):
-                extra_flags = list(raw_flags)
+              flags_val = configs[model_type].get('flags', [])
+              if isinstance(flags_val, list):
+                extra_flags = list(flags_val)
 
           if (
               should_compile
@@ -331,30 +347,60 @@ def compile_litertlm(
             # Resolve plugin directory from ai_edge_litert package
             try:
               apply_plugin_module = sys.modules[ApplyPlugin.__module__]
-              file_path = (
-                  getattr(apply_plugin_module, '__file__', None)
-                  if apply_plugin_module
-                  else None
-              )
-              if file_path is not None:
-                apply_plugin_file = pathlib.Path(file_path)
-                package_root = apply_plugin_file.parent.parent.parent
-                plugin_dir = package_root / 'vendors' / backend / 'compiler'
-                if not plugin_dir.exists():
-                  # Fallback for monorepo source tree layout
-                  plugin_dir = (
-                      package_root.parent / 'vendors' / backend / 'compiler'
-                  )
+              if apply_plugin_module:
+                apply_plugin_file_str = getattr(
+                    apply_plugin_module, '__file__', None
+                )
+                if apply_plugin_file_str is not None:
+                  apply_plugin_file = pathlib.Path(apply_plugin_file_str)
+                  package_root = apply_plugin_file.parent.parent.parent
+                  plugin_dir = package_root / 'vendors' / backend / 'compiler'
+                  if not plugin_dir.exists():
+                    # Fallback for monorepo source tree layout
+                    plugin_dir = (
+                        package_root.parent / 'vendors' / backend / 'compiler'
+                    )
 
-                if plugin_dir.exists():
-                  logging.info('Found plugin directory: %s', plugin_dir)
-                  kwargs['libs'] = str(plugin_dir)
-                else:
-                  logging.warning(
-                      'Could not find plugin directory for backend %s', backend
-                  )
+                  if plugin_dir.exists():
+                    logging.info('Found plugin directory: %s', plugin_dir)
+                    kwargs['libs'] = str(plugin_dir)
+                  else:
+                    logging.warning(
+                        'Could not find plugin directory for backend %s',
+                        backend,
+                    )
             except Exception as e:  # pylint: disable=broad-except
               logging.warning('Failed to resolve plugin directory: %s', e)
+
+            # Resolve vendor SDK library path if installed
+            try:
+              sdk_libs_path = None
+              if backend == 'qualcomm':
+                import ai_edge_litert_sdk_qualcomm  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+                sdk_libs_path = str(
+                    ai_edge_litert_sdk_qualcomm.path_to_sdk_libs()
+                )
+              elif backend == 'mediatek':
+                import ai_edge_litert_sdk_mediatek  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+                sdk_libs_path = str(
+                    ai_edge_litert_sdk_mediatek.path_to_sdk_libs()
+                )
+
+              if sdk_libs_path:
+                logging.info('Found vendor SDK library path: %s', sdk_libs_path)
+                kwargs['sdk_libs_path'] = sdk_libs_path
+            except ModuleNotFoundError:
+              logging.info(
+                  'Vendor SDK package not installed for %s. Falling back to'
+                  ' default search paths.',
+                  backend,
+              )
+            except Exception as e:  # pylint: disable=broad-except
+              logging.warning(
+                  'Failed to resolve vendor SDK library path: %s', e
+              )
 
             try:
               compiler(
