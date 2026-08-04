@@ -87,7 +87,7 @@ try:
 
     layer_types = getattr(text_config, 'layer_types', None)
     if layer_types is None:
-      raise ValueError('Model config does not have layer_types.')
+      layer_types = ['full_attention'] * text_config.num_hidden_layers
 
     for i, layer_type in enumerate(layer_types):
       if layer_type == 'linear_attention':
