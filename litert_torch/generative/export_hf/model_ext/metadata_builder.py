@@ -86,10 +86,15 @@ try:
     max_cache_length = export_config.cache_length
 
     layer_types = getattr(text_config, 'layer_types', None)
+    num_layers = text_config.num_hidden_layers
+    num_shared_layers = getattr(text_config, 'num_kv_shared_layers', 0)
+    num_layers -= num_shared_layers
     if layer_types is None:
-      layer_types = ['full_attention'] * text_config.num_hidden_layers
+      layer_types = ['full_attention'] * num_layers
 
     for i, layer_type in enumerate(layer_types):
+      if i >= num_layers:
+        break
       if layer_type == 'linear_attention':
         _add_state_buffer(
             llm_metadata,
