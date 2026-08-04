@@ -141,9 +141,8 @@ class LiteRTExportableModuleForEmbedder(torch.nn.Module):
     """Gets sample inputs."""
     del kwargs  # Unused.
     batch_size = export_config.batch_size
-    prefill_length = export_config.prefill_lengths[0]
-    prefill_length_dim = export_config.prefill_length_dim
     del model_config  # Unused.
+    prefill_length_dim = export_config.prefill_length_dim
     tokens = {"token_ids": torch.ones((batch_size, 1), dtype=torch.int32)}
     tokens_dynamic_shape = {"token_ids": {1: 1}} if prefill_length_dim else {}
     if export_config.single_token_embedder:
@@ -152,13 +151,17 @@ class LiteRTExportableModuleForEmbedder(torch.nn.Module):
       ret = {}
       ret["decode_embedder"] = (tokens, tokens_dynamic_shape)
 
-      tokens = {
-          "token_ids": torch.ones(
-              (batch_size, prefill_length), dtype=torch.int32
-          )
-      }
-      tokens_dynamic_shape = (
-          {"token_ids": {1: prefill_length_dim}} if prefill_length_dim else {}
-      )
-      ret[f"prefill_embedder_{prefill_length}"] = (tokens, tokens_dynamic_shape)
+      for prefill_length in export_config.prefill_lengths:
+        tokens = {
+            "token_ids": torch.ones(
+                (batch_size, prefill_length), dtype=torch.int32
+            )
+        }
+        tokens_dynamic_shape = (
+            {"token_ids": {1: prefill_length_dim}} if prefill_length_dim else {}
+        )
+        ret[f"prefill_embedder_{prefill_length}"] = (
+            tokens,
+            tokens_dynamic_shape,
+        )
       return ret
