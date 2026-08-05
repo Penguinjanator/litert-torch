@@ -781,7 +781,7 @@ def export_auxiliary_model(
   # Attention Mask
   sliding_window_sizes = [getattr(text_model_config, 'sliding_window', None)]
   attention_mask_module = split_cache_module.SplitAttentionMaskBuilder(
-      export_config.cache_length,
+      export_config,
       sliding_window_sizes=sliding_window_sizes,
   )
   sample_inputs = attention_mask_module.get_sample_inputs(

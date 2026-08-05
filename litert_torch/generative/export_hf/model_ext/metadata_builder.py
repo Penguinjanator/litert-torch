@@ -112,11 +112,26 @@ try:
             f'kv_cache_c_{i}',
             executor_metadata_pb2.StateBuffer.TYPE_LINEAR_ATTENTION,
         )
-      elif layer_type == 'full_attention' or layer_type == 'sliding_attention':
+      elif layer_type == 'full_attention':
         _add_state_buffer(
             llm_metadata,
             f'kv_cache_k_{i}',
             executor_metadata_pb2.StateBuffer.TYPE_GLOBAL_KEY_CACHE,
+            sequence_axis=export_config.k_ts_idx,
+            maximum_sequence_length=max_cache_length,
+        )
+        _add_state_buffer(
+            llm_metadata,
+            f'kv_cache_v_{i}',
+            executor_metadata_pb2.StateBuffer.TYPE_GLOBAL_VALUE_CACHE,
+            sequence_axis=export_config.v_ts_idx,
+            maximum_sequence_length=max_cache_length,
+        )
+      elif layer_type == 'sliding_attention':
+        _add_state_buffer(
+            llm_metadata,
+            f'kv_cache_k_{i}',
+            executor_metadata_pb2.StateBuffer.TYPE_LOCAL_KEY_CACHE,
             sequence_axis=export_config.k_ts_idx,
             maximum_sequence_length=max_cache_length,
             minimum_sequence_length=sliding_window_size,
@@ -124,7 +139,7 @@ try:
         _add_state_buffer(
             llm_metadata,
             f'kv_cache_v_{i}',
-            executor_metadata_pb2.StateBuffer.TYPE_GLOBAL_VALUE_CACHE,
+            executor_metadata_pb2.StateBuffer.TYPE_LOCAL_VALUE_CACHE,
             sequence_axis=export_config.v_ts_idx,
             maximum_sequence_length=max_cache_length,
             minimum_sequence_length=sliding_window_size,

@@ -40,6 +40,7 @@ class ExportableModuleConfig:
   trust_remote_code: bool = False
   prefill_lengths: list[int] = dataclasses.field(default_factory=lambda: [128])
   cache_length: int = 4096
+  sliding_window_ring_buffer_size: int | None = None
   # For quantization
   quantization_recipe: str | None = "dynamic_wi8_afp32"
   # For dynamic shape

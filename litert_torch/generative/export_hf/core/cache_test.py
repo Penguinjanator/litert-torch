@@ -45,7 +45,11 @@ def build_cache_data(
       value_cache = torch.randn(
           1, batch_size, head_dim, context_len, dtype=torch.float32
       )
-    cache_data.append(cache_lib.LiteRTLMCacheLayer(key_cache, value_cache))
+    cache_data.append(
+        cache_lib.LiteRTLMCacheLayer(
+            key_cache, value_cache, layer_type="full_attention"
+        )
+    )
   return cache_data
 
 
@@ -205,9 +209,9 @@ class CacheTest(googletest.TestCase):
         self.hidden_size = 256
         self.num_attention_heads = 8
         self.layer_types = [
-            "local_attention",
+            "sliding_attention",
             "full_attention",
-            "local_attention",
+            "sliding_attention",
             "full_attention",
         ]
         self.num_kv_shared_layers = 1

@@ -21,6 +21,7 @@ from litert_torch.generative.export_hf.core import attention as _
 from litert_torch.generative.export_hf.core.split_cache import attention as _
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import utils
+from litert_torch.generative.export_hf.core.sliding_window import attention_mask as sliding_window_attention_mask
 import torch
 
 ExportableModuleConfig = exportable_module_config.ExportableModuleConfig
@@ -85,6 +86,27 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
     sliding_window = getattr(text_config, "sliding_window", None)
     # TODO(weiyiw): This is a hack to check if it's Mistral.
     is_mistral = getattr(self.model.config, "model_type", "") == "mistral"
+
+    valid_mask = None
+    # Currently we generate the valid mask either from input tokens or position.
+    # But we should consider a unified way to do this or leave it to the
+    # pipeline to pass in as an argument.
+    if tokens is not None:
+      pad_token_id = getattr(text_config, "pad_token_id", 0)
+      if pad_token_id is None:
+        pad_token_id = 0
+      valid_mask = tokens != pad_token_id
+    elif input_pos is not None:
+      valid_mask_0 = torch.ones_like(input_pos[:1], dtype=torch.bool).unsqueeze(
+          0
+      )
+      if input_pos.shape[0] > 1:
+        valid_mask_1 = input_pos[1:] > input_pos[:-1]
+      else:
+        valid_mask_1 = torch.ones_like(input_pos[1:], dtype=torch.bool)
+      valid_mask_1 = valid_mask_1.unsqueeze(0)
+      valid_mask = torch.cat([valid_mask_0, valid_mask_1], dim=1)
+
     if sliding_window is not None:
       layer_types = getattr(text_config, "layer_types", None)
       masks = {
@@ -94,22 +116,61 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
           layer_types is not None and "sliding_attention" in layer_types
       ) or is_mistral
       if need_sliding_mask:
+        # TODO(weiyiw): Update LiteRT-LM to provide sliding window mask
+        # instead of computing it inside the model.
         if use_bool_mask:
-          masks["sliding_attention"] = utils.create_sliding_mask(
-              input_pos.clone().unsqueeze(0),
-              kv_cache.get_max_cache_shape(),
-              sliding_window,
-              use_bool_mask=True,
-          )
+          if self.export_config.sliding_window_ring_buffer_size:
+            assert (
+                self.export_config.sliding_window_ring_buffer_size
+                >= sliding_window
+            ), (
+                "Sliding window ring buffer size must be greater than or equal"
+                " to the sliding window size."
+            )
+            masks["sliding_attention"] = (
+                sliding_window_attention_mask.build_full_mask_with_valid_mask(
+                    valid_mask,
+                    sliding_window,
+                    self.export_config.sliding_window_ring_buffer_size,
+                    input_pos[0],
+                    use_bool_mask=True,
+                )
+            )
+          else:
+            masks["sliding_attention"] = utils.create_sliding_mask(
+                input_pos.clone().unsqueeze(0),
+                kv_cache.get_max_cache_shape(),
+                sliding_window,
+                use_bool_mask=True,
+            )
         else:
-          masks["sliding_attention"] = (
-              utils.create_sliding_mask(
-                  input_pos.clone().unsqueeze(0),
-                  kv_cache.get_max_cache_shape(),
-                  sliding_window,
-              )
-              + mask
-          )
+
+          if self.export_config.sliding_window_ring_buffer_size is not None:
+            assert (
+                self.export_config.sliding_window_ring_buffer_size
+                >= sliding_window
+            ), (
+                "Sliding window ring buffer size must be greater than or equal"
+                " to the sliding window size."
+            )
+            masks["sliding_attention"] = (
+                sliding_window_attention_mask.build_full_mask_with_valid_mask(
+                    valid_mask,
+                    sliding_window,
+                    self.export_config.sliding_window_ring_buffer_size,
+                    input_pos[0],
+                    use_bool_mask=False,
+                )
+            )
+          else:
+            masks["sliding_attention"] = (
+                utils.create_sliding_mask(
+                    input_pos.clone().unsqueeze(0),
+                    kv_cache.get_max_cache_shape(),
+                    sliding_window,
+                )
+                + mask
+            )
       if is_mistral:
         masks = masks["sliding_attention"]
     else:
@@ -163,6 +224,9 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
       cache_runtime_args["param_tensor"] = param_tensor
       ret["apply_gpu_composites"] = True
       ret["param_tensor"] = param_tensor
+    if self.export_config.sliding_window_ring_buffer_size is not None:
+      # Ring buffer cache implementation requires valid mask.
+      cache_runtime_args["valid_mask"] = valid_mask
     kv_cache.set_cache_runtime_args(cache_runtime_args)
     if kwargs.get("sdpa_use_composite", False):
       ret["sdpa_use_composite"] = kwargs["sdpa_use_composite"]

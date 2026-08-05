@@ -118,6 +118,8 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
 
   def _get_input(self, batch_size, input_length, cache_length):
 
+    export_config = self.export_config
+
     model_config = self.model.model.config
     if hasattr(model_config, 'text_config'):
       model_config = model_config.text_config
@@ -164,8 +166,17 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
         'global': torch.ones(mask_shape, dtype=torch.float32),
     }
     if utils.has_sliding_attention(self.model):
+      if export_config.sliding_window_ring_buffer_size is not None:
+        local_mask_shape = (
+            1,
+            1,
+            input_length,
+            export_config.sliding_window_ring_buffer_size + input_length,
+        )
+      else:
+        local_mask_shape = mask_shape
       mask.update({
-          'local': torch.ones(mask_shape, dtype=torch.float32),
+          'local': torch.ones(local_mask_shape, dtype=torch.float32),
       })
     sample_inputs.update({
         'mask': mask,
@@ -267,21 +278,29 @@ class SplitAttentionMaskBuilder(nn.Module):
 
   def __init__(
       self,
-      context_size: int,
+      export_config: base_exportable_module.ExportableModuleConfig,
       sliding_window_sizes: list[int | None] | None = None,
   ):
     super().__init__()
+    context_size = export_config.cache_length
+    sliding_window_ring_buffer_size = (
+        export_config.sliding_window_ring_buffer_size
+    )
     if sliding_window_sizes is None:
       sliding_window_sizes = [None]
     local_masks = {}
-    self.global_mask = attention_mask.SplitAttentionMask(context_size, None)
+    self.global_mask = attention_mask.SplitAttentionMask(
+        context_size, None, sliding_window_ring_buffer_size
+    )
     for sliding_window_size in sliding_window_sizes:
       if sliding_window_size is not None:
         local_masks[sliding_window_size] = attention_mask.SplitAttentionMask(
-            context_size, sliding_window_size
+            context_size, sliding_window_size, sliding_window_ring_buffer_size
         )
       else:
-        self.global_mask = attention_mask.SplitAttentionMask(context_size, None)
+        self.global_mask = attention_mask.SplitAttentionMask(
+            context_size, None, sliding_window_ring_buffer_size
+        )
     self.local_masks = local_masks
 
   def forward(
@@ -342,11 +361,14 @@ class CacheUpdate(torch.nn.Module):
       kv_slice: base_cache_lib.LiteRTLMCache,
       kv_cache: base_cache_lib.LiteRTLMCache,
       input_pos: torch.Tensor,
+      valid_mask: torch.Tensor | None = None,
   ):
     assert len(kv_slice.layers) == len(kv_cache.layers)
     num_layers = len(kv_slice.layers)
 
     cache_kwargs = {'cache_position': input_pos, 'kv_slice_preprocessed': True}
+    if valid_mask is not None:
+      cache_kwargs['valid_mask'] = valid_mask
     kv_cache.set_cache_runtime_args(cache_kwargs)
 
     for i in range(num_layers):
@@ -372,6 +394,8 @@ class CacheUpdate(torch.nn.Module):
     )
     slice_export_config = copy.deepcopy(export_config)
     slice_export_config.cache_length = input_length
+    if slice_export_config.sliding_window_ring_buffer_size is not None:
+      slice_export_config.sliding_window_ring_buffer_size = input_length
     kv_slice = base_cache_lib.LiteRTLMCache.create_from_config(
         model_config, slice_export_config
     )
@@ -379,6 +403,7 @@ class CacheUpdate(torch.nn.Module):
         'kv_cache': kv_cache,
         'kv_slice': kv_slice,
         'input_pos': torch.ones((input_length), dtype=torch.int32),
+        'valid_mask': torch.ones((1, input_length), dtype=torch.bool),
     }
 
   @classmethod

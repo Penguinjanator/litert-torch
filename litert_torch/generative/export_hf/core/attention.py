@@ -73,7 +73,13 @@ def scaled_dot_product_attention_transposed(
   else:
     assert k_ts_idx == 3, "k_ts_idx must be 2 or 3."
     bmm_fn = lambda x, y: torch.einsum("abth,abhs->abts", x, y)
-  logits = bmm_fn(query, key)
+  if isinstance(key, tuple):
+    key_past, key_slice = key
+    logits0 = bmm_fn(query, key_past)
+    logits1 = bmm_fn(query, key_slice)
+    logits = torch.cat([logits0, logits1], dim=-1)
+  else:
+    logits = bmm_fn(query, key)
 
   _, _, gt, _ = logits.shape
   g = gt // t
@@ -96,13 +102,20 @@ def scaled_dot_product_attention_transposed(
   padded_logits = builder.mark_inputs(padded_logits)
   probs = F.softmax(padded_logits, dim=-1)
   probs = builder.mark_outputs(probs)
-  probs = probs.type_as(key)
+  probs = probs.type_as(key[0] if isinstance(key, tuple) else key)
   if v_ts_idx == 3:
     bmm_fn = bmm_lib.bmm_4d
   else:
     assert v_ts_idx == 2, "v_ts_idx must be 2 or 3."
     bmm_fn = lambda x, y: torch.einsum("abts,absh->abth", x, y)
-  encoded = bmm_fn(probs, value)
+  if isinstance(value, tuple):
+    probs0, probs1 = probs[..., :-t], probs[..., -t:]
+    value_past, value_slice = value
+    encoded0 = bmm_fn(probs0, value_past)
+    encoded1 = bmm_fn(probs1, value_slice)
+    encoded = encoded0 + encoded1
+  else:
+    encoded = bmm_fn(probs, value)
 
   return encoded  # 1, bk, gt, h
 

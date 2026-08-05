@@ -93,16 +93,31 @@ _BACKEND = flags.DEFINE_enum(
 
 _LITERT_LM_MODEL_PATH = flags.DEFINE_string(
     'litert_lm_model_path',
-    '',
-    'Path to a LiteRT LM model to validate. If specified, the model will be'
-    ' used instead of exporting from Hugging Face.',
+    None,
+    'Path to the LiteRT LM model to validate. If not specified, will export '
+    'from HuggingFace.',
 )
+
+_DIFFBASE_LITERT_LM_MODEL_PATH = flags.DEFINE_string(
+    'diffbase_litert_lm_model_path',
+    None,
+    'Path to the LiteRT LM model to compare against. If not specified, will '
+    'compare against Transformers.',
+)
+
+_SLIDING_WINDOW_RING_BUFFER_SIZE = flags.DEFINE_integer(
+    'sliding_window_ring_buffer_size',
+    None,
+    'Size of the sliding window ring buffer.',
+)
+
 
 def run_transformers(
     model_id: str, prompts: list[str], max_new_tokens: int
 ) -> list[str]:
   print('Running transformers...')
   tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+  assert tokenizer is not None, 'Tokenizer is None'
   model = transformers.AutoModelForCausalLM.from_pretrained(
       model_id, torch_dtype=torch.float32
   )
@@ -114,7 +129,7 @@ def run_transformers(
   for prompt in prompts:
     if has_template:
       chat.append({'role': 'user', 'content': prompt})
-      formatted_prompt = tokenizer.apply_chat_template(  # pyrefly: ignore[missing-attribute]
+      formatted_prompt = tokenizer.apply_chat_template(
           chat, tokenize=False, add_generation_prompt=True
       )
     else:
@@ -207,8 +222,10 @@ def main(argv):
   print(f'Exporting model to {export_dir}...')
 
   try:
-    # Export model
-    if not _LITERT_LM_MODEL_PATH.value:
+    if _LITERT_LM_MODEL_PATH.value:
+      exported_model_path = _LITERT_LM_MODEL_PATH.value
+    else:
+      # Export model
       litert_torch_export.export(
           model=model_id,
           output_dir=export_dir,
@@ -218,17 +235,26 @@ def main(argv):
           externalize_embedder=_EXTERNALIZE_EMBEDDER.value,
           single_token_embedder=_SINGLE_TOKEN_EMBEDDER.value,
           split_cache=_SPLIT_CACHE.value,
+          sliding_window_ring_buffer_size=_SLIDING_WINDOW_RING_BUFFER_SIZE.value,
       )
 
       exported_model_path = os.path.join(export_dir, 'model.litertlm')
-    else:
-      exported_model_path = _LITERT_LM_MODEL_PATH.value
     if not os.path.exists(exported_model_path):
       raise FileNotFoundError(
           f'Exported model not found at {exported_model_path}'
       )
 
-    tf_outputs = run_transformers(model_id, prompts, max_new_tokens)
+    if _DIFFBASE_LITERT_LM_MODEL_PATH.value:
+      tf_outputs = run_litert_lm(
+          _DIFFBASE_LITERT_LM_MODEL_PATH.value,
+          prompts,
+          max_new_tokens,
+          _MAX_NUM_TOKENS.value,
+          _BACKEND.value,
+      )
+    else:
+      tf_outputs = run_transformers(model_id, prompts, max_new_tokens)
+
     lite_outputs = run_litert_lm(
         exported_model_path,
         prompts,

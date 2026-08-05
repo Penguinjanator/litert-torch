@@ -116,6 +116,7 @@ def export(
     aot_compilation_config_dict: dict[str, Any] | None = None,
     experimental_lightweight_conversion: bool = False,
     experimental_transpile_chat_template_for_minijinja: bool = False,
+    sliding_window_ring_buffer_size: int | None = None,
     # pylint: enable=unused-argument
     **kwargs,
 ):
@@ -157,6 +158,14 @@ def export(
       tokens.
     litert_lm_model_type_override: Overriding the LiteRT LM model type.
     litert_lm_llm_metadata_override: Overriding the LiteRT LM LLM metadata.
+    aot_backend: The backend to use for AOT compilation.
+    aot_soc_model: The SoC model to use for AOT compilation.
+    aot_compilation_config_dict: The configuration dictionary for AOT
+      compilation.
+    experimental_lightweight_conversion: Whether to use lightweight conversion,
+      which might speed up large model conversion, but might not work for all
+      models.
+    sliding_window_ring_buffer_size: The size of the sliding window ring buffer.
     **kwargs: Additional keyword arguments to pass to the exportable module
       config.
   """
