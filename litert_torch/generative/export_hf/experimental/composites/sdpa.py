@@ -136,11 +136,18 @@ def scaled_dot_product_attention_transposed(
   else:
     padded_logits = logits + mask
 
-  attrs = {"axis": -1}
-  builder = composite.StableHLOCompositeBuilder(name="odml.softmax", attr=attrs)
-  padded_logits = builder.mark_inputs(padded_logits)
+  # TODO(weiyiw): Re-enable this with when compiler is updated
+  if padded_logits.dtype != torch.float32:
+    attrs = {"axis": -1}
+    builder = composite.StableHLOCompositeBuilder(
+        name="odml.softmax", attr=attrs
+    )
+    padded_logits = builder.mark_inputs(padded_logits)
+  else:
+    builder = None
   probs = F.softmax(padded_logits, dim=-1)
-  probs = builder.mark_outputs(probs)
+  if builder is not None:
+    probs = builder.mark_outputs(probs)
   probs = probs.type_as(key)
   if param_tensor is not None:
     bmm_fn = lambda x, y: runtime_batched_matmul.runtime_bmm(
