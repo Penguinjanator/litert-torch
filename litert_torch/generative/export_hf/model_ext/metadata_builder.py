@@ -95,6 +95,11 @@ try:
     for i, layer_type in enumerate(layer_types):
       if i >= num_layers:
         break
+      if (
+          layer_type == 'sliding_attention'
+          and export_config.sliding_window_ring_buffer_size is None
+      ):
+        layer_type = 'full_attention'
       if layer_type == 'linear_attention':
         _add_state_buffer(
             llm_metadata,
