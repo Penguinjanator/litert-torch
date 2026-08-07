@@ -44,11 +44,11 @@ python3 -m litert_torch.generative.export_hf.experimental.calib.calibrate \
   --embedder_model_path=/tmp/gemma3_models/embedder.tflite \
   --auxiliary_model_path=/tmp/gemma3_models/aux.tflite \
   --spm_path=/tmp/gemma3_models/tokenizer.model \
-  --eval_task_names="my_custom_task" \
-  --dataset_dir=/tmp \
-  --dataset_format=json \
+  --calibration_eval_task_names="my_custom_task" \
+  --calibration_dataset_dir=/tmp \
+  --calibration_dataset_format=json \
   --calibration_result_save_dir=/tmp/calibration_oss/my_custom_task \
-  --max_decode_steps=128 \
+  --max_calibration_decode_steps=128 \
   --use_profiler_based_calibration=True \
   --enable_min_max_calibration_update=True
 ```

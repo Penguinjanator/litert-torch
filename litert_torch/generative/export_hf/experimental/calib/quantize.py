@@ -99,41 +99,33 @@ _OUTPUT_PATH = _define_flag(
     None,
     'Path to save the quantized TFLite model.',
 )
-_A16W8 = _define_flag(
+_USE_FLOAT_INPUT_OUTPUT_NORMALIZER = _define_flag(
     flags.DEFINE_bool,
-    'a16w8',
-    False,
-    'Whether to use 16-bit activation quantization.',
-)
-_ALIGN_KV_CACHE = _define_flag(
-    flags.DEFINE_bool,
-    'align_kv_cache',
+    'use_float_input_output_normalizer',
     True,
-    'Whether to align KV cache quantization parameters.',
+    'Whether to keep normalizer layers (e.g. RMS Norm, residual ADD) in float'
+    ' in the quantized model.',
 )
-_ALLOW_FLOAT_OPERATIONS = _define_flag(
-    flags.DEFINE_bool,
-    'allow_float_operations',
-    True,
-    'Whether to allow float operations (e.g. RMS Norm, residual ADD) in the'
-    ' quantized model.',
-)
+_DEFAULT_SKIP_MLIR_PASSES = True
+_DEFAULT_KV_CACHE_K_PATTERN = ['kv_cache_k_{}', 'kv_slice_k_{}']
+_DEFAULT_KV_CACHE_V_PATTERN = ['kv_cache_v_{}', 'kv_slice_v_{}']
+
 _SKIP_MLIR_PASSES = _define_flag(
     flags.DEFINE_bool,
     'skip_mlir_passes',
-    True,
+    _DEFAULT_SKIP_MLIR_PASSES,
     'Whether to skip post-quantization MLIR graph surgery passes.',
 )
 _KV_CACHE_K_NAME_PATTERN = _define_flag(
     flags.DEFINE_list,
     'kv_cache_k_name_pattern',
-    ['kv_cache_k_{}', 'kv_slice_k_{}'],
+    _DEFAULT_KV_CACHE_K_PATTERN,
     'List of patterns for KV cache K tensor names.',
 )
 _KV_CACHE_V_NAME_PATTERN = _define_flag(
     flags.DEFINE_list,
     'kv_cache_v_name_pattern',
-    ['kv_cache_v_{}', 'kv_slice_v_{}'],
+    _DEFAULT_KV_CACHE_V_PATTERN,
     'List of patterns for KV cache V tensor names.',
 )
 _AUX_MODEL_PATH = _define_flag(
@@ -194,7 +186,7 @@ def _apply_mlir_passes(
     quantization_result: Any, skip_mlir_passes: bool = False
 ) -> Any:
   """Applies MLIR QDQ and quantized BMM fusion passes."""
-  if skip_mlir_passes or _SKIP_MLIR_PASSES.value:
+  if skip_mlir_passes:
     return quantization_result
 
   print('--- Starting MLIR post-quantization passes...')
@@ -223,10 +215,8 @@ def quantize(
     ple_model_path: str | None = None,
     spm_path: str | None = None,
     transformers_model_path: str | None = None,
-    a16w8: bool = True,
-    allow_float_operations: bool = False,
+    use_float_input_output_normalizer: bool = False,
     skip_mlir_passes: bool = True,
-    align_kv_cache: bool = True,
     calibration_range_scale: float = 1.0,
     calibration_dir: str | None = None,
     quantization_recipe: str | None = None,
@@ -311,18 +301,17 @@ def quantize(
           aux_calibration_result, calibration_range_scale
       )
 
-  if align_kv_cache:
-    print('--- Aligning KV cache parameters across models...')
-    quant_utils.align_kv_cache_params(
-        calibration_results=calibration_result,
-        model_path=model_path,
-        kv_cache_k_patterns=kv_cache_k_name_pattern
-        or _KV_CACHE_K_NAME_PATTERN.value,
-        kv_cache_v_patterns=kv_cache_v_name_pattern
-        or _KV_CACHE_V_NAME_PATTERN.value,
-        aux_calibration_results=aux_calibration_result,
-        aux_model_path=aux_model_path,
-    )
+  print('--- Aligning KV cache parameters across models...')
+  quant_utils.align_kv_cache_params(
+      calibration_results=calibration_result,
+      model_path=model_path,
+      kv_cache_k_patterns=kv_cache_k_name_pattern
+      or _DEFAULT_KV_CACHE_K_PATTERN,
+      kv_cache_v_patterns=kv_cache_v_name_pattern
+      or _DEFAULT_KV_CACHE_V_PATTERN,
+      aux_calibration_results=aux_calibration_result,
+      aux_model_path=aux_model_path,
+  )
 
   print(f'--- Initializing Quantizer for model: {model_path} ...')
   q_main = quantizer.Quantizer(model_path)
@@ -331,8 +320,8 @@ def quantize(
   else:
     q_main = quant_utils.add_main_model_quant_recipe(
         q_main,
-        allow_float_operations=allow_float_operations,
-        a16w8=a16w8,
+        allow_float_operations=use_float_input_output_normalizer,
+        a16w8=True,
     )
 
   print('--- Running main model quantization...')
@@ -364,8 +353,8 @@ def quantize(
     else:
       q_aux = quant_utils.add_main_model_quant_recipe(
           q_aux,
-          allow_float_operations=allow_float_operations,
-          a16w8=a16w8,
+          allow_float_operations=use_float_input_output_normalizer,
+          a16w8=True,
       )
 
     print('--- Running aux model quantization...')
@@ -422,10 +411,8 @@ def main(argv: Sequence[str]) -> None:
       ple_model_path=_PLE_MODEL_PATH.value,
       spm_path=_SPM_PATH.value,
       transformers_model_path=_TRANSFORMERS_MODEL_PATH.value,
-      a16w8=_A16W8.value,
-      allow_float_operations=_ALLOW_FLOAT_OPERATIONS.value,
+      use_float_input_output_normalizer=_USE_FLOAT_INPUT_OUTPUT_NORMALIZER.value,
       skip_mlir_passes=_SKIP_MLIR_PASSES.value,
-      align_kv_cache=_ALIGN_KV_CACHE.value,
       calibration_range_scale=_CALIBRATION_RANGE_SCALE.value,
       kv_cache_k_name_pattern=_KV_CACHE_K_NAME_PATTERN.value,
       kv_cache_v_name_pattern=_KV_CACHE_V_NAME_PATTERN.value,

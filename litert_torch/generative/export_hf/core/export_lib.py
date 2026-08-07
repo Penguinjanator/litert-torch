@@ -32,13 +32,12 @@ from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import patches as _
 from litert_torch.generative.export_hf.core import utils
 from litert_torch.generative.export_hf.core.external_emb import exportable_module as external_emb_module
-
-ExportTask = exportable_module_config.ExportTask
 from litert_torch.generative.export_hf.core.external_rope import exportable_module as external_rope_module
 from litert_torch.generative.export_hf.core.external_rope import preprocess_model as external_rope_preprocess_model
 from litert_torch.generative.export_hf.core.mu import mu_pass_lib
 from litert_torch.generative.export_hf.core.split_cache import attention as _
 from litert_torch.generative.export_hf.core.split_cache import exportable_module as split_cache_module
+from litert_torch.generative.export_hf.experimental.litert_lm_npu_compiler import litert_lm_npu_compiler
 from litert_torch.generative.export_hf.model_ext import exportables as model_ext_exportables
 from litert_torch.generative.export_hf.model_ext import extension as model_ext_extension
 from litert_torch.generative.export_hf.model_ext import patches as model_ext_patches
@@ -52,6 +51,8 @@ from ai_edge_litert.aot.core import aot_types
 from ai_edge_litert.aot.vendors import import_vendor
 from ai_edge_quantizer import quantizer as quantizer_lib
 from ai_edge_quantizer import recipe as recipe_lib
+
+ExportTask = exportable_module_config.ExportTask
 
 
 @dataclasses.dataclass
@@ -125,9 +126,9 @@ def verify_model_compatibility(model, model_config, text_model_config):
 
 @contextlib.contextmanager
 def patch_builtin_tuple_for_export():
-  """Context manager that temporarily injects a .to() method into Python's
+  """Temporarily injects a .to() method into Python's built-in tuple type.
 
-  built-in tuple type, and safely removes it upon exiting the scope.
+  Safely removes it upon exiting the scope.
   """
   tuple_dict = gc.get_referents(tuple.__dict__)[0]
 
@@ -240,7 +241,8 @@ def load_model(
       model = auto_model_cls.from_config(
           config=config,
           torch_dtype=torch.float32,
-          trust_remote_code=trust_remote_code)
+          trust_remote_code=trust_remote_code,
+      )
     else:
       model = auto_model_cls.from_pretrained(
           model_path,
@@ -376,8 +378,12 @@ def export_text_prefill_decode_model(
     prefill_module_cls, decode_module_cls = get_prefill_decode_exportable_cls(
         source_model_artifacts.model_config, export_config
     )
-    prefill_module = prefill_module_cls(model, export_config, source_model_artifacts)
-    decode_module = decode_module_cls(model, export_config, source_model_artifacts)
+    prefill_module = prefill_module_cls(
+        model, export_config, source_model_artifacts
+    )
+    decode_module = decode_module_cls(
+        model, export_config, source_model_artifacts
+    )
     converter = converter_utils.Converter()
     sample_prefill_inputs = prefill_module.get_sample_inputs(text_model_config)
     for signature_name, (
@@ -964,7 +970,12 @@ def aot_compile_model(
     export_config: exportable_module.ExportableModuleConfig,
     exported_model_artifacts: ExportedModelArtifacts,
 ):
-  """AOT compiles the model."""
+  """AOT compiles the model.
+
+  DEPRECATED: This legacy compilation workflow (which compiles individual
+  sub-models before packaging) is deprecated and will be removed soon. Please
+  use the LiteRT-LM package compiler `compile_litertlm` instead.
+  """
   del source_model_artifacts  # Unused.
   assert export_config.aot_backend is not None
   assert export_config.aot_soc_model is not None
@@ -1000,3 +1011,32 @@ def aot_compile_model(
       exported_model_artifacts,
       prefill_decode_model_path=output_path,
   )
+
+
+@progress.task('NPU Package Compilation')
+def compile_litertlm_bundle(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+):
+  """Compiles the packaged .litertlm file using the new NPU compiler."""
+
+  model_name = source_model_artifacts.model_config.model_type
+  litert_lm_model_path = exported_model_artifacts.litert_lm_model_path
+  assert litert_lm_model_path is not None, 'LiteRT-LM model path not found.'
+
+  backend = export_config.aot_backend
+  soc_model = export_config.aot_soc_model
+  assert backend is not None, 'aot_backend is required for compilation.'
+  assert soc_model is not None, 'aot_soc_model is required for compilation.'
+
+  litert_lm_npu_compiler.compile_litertlm(
+      input_litertlm=litert_lm_model_path,
+      output_litertlm=litert_lm_model_path,
+      backend=backend,
+      soc_model=soc_model,
+      compile_configs=export_config.compile_configs,
+      model_name=model_name,
+      overwrite=True,
+  )
+  return exported_model_artifacts

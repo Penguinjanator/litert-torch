@@ -87,21 +87,19 @@ def npu_export(
 def npu_calibrate(
     cfg: NpuPipelineConfig,
     input_litertlm: str,
-    dataset_dir: str,
+    calibration_dataset_dir: str,
     calibration_result_save_dir: str,
     **kwargs: Any,
 ) -> None:
   """Runs Stage 2 Profiler Calibration bound to NpuPipelineConfig."""
   overrides = {
       "input_litertlm": input_litertlm,
-      "dataset_dir": dataset_dir,
+      "calibration_dataset_dir": calibration_dataset_dir,
       "calibration_result_save_dir": calibration_result_save_dir,
       **kwargs,
   }
   name_map = {
       "kv_cache_max_len": "cache_length",
-      "dataset_format": "calib_dataset_format",
-      "eval_task_names": "calib_eval_task_names",
   }
   bound_args = _bind_cfg(cfg, calib_func, overrides, name_map=name_map)
   calib_func(**bound_args)
@@ -125,7 +123,6 @@ def npu_quantize(
       cfg,
       quant_func,
       overrides,
-      name_map={"a16w8": "use_16bits_activations"},
   )
   if "quantization_recipe" not in overrides:
     bound_args.pop("quantization_recipe", None)

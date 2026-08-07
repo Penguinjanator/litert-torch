@@ -25,13 +25,13 @@ from litert_torch.generative.export_hf.experimental.npu_export import stages
 def dummy_func(
     model: str | None = None,
     cache_length: int = 0,
-    max_decode_steps: int = 0,
+    max_calibration_decode_steps: int = 0,
     custom_flag: bool = False,
 ) -> dict[str, Any]:
   return {
       "model": model,
       "cache_length": cache_length,
-      "max_decode_steps": max_decode_steps,
+      "max_calibration_decode_steps": max_calibration_decode_steps,
       "custom_flag": custom_flag,
   }
 
@@ -44,14 +44,14 @@ class StagesTest(absltest.TestCase):
         target_vendor="qualcomm",
         target_soc="SM8850",
         cache_length=2048,
-        max_decode_steps=64,
+        max_calibration_decode_steps=64,
     )
     bound = stages._bind_cfg(
         cfg, dummy_func, {"custom_flag": True}, name_map={"model": "model_id"}
     )
     self.assertEqual(bound["model"], "google/gemma-3-270m-it")
     self.assertEqual(bound["cache_length"], 2048)
-    self.assertEqual(bound["max_decode_steps"], 64)
+    self.assertEqual(bound["max_calibration_decode_steps"], 64)
     self.assertTrue(bound["custom_flag"])
 
   def test_bind_cfg_user_override_precedence(self):
@@ -79,7 +79,7 @@ class StagesTest(absltest.TestCase):
         target_vendor="qualcomm",
         target_soc="SM8850",
         cache_length=2048,
-        max_decode_steps=64,
+        max_calibration_decode_steps=64,
     )
     bound_export = stages._bind_cfg(
         cfg,
@@ -99,29 +99,25 @@ class StagesTest(absltest.TestCase):
         stages.calib_func,
         {
             "input_litertlm": "/tmp/model.litertlm",
-            "dataset_dir": "/tmp/data",
+            "calibration_dataset_dir": "/tmp/data",
             "calibration_result_save_dir": "/tmp/out",
         },
         name_map={
             "kv_cache_max_len": "cache_length",
-            "dataset_format": "calib_dataset_format",
-            "eval_task_names": "calib_eval_task_names",
         },
     )
-    self.assertEqual(bound_calib["max_decode_steps"], 64)
+    self.assertEqual(bound_calib["max_calibration_decode_steps"], 64)
     self.assertEqual(bound_calib["kv_cache_max_len"], 2048)
-    self.assertEqual(bound_calib["dataset_format"], "jsonl")
-    self.assertEqual(bound_calib["eval_task_names"], "ALL")
+    self.assertEqual(bound_calib["calibration_dataset_format"], "jsonl")
+    self.assertEqual(bound_calib["calibration_eval_task_names"], "ALL")
     self.assertEqual(bound_calib["calibration_result_save_dir"], "/tmp/out")
 
     bound_quant = stages._bind_cfg(
         cfg,
         stages.quant_func,
         {"input_litertlm": "/tmp/model.litertlm", "output_litertlm": "/tmp/q"},
-        name_map={"a16w8": "use_16bits_activations"},
     )
-    self.assertEqual(bound_quant["a16w8"], True)
-    self.assertEqual(bound_quant["allow_float_operations"], False)
+    self.assertEqual(bound_quant["use_float_input_output_normalizer"], False)
 
     bound_compile = stages._bind_cfg(
         cfg,
@@ -161,8 +157,6 @@ class StagesTest(absltest.TestCase):
     self.assertEqual(cfg.soc_model, "SM8750")
     self.assertEqual(cfg.weight_quantization_recipe, "dynamic_wi8_afp32")
     self.assertEqual(cfg.quantization_recipe, "dynamic_wi8_afp32")
-    self.assertTrue(cfg.use_16bits_activations)
-    self.assertTrue(cfg.a16w8)
 
 
 if __name__ == "__main__":

@@ -478,9 +478,11 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     return cls(
         keys,
         values,
+        # pytype: disable=bad-argument-type
         k_ts_idx=export_config.k_ts_idx,
         v_ts_idx=export_config.v_ts_idx,
         layer_type=layer_type,
+        # pytype: enable=bad-argument-type
         **kwargs,
     )
 
@@ -558,10 +560,13 @@ class LiteRTLMConvCacheLayer(
 
     if seq_len > 1:
       if valid_mask is not None:
-        L_state = self.conv_kernel_size
+        l_state = self.conv_kernel_size
         num_real = valid_mask.to(torch.int32).sum(dtype=torch.int32)
         start = num_real
-        idx = torch.arange(L_state, device=conv_states.device, dtype=torch.int32) + start
+        idx = (
+            torch.arange(l_state, device=conv_states.device, dtype=torch.int32)
+            + start
+        )
         next_state = padded_input[:, :, idx]
       else:
         next_state = padded_input[:, :, -self.conv_kernel_size:]
@@ -632,8 +637,8 @@ class LiteRTLMConvCacheLayer(
           * model_config.linear_num_value_heads
       )
       conv_dim = key_dim * 2 + value_dim
-      conv_L_cache = model_config.linear_conv_kernel_dim - 1
-      c_state_shape = (batch_size, conv_dim, conv_L_cache)
+      conv_cache_len = model_config.linear_conv_kernel_dim - 1
+      c_state_shape = (batch_size, conv_dim, conv_cache_len)
       r_state_shape = (
           batch_size,
           model_config.linear_num_value_heads,

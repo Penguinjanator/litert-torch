@@ -104,12 +104,11 @@ _TRANSFORMERS_MODEL_PATH = _define_flag(
     'Path to the transformers model directory (containing tokenizer.json).',
 )
 
-_EVAL_TASK_NAMES = _define_flag(
+_CALIBRATION_EVAL_TASK_NAMES = _define_flag(
     flags.DEFINE_list,
-    'eval_task_names',
-    '',
-    'Comma-separated list of eval task name(s) to run. If ALL is included,'
-    ' run all tasks in eval_task_utils.EVAL_TASK_RIEGELI_PATH.',
+    'calibration_eval_task_names',
+    'ALL',
+    'Comma-separated list of calibration task name(s) to run.',
 )
 
 _CALIBRATION_RESULT_SAVE_DIR = _define_flag(
@@ -117,7 +116,6 @@ _CALIBRATION_RESULT_SAVE_DIR = _define_flag(
     'calibration_result_save_dir',
     None,
     'Path to the output calibration result directory.',
-    required=True,
 )
 
 _ENABLE_FORMATTING = _define_flag(
@@ -147,9 +145,9 @@ _EMA_SMOOTHING_FACTOR = _define_flag(
     ' updates.',
 )
 
-_MAX_DECODE_STEPS = _define_flag(
+_MAX_CALIBRATION_DECODE_STEPS = _define_flag(
     flags.DEFINE_integer,
-    'max_decode_steps',
+    'max_calibration_decode_steps',
     None,
     'Maximum number of decode steps.',
 )
@@ -161,32 +159,33 @@ _MAX_EXAMPLES = _define_flag(
     'Maximum number of examples to process per task.',
 )
 
-_DATASET_DIR = _define_flag(
+_CALIBRATION_DATASET_DIR = _define_flag(
     flags.DEFINE_string,
-    'dataset_dir',
+    'calibration_dataset_dir',
     None,
     'Path to the dataset directory. If not specified, uses the default CNS'
     ' path.',
 )
 
-_DEFAULT_DATASET_FORMAT = 'json'
+_DEFAULT_DATASET_FORMAT = 'jsonl'
+_DATASET_FORMAT_CHOICES = ['json', 'jsonl']
 
-_DATASET_FORMAT = _define_flag(
+_CALIBRATION_DATASET_FORMAT = _define_flag(
     flags.DEFINE_enum,
-    'dataset_format',
+    'calibration_dataset_format',
     _DEFAULT_DATASET_FORMAT,
-    ['riegeli', 'json', 'jsonl'],
+    _DATASET_FORMAT_CHOICES,
     'Format of the dataset.',
 )
 
 
 def calibrate(
     input_litertlm: str | None = None,
-    dataset_dir: str | None = None,
+    calibration_dataset_dir: str | None = None,
     calibration_result_save_dir: str | None = None,
-    dataset_format: str = 'riegeli',
-    eval_task_names: list[str] | str = 'ALL',
-    max_decode_steps: int = 32,
+    calibration_dataset_format: str = 'riegeli',
+    calibration_eval_task_names: list[str] | str = 'ALL',
+    max_calibration_decode_steps: int = 32,
     use_profiler_based_calibration: bool = True,
     enable_min_max_calibration_update: bool = True,
     max_examples: int | None = None,
@@ -269,12 +268,14 @@ def calibrate(
   else:
     state = quant_utils.CalibrationState()
 
-  ext = dataset_format
+  ext = calibration_dataset_format
   task_names_list = (
-      [eval_task_names] if isinstance(eval_task_names, str) else eval_task_names
+      [calibration_eval_task_names]
+      if isinstance(calibration_eval_task_names, str)
+      else calibration_eval_task_names
   )
   tasks = quant_utils.get_calibration_tasks(
-      task_names_list, dataset_dir=dataset_dir, ext=ext
+      task_names_list, dataset_dir=calibration_dataset_dir, ext=ext
   )
   task_items = list(tasks.items())
 
@@ -284,9 +285,9 @@ def calibrate(
       continue
 
     print(f'\n--- Running calibration for task: {task_name} ---')
-    if dataset_format == 'json':
+    if calibration_dataset_format == 'json':
       examples = quant_utils.read_from_json(dataset_path)
-    elif dataset_format == 'jsonl':
+    elif calibration_dataset_format == 'jsonl':
       examples = quant_utils.read_from_jsonl(dataset_path)
     else:
       raise ValueError("Only json and jsonl formats are supported in OSS.")
@@ -316,7 +317,9 @@ def calibrate(
           tokenizer=executor.tokenizer,
       )
       print(f'Processing example {i+1}/{len(examples)}')
-      result = executor.sample_text(prompt, max_sample_step=max_decode_steps)
+      result = executor.sample_text(
+          prompt, max_sample_step=max_calibration_decode_steps
+      )
       print(f'Result: {result}')
 
       state.update(len(examples))
@@ -333,6 +336,9 @@ def main(argv: Sequence[str]) -> None:
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
+  if not _CALIBRATION_RESULT_SAVE_DIR.value:
+    raise app.UsageError('Must specify --calibration_result_save_dir.')
+
   if (
       not _SPM_PATH.value
       and not _TRANSFORMERS_MODEL_PATH.value
@@ -345,11 +351,11 @@ def main(argv: Sequence[str]) -> None:
 
   calibrate(
       input_litertlm=_INPUT_LITERTLM.value,
-      dataset_dir=_DATASET_DIR.value,
+      calibration_dataset_dir=_CALIBRATION_DATASET_DIR.value,
       calibration_result_save_dir=_CALIBRATION_RESULT_SAVE_DIR.value,
-      dataset_format=_DATASET_FORMAT.value,
-      eval_task_names=_EVAL_TASK_NAMES.value,
-      max_decode_steps=_MAX_DECODE_STEPS.value,
+      calibration_dataset_format=_CALIBRATION_DATASET_FORMAT.value,
+      calibration_eval_task_names=_CALIBRATION_EVAL_TASK_NAMES.value,
+      max_calibration_decode_steps=_MAX_CALIBRATION_DECODE_STEPS.value,
       use_profiler_based_calibration=_USE_PROFILER_BASED_CALIBRATION.value,
       enable_min_max_calibration_update=_ENABLE_MIN_MAX_CALIBRATION_UPDATE.value,
       max_examples=_MAX_EXAMPLES.value,

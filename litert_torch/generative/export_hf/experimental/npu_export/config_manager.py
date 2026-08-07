@@ -40,24 +40,22 @@ class NpuPipelineConfig:
   soc_model: str
   overwrite: bool = True
   weight_quantization_recipe: str = "dynamic_wi8_afp32"
-  use_16bits_activations: bool = True
   k_ts_idx: int = 3
   v_ts_idx: int = 2
-  allow_float_operations: bool = False
+  use_float_input_output_normalizer: bool = False
   skip_mlir_passes: bool = True
   prefill_lengths: list[int] = dataclasses.field(default_factory=lambda: [128])
   cache_length: int = 1280
-  max_decode_steps: int = 32
+  max_calibration_decode_steps: int = 32
 
   # Stage 2 Calibration Configuration Defaults
-  calib_dataset_format: str = "jsonl"
-  calib_eval_task_names: str | list[str] = "ALL"
+  calibration_dataset_format: str = "jsonl"
+  calibration_eval_task_names: str | list[str] = "ALL"
   use_profiler_based_calibration: bool = True
   enable_min_max_calibration_update: bool = True
   ema_smoothing_factor: float = 0.1
 
   # Stage 3 Static Range Quantization Defaults
-  align_kv_cache: bool = True
   calibration_range_scale: float = 1.0
 
   @property
@@ -68,15 +66,6 @@ class NpuPipelineConfig:
   @quantization_recipe.setter
   def quantization_recipe(self, value: str) -> None:
     self.weight_quantization_recipe = value
-
-  @property
-  def a16w8(self) -> bool:
-    """Backward-compatible property alias pointing to use_16bits_activations."""
-    return self.use_16bits_activations
-
-  @a16w8.setter
-  def a16w8(self, value: bool) -> None:
-    self.use_16bits_activations = value
 
   def print_summary(self) -> None:
     """Prints a formatted summary table of all resolved configuration fields."""
@@ -90,7 +79,6 @@ class NpuPipelineConfig:
         "backend",
         "soc_model",
         "quantization_recipe",
-        "a16w8",
     }
     for field in dataclasses.fields(self):
       if field.name in printed:
@@ -123,8 +111,6 @@ class NpuPipelineConfig:
         and "weight_quantization_recipe" not in data
     ):
       data["weight_quantization_recipe"] = data.pop("quantization_recipe")
-    if "a16w8" in data and "use_16bits_activations" not in data:
-      data["use_16bits_activations"] = data.pop("a16w8")
     valid_fields = {f.name for f in dataclasses.fields(cls)}
     clean_kwargs = {k: v for k, v in data.items() if k in valid_fields}
     cfg = cls(**clean_kwargs)
@@ -161,7 +147,7 @@ def build_pipeline_config(
     target_soc: str,
     prefill_lengths: list[int] | None = None,
     cache_length: int | None = None,
-    max_decode_steps: int | None = None,
+    max_calibration_decode_steps: int | None = None,
     **user_overrides: Any,
 ) -> NpuPipelineConfig:
   """Factory function that builds a validated and resolved NpuPipelineConfig.
@@ -172,7 +158,8 @@ def build_pipeline_config(
     target_soc: Target SoC ID (e.g. 'sm8850'). Validated against supported SoCs.
     prefill_lengths: User-specified prefill sequence buckets.
     cache_length: User-specified KV cache capacity.
-    max_decode_steps: User-specified calibration decode sample steps.
+    max_calibration_decode_steps: User-specified calibration decode sample
+      steps.
     **user_overrides: Additional ad-hoc property overrides for
       NpuPipelineConfig.
 
@@ -209,8 +196,8 @@ def build_pipeline_config(
     merged["prefill_lengths"] = prefill_lengths
   if cache_length is not None:
     merged["cache_length"] = cache_length
-  if max_decode_steps is not None:
-    merged["max_decode_steps"] = max_decode_steps
+  if max_calibration_decode_steps is not None:
+    merged["max_calibration_decode_steps"] = max_calibration_decode_steps
   for k, v in user_overrides.items():
     if v is not None:
       merged[k] = v
@@ -220,8 +207,6 @@ def build_pipeline_config(
       and "weight_quantization_recipe" not in merged
   ):
     merged["weight_quantization_recipe"] = merged.pop("quantization_recipe")
-  if "a16w8" in merged and "use_16bits_activations" not in merged:
-    merged["use_16bits_activations"] = merged.pop("a16w8")
 
   valid_fields = {f.name for f in dataclasses.fields(NpuPipelineConfig)}
   clean_kwargs = {k: v for k, v in merged.items() if k in valid_fields}

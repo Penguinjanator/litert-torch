@@ -20,6 +20,7 @@ import pprint
 from typing import Any
 
 from litert_torch.generative.export_hf.core import utils
+from litert_torch.generative.export_hf.experimental.npu_export.configs import vendor_configs
 import torch
 
 
@@ -52,8 +53,8 @@ class ExportableModuleConfig:
   # Export configs
   externalize_embedder: bool = False
   single_token_embedder: bool = False
-  k_ts_idx: int = 2
-  v_ts_idx: int = 3
+  k_ts_idx: int | None = None
+  v_ts_idx: int | None = None
   split_cache: bool = False
   cache_implementation: str | None = None
   auto_model_override: str | None = None
@@ -98,6 +99,23 @@ class ExportableModuleConfig:
   aot_soc_model: str | None = None
   aot_compilation_config_dict: dict[str, Any] | None = None
 
+  # New Compiler & Pipeline settings
+  use_litert_lm_compiler: bool = False
+  compile_configs: str | None = None
+
+  # Calibration & Static Quantization settings
+  calibration_dataset_dir: str | None = None
+  calibration_dataset_format: str = "jsonl"
+  calibration_eval_task_names: str | list[str] = "ALL"
+  max_calibration_decode_steps: int = 32
+  calibration_range_scale: float = 1.0
+  use_float_input_output_normalizer: bool = False
+  skip_mlir_passes: bool = True
+  use_profiler_based_calibration: bool = True
+  enable_min_max_calibration_update: bool = True
+  ema_smoothing_factor: float = 0.1
+  static_quantization_recipe: str | None = None
+
   extra_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
 
   # Internal configs
@@ -109,6 +127,22 @@ class ExportableModuleConfig:
 
   def __post_init__(self):
     """Refines configuration based on task-specific rules."""
+    if self.aot_backend:
+      backend_clean = self.aot_backend.lower()
+      if backend_clean in vendor_configs.VENDOR_CONFIGS:
+        defaults = vendor_configs.VENDOR_CONFIGS[backend_clean]
+        if self.k_ts_idx is None:
+          self.k_ts_idx = defaults.get("k_ts_idx")
+        if self.v_ts_idx is None:
+          self.v_ts_idx = defaults.get("v_ts_idx")
+        self.split_cache = True
+        self.externalize_embedder = True
+
+    if self.k_ts_idx is None:
+      self.k_ts_idx = 2
+    if self.v_ts_idx is None:
+      self.v_ts_idx = 3
+
     if isinstance(self.prefill_lengths, int):
       self.prefill_lengths = [self.prefill_lengths]
     elif isinstance(self.prefill_lengths, str):

@@ -106,6 +106,7 @@ setup(
         "sentencepiece",
         "rich",
         "litert-lm-builder>=0.0.0.dev0",
+        "pillow",
     ],
     entry_points={
         "console_scripts": [

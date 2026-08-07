@@ -119,11 +119,11 @@ python3 -m litert_torch.generative.export_hf.experimental.calib.calibrate \
   --embedder_model_path={embedder_path} \
   --auxiliary_model_path={aux_path} \
   --spm_path={tokenizer_spm_path} \
-  --eval_task_names="{task_name}" \
-  --dataset_dir={dataset_dir} \
-  --dataset_format=json \
+  --calibration_eval_task_names="{task_name}" \
+  --calibration_dataset_dir={dataset_dir} \
+  --calibration_dataset_format=json \
   --calibration_result_save_dir={output_save_dir}/{task_name} \
-  --max_decode_steps=128 \
+  --max_calibration_decode_steps=128 \
   --use_profiler_based_calibration=True \
   --enable_min_max_calibration_update=True
 ```
