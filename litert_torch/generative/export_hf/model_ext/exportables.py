@@ -28,6 +28,7 @@ from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as m
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_tdt as parakeet_tdt_lib
 from litert_torch.generative.export_hf.model_ext.qwen3 import qwen3_asr as qwen3_asr_lib
+from litert_torch.generative.export_hf.model_ext.qwen3_5 import exportable_module as qwen3_5_exportable
 from litert_torch.generative.export_hf.model_ext.whisper import whisper as whisper_lib
 import transformers
 
@@ -69,6 +70,18 @@ def get_prefill_decode_exportables(
         )
     else:
       return None
+  elif model_config.model_type in ('qwen3_5', 'qwen3_5_text'):
+    print('Using Qwen3.5 exportables.')
+    if export_config.split_cache:
+      return (
+          qwen3_5_exportable.LiteRTSplitCacheExportableModuleForQwen3_5Prefill,
+          qwen3_5_exportable.LiteRTSplitCacheExportableModuleForQwen3_5Generate,
+      )
+    else:
+      return (
+          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5Prefill,
+          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5Generate,
+      )
   else:
     pass
   return None
