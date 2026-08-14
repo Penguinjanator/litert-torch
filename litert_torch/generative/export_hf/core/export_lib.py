@@ -203,16 +203,40 @@ def load_model(
 ) -> SourceModelArtifacts:
   """Loads model from checkpoint."""
 
-  config = transformers.AutoConfig.from_pretrained(
-      model_path,
-      dtype=torch.float32,
-      trust_remote_code=trust_remote_code,
-  )
+  try:
+    config = transformers.AutoConfig.from_pretrained(
+        model_path,
+        dtype=torch.float32,
+        trust_remote_code=trust_remote_code,
+    )
+  except (KeyError, ValueError):
+    # Fallback to PretrainedConfig if the model architecture is not built into
+    # transformers AutoConfig.
+    config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+        model_path, trust_remote_code=trust_remote_code
+    )
+    config = transformers.PretrainedConfig.from_dict(config_dict)
 
   if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
     model_cls = model_ext_exportables.get_speech_model_cls(config.model_type)
     model = model_cls(model_path, override_transformers=True)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+    return SourceModelArtifacts(
+        model=model,
+        model_config=config,
+        text_model_config=config,
+        tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
+    )
+
+  if task == ExportTask.TEXT_TO_SPEECH:
+    model_cls = model_ext_exportables.get_tts_model_cls(config.model_type)
+    model = model_cls(model_path, export_config=export_config)
+    try:
+      tokenizer = transformers.AutoTokenizer.from_pretrained(
+          model_path, trust_remote_code=trust_remote_code
+      )
+    except Exception:  # pylint: disable=broad-exception-caught
+      tokenizer = None
     return SourceModelArtifacts(
         model=model,
         model_config=config,
@@ -759,6 +783,21 @@ def export_asr_models(
   return dataclasses.replace(
       exported_model_artifacts,
       prefill_decode_model_path=model_path,
+  )
+
+
+@progress.task('Export TTS models')
+def export_tts_models(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+):
+  """Exports TTS models."""
+  tts_model = source_model_artifacts.model
+  artifacts = tts_model.export(export_config)
+  return dataclasses.replace(
+      exported_model_artifacts,
+      additional_model_paths=artifacts,
   )
 
 

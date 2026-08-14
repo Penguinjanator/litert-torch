@@ -140,7 +140,8 @@ def export(
       to the safetensors directory.
     output_dir: The directory to export the model to.
     task: The task to export the model for. Use 'text_generation' for text only
-      LLMs, and 'image_text_to_text' for Vision LLMs.
+      LLMs, 'image_text_to_text' for Vision LLMs, 'automatic_speech_recognition'
+      for ASR, and 'text_to_speech' for TTS.
     keep_temporary_files: Whether to keep the temporary files.
     trust_remote_code: Whether to trust remote code.
     prefill_lengths: The lengths of the prefill input, separated by comma.
@@ -264,6 +265,11 @@ def export(
     if export_config.aot_backend is not None:
       export_tasks.append(export_lib.aot_compile_model)
       legacy_compile_triggered = True
+  elif task == ExportTask.TEXT_TO_SPEECH:
+    export_tasks.append(export_lib.export_tts_models)
+    if export_config.aot_backend is not None:
+      export_tasks.append(export_lib.aot_compile_model)
+      legacy_compile_triggered = True
   else:
     export_tasks.append(export_lib.export_text_prefill_decode_model)
     if (
@@ -288,6 +294,13 @@ def export(
       print(
           '\nWARNING: The legacy AOT compiler path (compiling individual models'
           ' before packaging) is deprecated and will be removed soon. ASR task'
+          ' compilation will be migrated to the new package-based compiler'
+          ' path in a future release.\n'
+      )
+    elif task == ExportTask.TEXT_TO_SPEECH:
+      print(
+          '\nWARNING: The legacy AOT compiler path (compiling individual models'
+          ' before packaging) is deprecated and will be removed soon. TTS task'
           ' compilation will be migrated to the new package-based compiler'
           ' path in a future release.\n'
       )

@@ -29,6 +29,7 @@ from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_tdt as parakeet_tdt_lib
 from litert_torch.generative.export_hf.model_ext.qwen3 import qwen3_asr as qwen3_asr_lib
 from litert_torch.generative.export_hf.model_ext.qwen3_5 import exportable_module as qwen3_5_exportable
+from litert_torch.generative.export_hf.model_ext.qwen3_tts import qwen3_tts as qwen3_tts_lib
 from litert_torch.generative.export_hf.model_ext.whisper import whisper as whisper_lib
 import transformers
 
@@ -177,3 +178,11 @@ def get_speech_model_cls(model_type: str):
     return qwen3_asr_lib.Qwen3Asr
   else:
     raise ValueError(f'Unsupported speech model type: {model_type}')
+
+
+def get_tts_model_cls(model_type: str):
+  """Gets TTS model class by model type."""
+  if model_type in ('qwen3_tts', 'qwen3_tts_talker', 'qwen3'):
+    return qwen3_tts_lib.Qwen3Tts
+  else:
+    raise ValueError(f'Unsupported TTS model type: {model_type}')

@@ -28,6 +28,7 @@ class ExportTask(str, enum.Enum):
   TEXT_GENERATION = "text_generation"
   IMAGE_TEXT_TO_TEXT = "image_text_to_text"
   AUTOMATIC_SPEECH_RECOGNITION = "automatic_speech_recognition"
+  TEXT_TO_SPEECH = "text_to_speech"
 
 
 @dataclasses.dataclass
@@ -161,6 +162,14 @@ class ExportableModuleConfig:
         self.export_vision_encoder = False
         self.split_cache = False
         self.externalize_embedder = False
+        self.externalize_rope = False
+        self.bundle_litert_lm = False
+      case ExportTask.TEXT_TO_SPEECH:
+        self.export_vision_encoder = False
+        self.export_audio_encoder = False
+        self.split_cache = False
+        self.externalize_embedder = True
+        self.single_token_embedder = True
         self.externalize_rope = False
         self.bundle_litert_lm = False
       case _:
