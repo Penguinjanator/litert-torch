@@ -217,6 +217,14 @@ def load_model(
     )
     config = transformers.PretrainedConfig.from_dict(config_dict)
 
+  # Opt-in to global access for per-layer config attributes to avoid blocking heterogeneous pipelines
+  if hasattr(config, 'allow_global_per_layer_attribute_access'):
+    config.allow_global_per_layer_attribute_access = True
+  if hasattr(config, 'text_config') and hasattr(
+      config.text_config, 'allow_global_per_layer_attribute_access'
+  ):
+    config.text_config.allow_global_per_layer_attribute_access = True
+
   if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
     model_cls = model_ext_exportables.get_speech_model_cls(config.model_type)
     model = model_cls(model_path, override_transformers=True)

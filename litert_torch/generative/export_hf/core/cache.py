@@ -307,7 +307,6 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     cache_kwargs = self.get_cache_runtime_args()
     seq_len = key_states.shape[2]
     self.cumulative_length += seq_len
-
     key_states = key_states.to(self.keys.dtype)  # pyrefly: ignore[missing-attribute]
 
     value_states = value_states.to(self.values.dtype)  # pyrefly: ignore[missing-attribute]
@@ -412,10 +411,35 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     if hasattr(model_config, "num_global_key_value_heads"):
       if layer_type == "full_attention":
         num_kv_heads = model_config.num_global_key_value_heads or num_kv_heads
+
+    # --- HETEROGENEOUS BACKEND PATCH ---
+    head_dim = None
+    per_layer_config = getattr(model_config, "per_layer_config", None)
+    if (
+        per_layer_config is not None
+        and layer_index is not None
+        and layer_index < len(per_layer_config)
+    ):
+      head_dim = getattr(per_layer_config[layer_index], "head_dim", None)
+
+    if head_dim is None:
+      # Try accessing globally, catching custom AmbiguousGlobalPerLayerAttributeError
+      try:
+        head_dim = getattr(model_config, "head_dim", None)
+      except (AttributeError, RuntimeError):
+        # Opt-in to global access for per-layer config attributes to avoid blocking heterogeneous pipelines
+        if hasattr(model_config, "allow_global_per_layer_attribute_access"):
+          setattr(model_config, "allow_global_per_layer_attribute_access", True)
+        try:
+          head_dim = getattr(model_config, "head_dim", None)
+        except (AttributeError, RuntimeError):
+          head_dim = None
+
     embed_size_per_head = (
-        getattr(model_config, "head_dim", None)
-        or model_config.hidden_size // model_config.num_attention_heads
+        head_dim or model_config.hidden_size // model_config.num_attention_heads
     )
+    # -----------------------------------
+
     if hasattr(model_config, "global_head_dim"):
       if layer_type == "full_attention":
         embed_size_per_head = (
