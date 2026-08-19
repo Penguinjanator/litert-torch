@@ -167,7 +167,6 @@ def _first_arg_getter(node):
 # Note: default layout sensitive inputs are all inputs when not specified.
 @nhwcable_node_checkers.register(aten.max_pool2d)
 @nhwcable_node_checkers.register(aten.max_pool2d_with_indices)
-@nhwcable_node_checkers.register(aten.amax)
 @nhwcable_node_checkers.register(aten.avg_pool2d)
 @nhwcable_node_checkers.register(aten._prelu_kernel)
 @nhwcable_node_checkers.register(aten.upsample_bilinear2d)

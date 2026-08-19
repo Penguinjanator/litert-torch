@@ -294,6 +294,7 @@ def _aten_convolution_rewriter(node: torch.fx.Node):
 @rewriters.register(aten.sort.default)
 @rewriters.register(aten.topk.default)
 @rewriters.register(aten.cat.default)
+@rewriters.register(aten.amax.default)
 def dim_attr_rewriter(node: torch.fx.Node):
   op = node.target
 
