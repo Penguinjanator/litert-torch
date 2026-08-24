@@ -451,25 +451,21 @@ class Executor:
     available_input_size = [
         x for x in self.prefill_runners.keys() if x >= remaining_input_size
     ]
+    batch_size = decode_state.token_ids.shape[0]
     if available_input_size:
       input_size = min(available_input_size)
       padded_tokens = np.pad(
           decode_state.token_ids[:, time_step:],
           ((0, 0), (0, input_size - remaining_input_size)),
       )
-      valid_mask = np.array(
-          [
-              [1] * remaining_input_size
-              + [0] * (input_size - remaining_input_size)
-          ],
-          dtype=np.bool,
-      )
+      valid_mask = np.zeros((batch_size, input_size), dtype=bool)
+      valid_mask[:, :remaining_input_size] = True
     else:
       input_size = max(x for x in self.prefill_runners.keys())
       padded_tokens = decode_state.token_ids[
           :, time_step : time_step + input_size
       ]
-      valid_mask = np.ones((1, input_size), dtype=np.bool)
+      valid_mask = np.ones((batch_size, input_size), dtype=bool)
 
     if time_step + input_size > self.cache_length:
       raise ValueError('Prefill chunk exceeds the cache length.')
@@ -522,12 +518,19 @@ class Executor:
         self.prefill_runners[input_size],
     )
 
+    cache_update_inputs = {
+        **kv_slice,
+        **decode_state.kv_cache,
+        'input_pos': positions,
+    }
+    if (
+        'valid_mask'
+        in self.prefill_cache_update_runners[input_size].get_input_details()
+    ):
+      cache_update_inputs['valid_mask'] = valid_mask
+
     new_kv_cache = try_run_signature_with_quant_dequant(
-        {
-            **kv_slice,
-            **decode_state.kv_cache,
-            'input_pos': positions,
-        },
+        cache_update_inputs,
         self.prefill_cache_update_runners[input_size],
     )
 
@@ -567,12 +570,13 @@ class Executor:
     assert input_tokens is not None
     positions = np.asarray([time_step], dtype=np.int32)
 
+    batch_size = input_tokens.shape[0]
     decode_mask_inputs = {
         'time_step': np.asarray(time_step, dtype=np.int32),
         'input_tokens': input_tokens,
     }
     if 'valid_mask' in self.decode_mask_runner.get_input_details():
-      decode_mask_inputs['valid_mask'] = np.ones((1, 1), dtype=np.bool)
+      decode_mask_inputs['valid_mask'] = np.ones((batch_size, 1), dtype=bool)
 
     decode_masks = self.decode_mask_runner(**decode_mask_inputs)
 
@@ -612,12 +616,16 @@ class Executor:
 
     logits = kv_slice.pop('logits')
 
+    cache_update_inputs = {
+        **kv_slice,
+        **decode_state.kv_cache,
+        'input_pos': positions,
+    }
+    if 'valid_mask' in self.decode_cache_update_runner.get_input_details():
+      cache_update_inputs['valid_mask'] = np.ones((batch_size, 1), dtype=bool)
+
     new_kv_cache = try_run_signature_with_quant_dequant(
-        {
-            **kv_slice,
-            **decode_state.kv_cache,
-            'input_pos': positions,
-        },
+        cache_update_inputs,
         self.decode_cache_update_runner,
     )
 
@@ -868,8 +876,15 @@ def is_quantized(tensor_detail):
 
 def try_get_quantized_input(signature_input, signature_runner):
   """Returns quantized input if applicable."""
+  signature_input = dict(signature_input)
   input_details = signature_runner.get_input_details()
   for k, detail in input_details.items():
+    if k not in signature_input:
+      raise ValueError(
+          f"Missing required signature input '{k}' for runner. "
+          f'Provided inputs: {list(signature_input.keys())}, '
+          f'Expected inputs: {list(input_details.keys())}.'
+      )
     input_data = signature_input[k]
     if input_data.dtype == np.float32 and is_quantized(detail):
       quant_params = qtyping.UniformQuantParams.from_tfl_tensor_details(detail)
@@ -884,6 +899,7 @@ def try_get_dequantized_output(
     signature_runner,
 ):
   """Returns dequantized output if applicable."""
+  signature_output = dict(signature_output)
   output_details = signature_runner.get_output_details()
   for k, detail in output_details.items():
     if is_quantized(detail):
