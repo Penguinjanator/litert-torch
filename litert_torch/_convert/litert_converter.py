@@ -198,7 +198,7 @@ def exported_programs_to_flatbuffer(
       # pylint: disable=g-import-not-at-top
       from litert_torch._convert import runtime_fold
       # pylint: enable=g-import-not-at-top
-      runtime_fold.runtime_fold(ir_context, merged_module)
+      runtime_fold.runtime_fold(ir_context, merged_module, fold_dequantize=True)
 
   # Creates the lazy flatbuffer exporter.
   exporter = LazyModelExporter(module=merged_module)

@@ -15,6 +15,7 @@
 """Tests for runtime fold."""
 
 from litert_torch._convert import runtime_fold as runtime_fold_lib
+import numpy as np
 from absl.testing import absltest as googletest
 from litert_converter.tools.model_utils import model_builder
 from litert_converter.tools.model_utils import testing
@@ -73,6 +74,27 @@ class RuntimeFoldTest(testing.ModelUtilsTestCase):
         CHECK: %[[ADD:.*]] = tfl.add %arg0, %[[CST1]] {fused_activation_function = "NONE"} : tensor<2xf32>
         CHECK: %[[MUL:.*]] = tfl.mul %[[ADD]], %[[CST2]] {fused_activation_function = "NONE"} : tensor<2xf32>
         CHECK: return %[[MUL]]
+        """,
+    )
+
+  def test_fold_constants_with_dequantize(self):
+    @model_builder.build_module_from_py_func(mlir.RankedTensorType([2], "f32"))
+    def module(x):
+      c1 = tfl.const(np.array([1, 2], dtype=np.int8))
+      deq = tfl.dequantize(c1, mlir.RankedTensorType([2], "f32"))
+      c2 = tfl.const([3.0, 4.0])
+      cst = tfl.mul(deq, c2)
+      z = tfl.add(x, cst)
+      return z
+
+    ir_module = mu_transform.model_utils_to_mlir(module)
+    ir_module = runtime_fold(self.ir_context, ir_module, fold_dequantize=True)
+    self.assert_filecheck(
+        ir_module,
+        """
+        CHECK: %[[CST:.*]] = arith.constant
+        CHECK: %[[ADD:.*]] = tfl.add %arg0, %[[CST]] {fused_activation_function = "NONE"} : tensor<2xf32>
+        CHECK: return %[[ADD]]
         """,
     )
 
