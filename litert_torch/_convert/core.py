@@ -36,6 +36,7 @@ except ImportError:
   from ai_edge_litert.aot.core import types as litert_types
 
 
+
 def _run_convert_passes(
     exported_program: torch.export.ExportedProgram,
 ) -> torch.export.ExportedProgram:
@@ -47,6 +48,7 @@ def _run_convert_passes(
       fx_passes.EliminateDeadCodePass(),
       fx_passes.OptimizeLayoutTransposesPass(),
       fx_passes.CanonicalizePass(),
+      fx_passes.ReduceViewRankPass(),
       fx_passes.BuildAtenCompositePass(),
       fx_passes.RemoveNonUserOutputsPass(),
       fx_passes.CastInputsBf16ToF32Pass(),
