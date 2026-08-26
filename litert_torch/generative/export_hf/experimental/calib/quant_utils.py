@@ -88,17 +88,33 @@ def read_from_jsonl(input_file: str) -> list[dict[str, Any]]:
   return examples
 
 
-def format_prompt(
-    prompt: str | list[str], enable_formatting: bool
-) -> str | list[str]:
-  """Formats a single prompt or a list of prompts by optionally wrapping them in control tokens."""
+def _format_single_prompt(
+    prompt: str,
+    enable_formatting: bool = True,
+    tokenizer: tokenizer_lib.Tokenizer | None = None,
+) -> str:
+  """Formats a single prompt string using tokenizer or fallback turn markers."""
+  if tokenizer is not None:
+    return tokenizer.format_chat_prompt(
+        prompt, enable_formatting=enable_formatting
+    )
+
   if not enable_formatting:
     return prompt
+  return PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
 
+
+def format_prompt(
+    prompt: str | list[str],
+    enable_formatting: bool,
+    tokenizer: tokenizer_lib.Tokenizer | None = None,
+) -> str | list[str]:
+  """Formats a single prompt or a list of prompts by optionally wrapping them in control tokens."""
   if isinstance(prompt, list):
-    return [PROMPT_TEMPLATE_PREFIX + p + PROMPT_TEMPLATE_SUFFIX for p in prompt]
-  else:
-    return PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
+    return [
+        _format_single_prompt(p, enable_formatting, tokenizer) for p in prompt
+    ]
+  return _format_single_prompt(prompt, enable_formatting, tokenizer)
 
 
 def get_example_prompt(
@@ -108,50 +124,34 @@ def get_example_prompt(
 ) -> str | tokenizer_lib.Request:
   """Gets the prompt from the example."""
   if isinstance(example, str):
-    prompt = example
-    if enable_formatting:
-      prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
-    return prompt
+    return _format_single_prompt(example, enable_formatting, tokenizer)
 
   if isinstance(example, dict):
     if 'text' in example and isinstance(example['text'], str):
-      prompt = example['text']
-      if enable_formatting:
-        prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
-      return prompt
+      return _format_single_prompt(
+          example['text'], enable_formatting, tokenizer
+      )
 
     if 'prompt' in example and isinstance(example['prompt'], str):
-      prompt = example['prompt']
-      if enable_formatting:
-        prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
-      return prompt
+      return _format_single_prompt(
+          example['prompt'], enable_formatting, tokenizer
+      )
+
+    if 'inputs' in example and isinstance(example['inputs'], str):
+      return _format_single_prompt(
+          example['inputs'], enable_formatting, tokenizer
+      )
 
     if 'messages' in example:
       user_messages = [
           msg for msg in example['messages'] if msg.get('role') == 'user'
       ]
-      if tokenizer and tokenizer.tx_tokenizer and enable_formatting:
-        prompt = tokenizer.tx_tokenizer.apply_chat_template(
-            user_messages,
-            tokenize=False,
-            add_generation_prompt=True,
+      if tokenizer is not None:
+        return tokenizer.format_chat_prompt(
+            user_messages, enable_formatting=enable_formatting
         )
-        assert isinstance(prompt, str)
-        print(f'\n--- Formatted prompt using chat template:\n{prompt}\n---')
-        return prompt
-      else:
-        prompt = '\n'.join([msg.get('content', '') for msg in user_messages])
-        if enable_formatting:
-          prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
-          print(f'\n--- Formatted prompt (fallback): {prompt} ---')
-        return prompt
-
-    if 'inputs' in example and example['inputs']:
-      prompt = example['inputs']
-      if enable_formatting:
-        prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
-        print(f'\n--- Formatted prompt: {prompt} ---')
-      return prompt
+      prompt = '\n'.join([str(msg.get('content', '')) for msg in user_messages])
+      return _format_single_prompt(prompt, enable_formatting, tokenizer)
 
     contents = []
     if enable_formatting:
@@ -171,10 +171,7 @@ def get_example_prompt(
     return tokenizer_lib.Request(contents=contents)
 
   if isinstance(example, str):
-    prompt = example
-    if enable_formatting:
-      prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
-    return prompt
+    return _format_single_prompt(example, enable_formatting, tokenizer)
   raise ValueError("Only dict or str examples are supported in OSS.")
 
 

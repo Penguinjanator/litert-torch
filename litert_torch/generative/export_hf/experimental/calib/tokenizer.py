@@ -16,7 +16,12 @@
 
 import dataclasses
 import io
+import json
+import os
+from typing import Any
 
+from absl import logging
+import huggingface_hub
 import numpy as np
 from PIL import Image
 import transformers
@@ -67,6 +72,11 @@ class TokenizerConfig:
     )
 
 
+# Following BARD250 / Gemma turn format for fallback.
+PROMPT_TEMPLATE_PREFIX = '<start_of_turn>user\n'
+PROMPT_TEMPLATE_SUFFIX = '<end_of_turn>\n<start_of_turn>model\n'
+
+
 class Tokenizer:
   """Tokenizes the input string."""
 
@@ -90,6 +100,30 @@ class Tokenizer:
       self.tx_tokenizer = transformers.AutoTokenizer.from_pretrained(
           transformers_model_path
       )
+      if chat_template and not getattr(
+          self.tx_tokenizer, 'chat_template', None
+      ):
+        self.tx_tokenizer.chat_template = chat_template
+
+      if not getattr(self.tx_tokenizer, 'chat_template', None):
+        try:
+          if os.path.isdir(transformers_model_path):
+            template_file = os.path.join(
+                transformers_model_path, 'chat_template.json'
+            )
+          else:
+            template_file = huggingface_hub.hf_hub_download(
+                transformers_model_path, filename='chat_template.json'
+            )
+          if os.path.exists(template_file):
+            with open(template_file, 'rt') as f:
+              chat_template_dict = json.loads(f.read())
+            if 'chat_template' in chat_template_dict:
+              self.tx_tokenizer.chat_template = chat_template_dict[
+                  'chat_template'
+              ]
+        except Exception as e:  # pylint: disable=broad-exception-caught
+          logging.warning('Failed to load standalone chat_template.json: %s', e)
 
     if spm_model_path:
       self.spm = spm.SentencePieceProcessor()
@@ -115,6 +149,58 @@ class Tokenizer:
         self._image_preprocessor = image_preprocessor_cls(
             transformers_model_path, self
         )
+
+  def format_chat_prompt(
+      self,
+      prompt: str | list[dict[str, Any]],
+      enable_formatting: bool = True,
+  ) -> str:
+    """Formats a single prompt or list of messages using chat template or fallback turn markers."""
+    if not enable_formatting:
+      if isinstance(prompt, list):
+        return '\n'.join([str(msg.get('content', '')) for msg in prompt])
+      return prompt
+
+    if self.tx_tokenizer and getattr(self.tx_tokenizer, 'chat_template', None):
+      try:
+        messages = (
+            prompt
+            if isinstance(prompt, list)
+            else [{'role': 'user', 'content': prompt}]
+        )
+        formatted = self.tx_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        # Guard: Check that prompt text was not dropped (e.g. SmolVLM2 list schema)
+        raw_text = (
+            prompt
+            if isinstance(prompt, str)
+            else str(messages[-1].get('content', ''))
+        )
+        if isinstance(formatted, str) and (
+            not raw_text or raw_text in formatted
+        ):
+          return formatted
+        logging.warning(
+            'apply_chat_template dropped the prompt content; falling back to'
+            ' default formatting.'
+        )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning(
+            'Failed to apply chat template (%s); falling back to default'
+            ' formatting.',
+            e,
+        )
+
+    # Fallback when no chat template is available or template execution failed
+    raw_str = (
+        prompt
+        if isinstance(prompt, str)
+        else '\n'.join([str(m.get('content', '')) for m in prompt])
+    )
+    return PROMPT_TEMPLATE_PREFIX + raw_str + PROMPT_TEMPLATE_SUFFIX
 
   def tokenize_internal(self, input_string: str):
     """Tokenizes the input string."""
