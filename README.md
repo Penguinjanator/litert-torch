@@ -23,7 +23,7 @@ information.
 
 ### Requirements and Dependencies
 
- * Python versions: `>=3.10` and `<3.14` (**Python 3.11 is highly recommended.** *Note: Python 3.14 currently has compatibility issues with typing in `torchao`.*)
+ * Python versions: `>=3.10` (**Python 3.11 is highly recommended.**)
  * Operating system: Linux
  * PyTorch: [![torch](https://img.shields.io/badge/torch->=2.4.0-blue)](https://pypi.org/project/torch/)
  * TensorFlow: [![tf-nightly](https://img.shields.io/badge/tf--nightly-latest-blue)](https://pypi.org/project/tf-nightly/)
