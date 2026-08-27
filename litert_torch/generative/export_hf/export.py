@@ -92,6 +92,7 @@ def export(
     enable_gpu_dynamic_prefill: bool | None = None,
     enable_gpu_dynamic_cache: bool | None = None,
     use_rope_composite: bool | None = None,
+    use_swiglu_composite: bool | None = None,
     use_qkv_norm_rope_composite: bool | None = None,
     use_sdpa_composite: bool | None = None,
     externalize_embedder: bool | None = None,

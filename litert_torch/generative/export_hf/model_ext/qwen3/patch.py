@@ -19,6 +19,7 @@ import contextlib
 from litert_torch.generative.export_hf.core.speech import asr_model
 from litert_torch.generative.export_hf.experimental.composites import qkv_norm_rope as qkv_norm_rope_composite
 from litert_torch.generative.export_hf.experimental.composites import rope as rope_composite
+from litert_torch.generative.export_hf.experimental.composites import swiglu as swiglu_composite
 from litert_torch.generative.export_hf.model_ext import patches as patches_lib
 from litert_torch.generative.layers import normalization
 import torch
@@ -44,49 +45,39 @@ class Qwen3RMSNorm(torch.nn.Module):
     )
 
   def extra_repr(self):
-    return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+    return f"{self.hidden_size}, eps={self.variance_epsilon}"
 
 
 class FusedQwen3MLP(torch.nn.Module):
-  """Fused Gate + Up MLP layer."""
+  """Fused Gate-Up MLP Layer for Qwen3 model."""
 
   def __init__(
       self,
       original_mlp: modeling_qwen3.Qwen3MLP,
+      use_swiglu_composite: bool = False,
   ):
     super().__init__()
-    self.gate_proj = original_mlp.gate_proj
-    self.up_proj = original_mlp.up_proj
-    self.down_proj = original_mlp.down_proj
+    self.config = original_mlp.config
+    self.hidden_size = getattr(original_mlp, "hidden_size", 0)
+    self.intermediate_size = getattr(original_mlp, "intermediate_size", 0)
     self.act_fn = original_mlp.act_fn
+    self.down_proj = original_mlp.down_proj
+    self.use_swiglu_composite = use_swiglu_composite
 
-    # Fuse gate and up projections
-    gate_out_features = self.gate_proj.out_features
-    up_out_features = self.up_proj.out_features
+    gate_w = original_mlp.gate_proj.weight.data
+    up_w = original_mlp.up_proj.weight.data
+    fused_weight = torch.cat([gate_w, up_w], dim=0)
 
     self.gate_up_proj = torch.nn.Linear(
-        self.gate_proj.in_features,
-        gate_out_features + up_out_features,
-        bias=self.gate_proj.bias is not None,
+        self.hidden_size, 2 * self.intermediate_size, bias=False
     )
-
-    # Copy weights and biases
-    with torch.no_grad():
-      self.gate_up_proj.weight.copy_(
-          torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
-      )
-      if self.gate_up_proj.bias is not None:
-        self.gate_up_proj.bias.copy_(
-            torch.cat([self.gate_proj.bias, self.up_proj.bias], dim=0)
-        )
-
-    self.gate_size = gate_out_features
+    self.gate_up_proj.weight = torch.nn.Parameter(fused_weight)
 
   def forward(self, x):
     gate_up = self.gate_up_proj(x)
-    gate, up = gate_up.split(
-        [self.gate_size, gate_up.shape[-1] - self.gate_size], dim=-1
-    )
+    if self.use_swiglu_composite:
+      return self.down_proj(swiglu_composite.apply_swiglu(gate_up))
+    gate, up = gate_up.chunk(2, dim=-1)
     return self.down_proj(self.act_fn(gate) * up)
 
 
@@ -96,87 +87,75 @@ class FusedQwen3Attention(torch.nn.Module):
   def __init__(
       self,
       original_attn: modeling_qwen3.Qwen3Attention,
-      fuse_qkv: bool = False,
+      fuse_qkv: bool = True,
       use_rope_composite: bool = False,
       use_qkv_norm_rope_composite: bool = False,
   ):
     super().__init__()
-    self.o_proj = original_attn.o_proj
-    self.q_norm = original_attn.q_norm
-    self.k_norm = original_attn.k_norm
-
     self.config = original_attn.config
-    self.layer_idx = original_attn.layer_idx
-    num_heads = getattr(
+    self.layer_idx = getattr(original_attn, "layer_idx", 0)
+    self.head_dim = getattr(
+        original_attn,
+        "head_dim",
+        getattr(original_attn.config, "head_dim", 128),
+    )
+    self.num_heads = getattr(
         original_attn,
         "num_heads",
-        getattr(self.config, "num_attention_heads", 16),
+        getattr(original_attn.config, "num_attention_heads", 16),
     )
-    self.num_heads: int = int(num_heads) if isinstance(num_heads, int) else 16
-    num_kv_heads = getattr(
+    self.num_key_value_heads = getattr(
         original_attn,
         "num_key_value_heads",
-        getattr(self.config, "num_key_value_heads", 8),
+        getattr(original_attn.config, "num_key_value_heads", 8),
     )
-    self.num_key_value_heads = self.num_kv_heads = (
-        int(num_kv_heads) if isinstance(num_kv_heads, int) else 8
+    self.num_key_value_groups = getattr(
+        original_attn,
+        "num_key_value_groups",
+        getattr(original_attn.config, "num_key_value_groups", 2),
     )
-    head_dim = getattr(
-        original_attn, "head_dim", getattr(self.config, "head_dim", 128)
-    )
-    self.head_dim: int = int(head_dim) if isinstance(head_dim, int) else 128
-    self.num_key_value_groups = original_attn.num_key_value_groups
-    self.scaling = original_attn.scaling
-    self.attention_dropout = original_attn.attention_dropout
-    self.is_causal = original_attn.is_causal
-    self.sliding_window = original_attn.sliding_window
+    self.scaling = getattr(original_attn, "scaling", self.head_dim**-0.5)
+    self.is_causal = getattr(original_attn, "is_causal", True)
+    self.attention_dropout = getattr(original_attn, "attention_dropout", 0.0)
+    self.sliding_window = getattr(original_attn, "sliding_window", None)
 
+    self.q_norm = original_attn.q_norm
+    self.k_norm = original_attn.k_norm
+    self.o_proj = original_attn.o_proj
+    self.rotary_emb = getattr(original_attn, "rotary_emb", None)
     self.fuse_qkv = fuse_qkv
     self.use_rope_composite = use_rope_composite
     self.use_qkv_norm_rope_composite = use_qkv_norm_rope_composite
 
-    self.q_proj = original_attn.q_proj
-    self.k_proj = original_attn.k_proj
-    self.v_proj = original_attn.v_proj
+    self.q_size = self.num_heads * self.head_dim
+    self.k_size = self.num_key_value_heads * self.head_dim
+    self.v_size = self.num_key_value_heads * self.head_dim
 
-    if self.fuse_qkv:
-      q_out_features = self.q_proj.out_features
-      k_out_features = self.k_proj.out_features
-      v_out_features = self.v_proj.out_features
+    if fuse_qkv:
+      q_w = original_attn.q_proj.weight.data
+      k_w = original_attn.k_proj.weight.data
+      v_w = original_attn.v_proj.weight.data
+      fused_weight = torch.cat([q_w, k_w, v_w], dim=0)
 
+      total_out_dim = self.q_size + self.k_size + self.v_size
       self.qkv_proj = torch.nn.Linear(
-          self.q_proj.in_features,
-          q_out_features + k_out_features + v_out_features,
-          bias=self.q_proj.bias is not None,
+          self.config.hidden_size, total_out_dim, bias=False
       )
-
-      # Copy weights and biases
-      with torch.no_grad():
-        self.qkv_proj.weight.copy_(
-            torch.cat(
-                [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
-                dim=0,
-            )
-        )
-        if self.qkv_proj.bias is not None:
-          self.qkv_proj.bias.copy_(
-              torch.cat(
-                  [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0
-              )
-          )
-
-      self.q_size = q_out_features
-      self.k_size = k_out_features
-      self.v_size = v_out_features
+      self.qkv_proj.weight = torch.nn.Parameter(fused_weight)
+    else:
+      self.q_proj = original_attn.q_proj
+      self.k_proj = original_attn.k_proj
+      self.v_proj = original_attn.v_proj
 
   def forward(
       self,
       hidden_states: torch.Tensor,
       position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
       attention_mask: torch.Tensor | None = None,
-      past_key_values=None,
+      past_key_values: transformers.cache_utils.Cache | None = None,
+      cache_position: torch.LongTensor | None = None,
       **kwargs,
-  ):
+  ) -> tuple[torch.Tensor, torch.Tensor | None]:
     input_shape = hidden_states.shape[:-1]
     hidden_shape_q = (*input_shape, self.num_heads, self.head_dim)
     hidden_shape_kv = (*input_shape, self.num_key_value_heads, self.head_dim)
@@ -299,11 +278,19 @@ class FusedQwen3Attention(torch.nn.Module):
       query_states = self.q_norm(q.view(hidden_shape_q)).transpose(1, 2)
       key_states = self.k_norm(k.view(hidden_shape_kv)).transpose(1, 2)
       value_states = v.view(hidden_shape_kv).transpose(1, 2)
-      assert position_embeddings is not None
-      cos, sin = position_embeddings
-      query_states, key_states = modeling_qwen3.apply_rotary_pos_emb(
-          query_states, key_states, cos, sin
-      )
+
+      if position_embeddings is not None:
+        cos, sin = position_embeddings
+      elif self.rotary_emb is not None:
+        cos, sin = self.rotary_emb(
+            value_states, position_ids=kwargs.get("position_ids", None)
+        )
+      else:
+        cos, sin = None, None
+      if cos is not None and sin is not None:
+        query_states, key_states = modeling_qwen3.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
 
     if past_key_values is not None:
       key_states, value_states = past_key_values.update(
@@ -358,23 +345,26 @@ def patch_qwen3_model(model, export_config):
   fuse_gate_up = getattr(export_config, "fuse_gate_up", False)
   fuse_qkv = getattr(export_config, "fuse_qkv", False)
   use_rope = getattr(export_config, "use_rope_composite", False)
+  use_swiglu = getattr(export_config, "use_swiglu_composite", False)
   use_qkv_norm_rope = getattr(
       export_config, "use_qkv_norm_rope_composite", False
   )
   print(
       "Qwen3 model patch applied. "
       f"fuse_gate_up={fuse_gate_up}, fuse_qkv={fuse_qkv}, "
-      f"use_rope_composite={use_rope}, "
+      f"use_rope_composite={use_rope}, use_swiglu_composite={use_swiglu}, "
       f"use_qkv_norm_rope_composite={use_qkv_norm_rope}, "
-      ""
+      f""
   )
 
   replaced_modules = []
 
   def replace_modules(module):
     for child_name, child in module.named_children():
-      if fuse_gate_up and isinstance(child, modeling_qwen3.Qwen3MLP):
-        fused = FusedQwen3MLP(child)
+      if (fuse_gate_up or use_swiglu) and isinstance(
+          child, modeling_qwen3.Qwen3MLP
+      ):
+        fused = FusedQwen3MLP(child, use_swiglu_composite=use_swiglu)
         setattr(module, child_name, fused)
         replaced_modules.append((module, child_name, child))
       elif isinstance(child, modeling_qwen3.Qwen3Attention):
