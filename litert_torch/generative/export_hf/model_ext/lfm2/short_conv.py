@@ -28,10 +28,11 @@ class Lfm2ShortConv(modeling_lfm2.Lfm2ShortConv):
       layer_idx: int,
   ):
     super().__init__(config, layer_idx)
+    self.conv_L_cache_size = config.conv_L_cache
     self.conv = torch.nn.Conv1d(
         in_channels=config.hidden_size,
         out_channels=config.hidden_size,
-        kernel_size=self.L_cache,
+        kernel_size=self.conv_L_cache_size,
         groups=config.hidden_size,
         bias=self.bias,
         padding=0,  # Padding is done in forward as part of state management.
@@ -76,7 +77,7 @@ class Lfm2ShortConv(modeling_lfm2.Lfm2ShortConv):
 
     if seq_len > 1:  # Prefill
       if valid_mask is not None:
-        L_state = self.L_cache - 1
+        L_state = self.conv_L_cache_size - 1
         B, C, S = padded_input.shape
         start = valid_mask.to(torch.float32).sum().to(torch.int32)
 
@@ -95,9 +96,9 @@ class Lfm2ShortConv(modeling_lfm2.Lfm2ShortConv):
 
         next_state = torch.matmul(padded_input, mask)
       else:
-        next_state = padded_input[:, :, -(self.L_cache - 1) :]
+        next_state = padded_input[:, :, -(self.conv_L_cache_size - 1) :]
     else:  # Decode
-      next_state = padded_input[:, :, -(self.L_cache - 1) :]
+      next_state = padded_input[:, :, -(self.conv_L_cache_size - 1) :]
 
     conv_out = self.conv(padded_input)
     conv_out = conv_out.transpose(1, 2)
