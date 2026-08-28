@@ -825,6 +825,101 @@ class TestConvert(googletest.TestCase):
         DictModel(), args, kwargs, flat_inputs
     )
 
+  def test_conv_transpose_grouped(self):
+    """Tests grouped 1D and 2D transposed convolution across diverse parameters (Issue #604)."""
+    torch.manual_seed(42)
+
+    # 2D Transposed Convolution Parameter Sweep
+    # (in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, input_shape)
+    conv2d_configs = [
+        # Standard grouped (1 < G < in_channels) with VALID padding (pad=0, stride=2)
+        (4, 8, 3, 2, 0, 1, 2, True, (1, 4, 8, 8)),
+        (4, 8, 3, 2, 0, 1, 2, False, (1, 4, 8, 8)),
+        # Standard grouped with SAME padding (pad=1, stride=1)
+        (4, 8, 3, 1, 1, 1, 2, True, (1, 4, 8, 8)),
+        # Standard grouped with pad=0, stride=1
+        (4, 8, 3, 1, 0, 1, 2, False, (2, 4, 6, 6)),
+        # Depthwise (G == in_channels) with channel multiplier M=2
+        (4, 8, 3, 2, 0, 1, 4, True, (1, 4, 8, 8)),
+        # Depthwise (G == in_channels) with channel multiplier M=1
+        (4, 4, 3, 2, 0, 1, 4, False, (1, 4, 8, 8)),
+        (4, 4, 3, 1, 1, 1, 4, True, (1, 4, 8, 8)),
+        # Depthwise with channel multiplier M=3
+        (4, 12, 3, 1, 0, 1, 4, True, (1, 4, 6, 6)),
+        # Channel reducing (in_channels > out_channels)
+        (8, 4, 3, 2, 0, 1, 2, True, (1, 8, 8, 8)),
+        # 3 groups
+        (6, 12, 3, 1, 0, 1, 3, True, (1, 6, 8, 8)),
+        (6, 12, 3, 2, 0, 1, 3, False, (1, 6, 8, 8)),
+    ]
+    for (
+        in_c,
+        out_c,
+        k,
+        stride,
+        pad,
+        dilation,
+        groups,
+        bias,
+        in_shape,
+    ) in conv2d_configs:
+      m2d = nn.ConvTranspose2d(
+          in_channels=in_c,
+          out_channels=out_c,
+          kernel_size=k,
+          stride=stride,
+          padding=pad,
+          dilation=dilation,
+          groups=groups,
+          bias=bias,
+      ).eval()
+      x2d = (torch.randn(in_shape),)
+      edge_model2d = litert_torch.convert(m2d, x2d)
+      self.assertTrue(
+          model_coverage.compare_tflite_torch(edge_model2d, m2d, x2d)
+      )
+
+    # 1D Transposed Convolution Parameter Sweep
+    # (in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, input_shape)
+    conv1d_configs = [
+        # Standard grouped
+        (4, 8, 3, 2, 0, 1, 2, True, (1, 4, 16)),
+        (4, 8, 3, 1, 1, 1, 2, False, (1, 4, 16)),
+        # Depthwise 1D (M=2)
+        (4, 8, 3, 2, 0, 1, 4, True, (1, 4, 16)),
+        # Depthwise 1D (M=1)
+        (4, 4, 3, 1, 0, 1, 4, False, (2, 4, 16)),
+        # 3 groups 1D
+        (6, 12, 3, 1, 0, 1, 3, True, (1, 6, 16)),
+        (6, 12, 3, 2, 0, 1, 3, False, (1, 6, 16)),
+    ]
+    for (
+        in_c,
+        out_c,
+        k,
+        stride,
+        pad,
+        dilation,
+        groups,
+        bias,
+        in_shape,
+    ) in conv1d_configs:
+      m1d = nn.ConvTranspose1d(
+          in_channels=in_c,
+          out_channels=out_c,
+          kernel_size=k,
+          stride=stride,
+          padding=pad,
+          dilation=dilation,
+          groups=groups,
+          bias=bias,
+      ).eval()
+      x1d = (torch.randn(in_shape),)
+      edge_model1d = litert_torch.convert(m1d, x1d)
+      self.assertTrue(
+          model_coverage.compare_tflite_torch(edge_model1d, m1d, x1d)
+      )
+
 
 if __name__ == "__main__":
   googletest.main()

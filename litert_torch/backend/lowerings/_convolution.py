@@ -85,6 +85,53 @@ def build_transpose_conv(
   num_spatial_dims = len(lhs_type.shape) - 2
   rhs = stablehlo.reverse(rhs, list(range(2, 2 + num_spatial_dims)))
 
+  if groups > 1:
+    # PyTorch and StableHLO have different weight layout conventions for
+    # grouped transposed convolutions:
+    #
+    # 1. PyTorch format: [C_in, C_out / G, *spatial]
+    #    Dimension 0 has size C_in (input channels across all groups), and
+    #    dimension 1 has size C_out / G (output channels per group).
+    #    In memory, elements are packed as [G, C_in // G, C_out / G, *spatial].
+    #
+    # 2. StableHLO format: [C_in / G, C_out, *spatial]
+    #    StableHLO's verifier requires kernel_input_feature_dimension (dim 0)
+    #    to be the input features *per group* (C_in / G), and
+    #    kernel_output_feature_dimension (dim 1) to be the total output features
+    #    across all groups (C_out = G * C_out_per_group).
+    #
+    # To adapt PyTorch weights to StableHLO:
+    #   Step 1: Reshape 4D -> 5D: [G, C_in // G, C_out / G, *spatial]
+    #   Step 2: Transpose axes 0 and 1 -> [C_in // G, G, C_out / G, *spatial]
+    #   Step 3: Reshape 5D -> 4D: [C_in // G, C_out, *spatial]
+    c_in = rhs.type.shape[0]
+    c_out_per_group = rhs.type.shape[1]
+    c_in_per_group = c_in // groups
+    c_out = c_out_per_group * groups
+    spatial_shape = list(rhs.type.shape[2:])
+
+    reshaped_5d_type = ir.RankedTensorType.get(
+        [groups, c_in_per_group, c_out_per_group] + spatial_shape,
+        rhs.type.element_type,
+    )
+    rhs_5d = stablehlo.ReshapeOp(reshaped_5d_type, rhs).result
+
+    perm = [1, 0, 2] + list(range(3, 3 + len(spatial_shape)))
+    transposed_5d_type = ir.RankedTensorType.get(
+        [c_in_per_group, groups, c_out_per_group] + spatial_shape,
+        rhs.type.element_type,
+    )
+    rhs_transposed_5d = stablehlo.transpose(
+        rhs_5d, ir.DenseI64ArrayAttr.get(perm)
+    )
+
+    final_rhs_type = ir.RankedTensorType.get(
+        [c_in_per_group, c_out] + spatial_shape,
+        rhs.type.element_type,
+    )
+    rhs = stablehlo.ReshapeOp(final_rhs_type, rhs_transposed_5d).result
+
+
   kernel_size = rhs.type.shape
   # We need additional padding on the input to get the right output size.
   adjusted_padding = [

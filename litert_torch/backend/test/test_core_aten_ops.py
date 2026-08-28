@@ -622,6 +622,74 @@ class TestCoreAtenOps(parameterized.TestCase):
         dict(),
     )
 
+  def test_conv_transpose1d_grouped(self):
+    configs = [
+        # (in_c, out_c, k, stride, pad, dilation, output_pad, groups, bias, in_shape)
+        (4, 8, 4, [2], [0], [1], [0], 2, True, (1, 4, 16)),
+        (4, 8, 3, [1], [1], [1], [0], 2, False, (1, 4, 16)),
+        (4, 8, 3, [2], [0], [1], [0], 4, True, (1, 4, 16)),
+        (6, 12, 3, [1], [0], [1], [0], 3, False, (2, 6, 16)),
+    ]
+    for (
+        in_c,
+        out_c,
+        k,
+        stride,
+        pad,
+        dilation,
+        output_pad,
+        groups,
+        has_bias,
+        in_shape,
+    ) in configs:
+      x = torch.randn(in_shape)
+      weight = torch.randn(in_c, out_c // groups, k)
+      bias = torch.randn(out_c) if has_bias else None
+      self._run_export_convert_and_compare(
+          torch.ops.aten.convolution.default,
+          (x, weight, bias, stride, pad, dilation, True, output_pad, groups),
+          dict(),
+      )
+
+  def test_conv_transpose2d_grouped(self):
+    configs = [
+        # (in_c, out_c, k, stride, pad, dilation, output_pad, groups, bias, in_shape)
+        # VALID padding (pad=0, stride=2)
+        (4, 8, 3, [2, 2], [0, 0], [1, 1], [0, 0], 2, True, (1, 4, 8, 8)),
+        (4, 8, 3, [2, 2], [0, 0], [1, 1], [0, 0], 2, False, (1, 4, 8, 8)),
+        # SAME padding (pad=1, stride=1)
+        (4, 8, 3, [1, 1], [1, 1], [1, 1], [0, 0], 2, False, (1, 4, 8, 8)),
+        # Depthwise (G=in_c)
+        (4, 8, 3, [2, 2], [0, 0], [1, 1], [0, 0], 4, True, (1, 4, 8, 8)),
+        (4, 4, 3, [2, 2], [0, 0], [1, 1], [0, 0], 4, False, (1, 4, 8, 8)),
+        (4, 4, 3, [1, 1], [1, 1], [1, 1], [0, 0], 4, True, (1, 4, 8, 8)),
+        # Channel reducing
+        (8, 4, 3, [2, 2], [0, 0], [1, 1], [0, 0], 2, True, (1, 8, 8, 8)),
+        # 3 groups
+        (6, 12, 3, [1, 1], [0, 0], [1, 1], [0, 0], 3, True, (1, 6, 8, 8)),
+        (6, 12, 3, [2, 2], [0, 0], [1, 1], [0, 0], 3, False, (1, 6, 8, 8)),
+    ]
+    for (
+        in_c,
+        out_c,
+        k,
+        stride,
+        pad,
+        dilation,
+        output_pad,
+        groups,
+        has_bias,
+        in_shape,
+    ) in configs:
+      x = torch.randn(in_shape)
+      weight = torch.randn(in_c, out_c // groups, k, k)
+      bias = torch.randn(out_c) if has_bias else None
+      self._run_export_convert_and_compare(
+          torch.ops.aten.convolution.default,
+          (x, weight, bias, stride, pad, dilation, True, output_pad, groups),
+          dict(),
+      )
+
 
 if __name__ == "__main__":
   googletest.main()
