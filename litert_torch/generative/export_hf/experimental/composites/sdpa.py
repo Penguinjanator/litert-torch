@@ -41,12 +41,12 @@ def scaled_dot_product_attention_transposed(
     alibi_bias: Optional[torch.Tensor] = None,
     param_tensor: Optional[torch.Tensor] = None,
     is_global: bool = False,
-    sdpa_use_composite: bool = True,
+    use_sdpa_composite: bool = True,
 ):
   """Scaled dot product attention with transposed key and value.
 
   Args:
-    query: Query tensor, with shape [B, T, N, H].
+    query: Query tensor, with shape [B, N, T, H] or [1, BK, GT, H].
     key: Key tensor, with shape [B, T, KV_LEN, H].
     value: Value tensor, with shape [B, T, H, KV_LEN].
     head_size (int): head dimension.
@@ -58,11 +58,19 @@ def scaled_dot_product_attention_transposed(
     alibi_bias (torch.Tensor): optional alibi bias tensor.
     param_tensor (torch.Tensor): optional param tensor for runtime bmm.
     is_global (bool): whether the attention is global.
-    sdpa_use_composite (bool): whether to use composite for SDPA.
+    use_sdpa_composite (bool): whether to use composite for SDPA.
 
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
   """
+  b, n, seq_len, h = query.shape
+  is_decode_composite = use_sdpa_composite and seq_len == 1
+
+  if not is_decode_composite:
+    g = n // key.shape[1]
+    num_query_groups = n // g
+    query = query.reshape(1, b * num_query_groups, g * seq_len, h)
+
   if scale is None:
     scale = 1.0 / math.sqrt(head_size)
 
@@ -103,7 +111,7 @@ def scaled_dot_product_attention_transposed(
   })
   if softcap is not None:
     attrs["softcap"] = softcap
-  if sdpa_use_composite:
+  if use_sdpa_composite:
     sdpa_builder = composite.StableHLOCompositeBuilder(
         name="odml.sdpa_transposed", attr=attrs
     )
@@ -113,17 +121,26 @@ def scaled_dot_product_attention_transposed(
   else:
     sdpa_builder = None
 
+  key_for_bmm = key
+  value_for_bmm = value
+  if is_decode_composite and query.shape[1] != key.shape[1]:
+    g_ratio = query.shape[1] // key.shape[1]
+    key_for_bmm = key.repeat_interleave(g_ratio, dim=1)
+    value_for_bmm = value.repeat_interleave(g_ratio, dim=1)
+
   if param_tensor is not None:
+    # Do not create nested odml.runtime_bmm composites inside odml.sdpa_transposed.
+    # When use_sdpa_composite is False, enable composite on the individual BMMs instead.
     bmm_fn = lambda x, y: runtime_batched_matmul.runtime_bmm(
         x, y, param_tensor, is_global=is_global, is_src=False,
-        use_composite=not sdpa_use_composite,
+        use_composite=not use_sdpa_composite,
     )
   elif k_ts_idx == 2:
     bmm_fn = bmm_lib.bmm_4d
   else:
     assert k_ts_idx == 3, "k_ts_idx must be 2 or 3."
     bmm_fn = lambda x, y: torch.einsum("abth,abhs->abts", x, y)
-  logits = bmm_fn(query, key)
+  logits = bmm_fn(query, key_for_bmm)
 
   if softcap is not None:
     logits = torch.tanh(logits / softcap)
@@ -150,17 +167,25 @@ def scaled_dot_product_attention_transposed(
     probs = builder.mark_outputs(probs)
   probs = probs.type_as(key)
   if param_tensor is not None:
+    # Do not create nested odml.runtime_bmm composites inside odml.sdpa_transposed.
+    # When use_sdpa_composite is False, enable composite on the individual BMMs instead.
     bmm_fn = lambda x, y: runtime_batched_matmul.runtime_bmm(
         x, y, param_tensor, is_global=is_global, is_src=True,
-        use_composite=not sdpa_use_composite,
+        use_composite=not use_sdpa_composite,
     )
   elif v_ts_idx == 3:
     bmm_fn = bmm_lib.bmm_4d
   else:
     assert v_ts_idx == 2, "v_ts_idx must be 2 or 3."
     bmm_fn = lambda x, y: torch.einsum("abts,absh->abth", x, y)
-  encoded = bmm_fn(probs, value)
-  if sdpa_builder is not None:
-    encoded = sdpa_builder.mark_outputs(encoded)
+  encoded = bmm_fn(probs, value_for_bmm)
+  if is_decode_composite:
+    encoded = encoded.permute(0, 2, 1, 3).reshape(b, 1, -1)
+    if sdpa_builder is not None:
+      encoded = sdpa_builder.mark_outputs(encoded)
+  else:
+    if sdpa_builder is not None:
+      encoded = sdpa_builder.mark_outputs(encoded)
+    encoded = encoded.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
 
-  return encoded  # 1, bk, gt, h
+  return encoded

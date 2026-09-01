@@ -155,8 +155,6 @@ def transposed_attention(
   b, n, seq_len, h = query.shape
   g = getattr(module, "num_key_value_groups", 1)
   num_query_groups = n // g
-  # bnth -> b(kg)th -> 1(bk)(gt)h
-  query = query.reshape(1, b * num_query_groups, g * seq_len, h)
   key_ts_idx: int | None = kwargs.get("k_ts_idx", None)
   value_ts_idx: int | None = kwargs.get("v_ts_idx", None)
   if key_ts_idx is None or value_ts_idx is None:
@@ -166,8 +164,9 @@ def transposed_attention(
     )
 
   apply_gpu_composites = kwargs.get("apply_gpu_composites", False)
-  sdpa_use_composite = kwargs.get("sdpa_use_composite", False)
-  if apply_gpu_composites or sdpa_use_composite:
+  use_sdpa_composite = kwargs.get("use_sdpa_composite", False)
+
+  if apply_gpu_composites or use_sdpa_composite:
     is_global = kwargs.get("is_global", None)
     if is_global is None:
       is_sliding = getattr(module, "is_sliding", False)
@@ -184,12 +183,12 @@ def transposed_attention(
         softcap=softcap,
         param_tensor=kwargs.get("param_tensor", None),
         is_global=is_global,
-        sdpa_use_composite=sdpa_use_composite,
+        use_sdpa_composite=use_sdpa_composite,
     )
-    # b, kg, t, h
-    sdpa_out = sdpa_out.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
     return sdpa_out, None
 
+  # bnth -> b(kg)th -> 1(bk)(gt)h
+  query = query.reshape(1, b * num_query_groups, g * seq_len, h)
   # 1, bk, gt, h
   sdpa_out = scaled_dot_product_attention_transposed(
       query=query,
