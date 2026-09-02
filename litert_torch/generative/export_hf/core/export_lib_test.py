@@ -19,6 +19,8 @@ import os
 import shutil
 import tempfile
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 
@@ -146,6 +148,40 @@ class ExportLibTest(parameterized.TestCase):
     self.assertEqual(config.input_sec, 1.0)
     self.assertEqual(config.stateful_after, -1)
 
+  def test_cache_lengths_config_rules(self):
+    # Test default initialization
+    config = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        cache_length=1024,
+    )
+    self.assertEqual(config.cache_lengths, [1024])
+
+    # Test explicit initialization
+    config = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        cache_lengths=[1024, 4096],
+    )
+    self.assertEqual(config.cache_lengths, [1024, 4096])
+
+    # Test empty cache_lengths defaults to cache_length
+    config = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        cache_length=2048,
+        cache_lengths=[],
+    )
+    self.assertEqual(config.cache_lengths, [2048])
+
+    # Test error when dynamic shape is enabled with multiple cache lengths
+    with self.assertRaisesRegex(
+        ValueError,
+        "Dynamic shape is not supported with multiple cache lengths.",
+    ):
+      export_lib.exportable_module_config.ExportableModuleConfig(
+          model="dummy_model",
+          enable_dynamic_shape=True,
+          cache_lengths=[1024, 4096],
+      )
+
   def test_gpu_dynamic_shapes_config_rules(self):
     # Only prefill
     config = export_lib.exportable_module_config.ExportableModuleConfig(
@@ -191,6 +227,106 @@ class ExportLibTest(parameterized.TestCase):
           enable_dynamic_shape=True,
           enable_gpu_dynamic_cache=True,
       )
+
+  @mock.patch(
+      "litert_torch.generative.export_hf.core.export_lib.mu_pass_lib"
+      ".update_model"
+  )
+  @mock.patch(
+      "litert_torch.generative.export_hf.core.export_lib"
+      ".get_prefill_decode_exportable_cls"
+  )
+  @mock.patch(
+      "litert_torch.generative.export_hf.core.export_lib.converter_utils"
+      ".Converter"
+  )
+  @mock.patch(
+      "litert_torch.generative.export_hf.core.export_lib.model_ext_patches"
+      ".get_patch_context"
+  )
+  def test_export_signature_naming(
+      self,
+      mock_patch_context,
+      mock_converter_cls,
+      mock_get_cls,
+      mock_update_model,
+  ):
+    del mock_patch_context  # Unused.
+    # Setup mocks
+    mock_update_model.side_effect = lambda x: x
+    mock_prefill_cls = mock.MagicMock()
+    mock_decode_cls = mock.MagicMock()
+    mock_get_cls.return_value = (mock_prefill_cls, mock_decode_cls)
+
+    def mock_prefill_init(model, export_config, source_model_artifacts):
+      del model, source_model_artifacts  # Unused.
+      instance = mock.MagicMock()
+      def get_sample_inputs(model_config):
+        del model_config  # Unused.
+        return {
+            f"prefill_{length}": ({"input": 1}, None)
+            for length in export_config.prefill_lengths
+        }
+      instance.get_sample_inputs.side_effect = get_sample_inputs
+      return instance
+
+    mock_prefill_cls.side_effect = mock_prefill_init
+
+    mock_decode_instance = mock_decode_cls.return_value
+    mock_decode_instance.get_sample_inputs.return_value = {
+        "decode": ({"input": 2}, None)
+    }
+
+    mock_converter = mock_converter_cls.return_value
+    added_signatures = []
+
+    def mock_add_signature(name, module, sample_kwargs, dynamic_shapes=None):
+      del module, sample_kwargs, dynamic_shapes  # Unused.
+      added_signatures.append(name)
+    mock_converter.add_signature.side_effect = mock_add_signature
+
+    mock_model = mock.MagicMock()
+    mock_artifacts = mock.MagicMock()
+    mock_artifacts.model = mock_model
+    mock_artifacts.model_config.model_type = "dummy"
+    mock_artifacts.text_model_config = mock.MagicMock()
+
+    # Scenario 1: Single cache length (backward compatible)
+    config_single = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        cache_length=1024,
+        quantization_recipe=None,
+        work_dir=self.test_dir,
+    )
+
+    export_lib.export_text_prefill_decode_model(
+        mock_artifacts, config_single, export_lib.ExportedModelArtifacts()
+    )
+
+    expected_sigs_single = [
+        f"prefill_{length}" for length in config_single.prefill_lengths
+    ] + ["decode"]
+    self.assertEqual(added_signatures, expected_sigs_single)
+
+    # Scenario 2: Multiple cache lengths
+    added_signatures.clear()
+    config_multi = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        cache_lengths=[1024, 2048],
+        quantization_recipe=None,
+        work_dir=self.test_dir,
+    )
+
+    export_lib.export_text_prefill_decode_model(
+        mock_artifacts, config_multi, export_lib.ExportedModelArtifacts()
+    )
+
+    expected_sigs_multi = []
+    for cache_len in config_multi.cache_lengths:
+      for length in config_multi.prefill_lengths:
+        expected_sigs_multi.append(f"prefill_{length}_cache_{cache_len}")
+      expected_sigs_multi.append(f"decode_cache_{cache_len}")
+    self.assertEqual(added_signatures, expected_sigs_multi)
 
 
 if __name__ == "__main__":

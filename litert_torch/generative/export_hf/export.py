@@ -87,6 +87,7 @@ def export(
     trust_remote_code: bool = False,
     prefill_lengths: list[int] | None = None,
     cache_length: int | None = None,
+    cache_lengths: list[int] | None = None,
     quantization_recipe: str | None = None,
     enable_dynamic_shape: bool | None = None,
     enable_gpu_dynamic_prefill: bool | None = None,
@@ -147,8 +148,17 @@ def export(
       for ASR, and 'text_to_speech' for TTS.
     keep_temporary_files: Whether to keep the temporary files.
     trust_remote_code: Whether to trust remote code.
-    prefill_lengths: The lengths of the prefill input, separated by comma.
+    prefill_lengths: The lengths of the prefill input, separated by comma. If
+      multiple prefill_lengths and multiple cache_lengths are provided, the
+      export processes the outer product of prefill_lengths and cache_lengths,
+      creating prefill/decode signatures for each combination (e.g.,
+      `prefill_{prefill_length}_cache_{cache_length}`).
     cache_length: The length of the cache.
+    cache_lengths: The lengths of the cache, separated by comma. If multiple
+      cache_lengths and multiple prefill_lengths are provided, the export
+      processes the outer product of prefill_lengths and cache_lengths,
+      creating prefill/decode signatures for each combination (e.g.,
+      `prefill_{prefill_length}_cache_{cache_length}`).
     quantization_recipe: The quantization recipes to use, separated by comma.
     enable_dynamic_shape: Whether to enable dynamic shape.
     enable_gpu_dynamic_prefill: Whether to enable GPU dynamic shapes (magic

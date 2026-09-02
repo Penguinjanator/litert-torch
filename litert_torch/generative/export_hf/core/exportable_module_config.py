@@ -42,6 +42,7 @@ class ExportableModuleConfig:
   trust_remote_code: bool = False
   prefill_lengths: list[int] = dataclasses.field(default_factory=lambda: [128])
   cache_length: int = 4096
+  cache_lengths: list[int] | None = None
   sliding_window_ring_buffer_size: int | None = None
   # For quantization
   quantization_recipe: str | None = "dynamic_wi8_afp32"
@@ -154,6 +155,13 @@ class ExportableModuleConfig:
           int(x) for x in self.prefill_lengths.split(",") if x
       ]
 
+    if not self.cache_lengths:
+      self.cache_lengths = [self.cache_length]
+
+    if self.enable_dynamic_shape and len(self.cache_lengths) > 1:
+      raise ValueError(
+          "Dynamic shape is not supported with multiple cache lengths."
+      )
     # pylint: disable=g-bool-id-comparison
     match self.task:
       case ExportTask.IMAGE_TEXT_TO_TEXT:

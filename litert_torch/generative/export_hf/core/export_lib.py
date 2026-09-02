@@ -407,77 +407,58 @@ def export_text_prefill_decode_model(
     else:
       model.set_attn_implementation('lrt_transposed_attention')
 
-    prefill_module_cls, decode_module_cls = get_prefill_decode_exportable_cls(
-        source_model_artifacts.model_config, export_config
-    )
-    prefill_module = prefill_module_cls(
-        model, export_config, source_model_artifacts
-    )
-    decode_module = decode_module_cls(
-        model, export_config, source_model_artifacts
-    )
     converter = converter_utils.Converter()
-    sample_prefill_inputs = prefill_module.get_sample_inputs(text_model_config)
-    for signature_name, (
-        sample_prefill_inputs,
-        prefill_dynamic_shapes,
-    ) in sample_prefill_inputs.items():
-      if has_dynamic_shape:
-        prefill_ep = torch.export.export(
-            prefill_module,
-            args=(),
-            kwargs=sample_prefill_inputs,
-            dynamic_shapes=prefill_dynamic_shapes,
-        )
+    assert export_config.cache_lengths is not None
+    for cache_len in export_config.cache_lengths:
+      iter_config = dataclasses.replace(export_config, cache_length=cache_len)
+      prefill_module_cls, decode_module_cls = get_prefill_decode_exportable_cls(
+          source_model_artifacts.model_config, iter_config
+      )
+      prefill_module = prefill_module_cls(
+          model, iter_config, source_model_artifacts
+      )
+      decode_module = decode_module_cls(
+          model, iter_config, source_model_artifacts
+      )
+      modules_to_export = [
+          (
+              prefill_module,
+              prefill_module.get_sample_inputs(text_model_config),
+          ),
+          (
+              decode_module,
+              decode_module.get_sample_inputs(text_model_config),
+          ),
+      ]
+      for module, sample_inputs in modules_to_export:
+        for signature_name, (inputs, dynamic_shapes) in sample_inputs.items():
+          sig_name = signature_name
+          if len(export_config.cache_lengths) > 1:
+            sig_name = f'{signature_name}_cache_{cache_len}'
 
-        prefill_ep = fx_infra.safe_run_decompositions(
-            prefill_ep, fx_infra.decomp.pre_lower_decomp()
-        )
-
-        prefill_ep = prefill_ep.run_decompositions(torch_tfl.decomps)
-
-        converter.add_signature(
-            signature_name,
-            prefill_ep.module(),
-            sample_kwargs=sample_prefill_inputs,
-            dynamic_shapes=prefill_dynamic_shapes,
-        )
-      else:
-        converter.add_signature(
-            signature_name,
-            prefill_module.eval(),
-            sample_kwargs=sample_prefill_inputs,
-        )
-    for signature_name, (
-        sample_decode_inputs,
-        decode_dynamic_shapes,
-    ) in decode_module.get_sample_inputs(text_model_config).items():
-      if has_dynamic_shape:
-        decode_ep = torch.export.export(
-            decode_module,
-            args=(),
-            kwargs=sample_decode_inputs,
-            dynamic_shapes=decode_dynamic_shapes,
-        )
-
-        decode_ep = fx_infra.safe_run_decompositions(
-            decode_ep, fx_infra.decomp.pre_lower_decomp()
-        )
-
-        decode_ep = decode_ep.run_decompositions(torch_tfl.decomps)
-
-        converter.add_signature(
-            signature_name,
-            decode_ep.module(),
-            sample_kwargs=sample_decode_inputs,
-            dynamic_shapes=decode_dynamic_shapes,
-        )
-      else:
-        converter.add_signature(
-            signature_name,
-            decode_module.eval(),
-            sample_kwargs=sample_decode_inputs,
-        )
+          if has_dynamic_shape:
+            ep = torch.export.export(
+                module,
+                args=(),
+                kwargs=inputs,
+                dynamic_shapes=dynamic_shapes,
+            )
+            ep = fx_infra.safe_run_decompositions(
+                ep, fx_infra.decomp.pre_lower_decomp()
+            )
+            ep = ep.run_decompositions(torch_tfl.decomps)
+            converter.add_signature(
+                sig_name,
+                ep.module(),
+                sample_kwargs=inputs,
+                dynamic_shapes=dynamic_shapes,
+            )
+          else:
+            converter.add_signature(
+                sig_name,
+                module.eval(),
+                sample_kwargs=inputs,
+            )
 
     with patch_builtin_tuple_for_export():
       lrt_model = converter.convert(
@@ -820,7 +801,7 @@ def export_auxiliary_model(
   text_model_config = source_model_artifacts.text_model_config
   work_dir = export_config.work_dir
   converter = converter_utils.Converter()
-  # RoPE
+  # RoPE (does not depend on cache_length, export once)
   rope_module = external_rope_module.RoPEEmbedder(model)
   sample_inputs = rope_module.get_sample_inputs(
       text_model_config, export_config
@@ -831,32 +812,44 @@ def export_auxiliary_model(
         rope_module.eval(),
         sample_kwargs=sample_input,
     )
-  # Attention Mask
-  sliding_window_sizes = [getattr(text_model_config, 'sliding_window', None)]
-  attention_mask_module = split_cache_module.SplitAttentionMaskBuilder(
-      export_config,
-      sliding_window_sizes=sliding_window_sizes,
-  )
-  sample_inputs = attention_mask_module.get_sample_inputs(
-      text_model_config, export_config
-  )
-  for signature_name, (sample_input, _) in sample_inputs.items():
-    converter.add_signature(
-        signature_name,
-        attention_mask_module.eval(),
-        sample_kwargs=sample_input,
+  # Attention Mask and Cache Update (depend on cache_length, export for each)
+  assert export_config.cache_lengths is not None
+  for cache_len in export_config.cache_lengths:
+    iter_config = dataclasses.replace(export_config, cache_length=cache_len)
+
+    # Attention Mask
+    sliding_window_sizes = [getattr(text_model_config, 'sliding_window', None)]
+    attention_mask_module = split_cache_module.SplitAttentionMaskBuilder(
+        iter_config,
+        sliding_window_sizes=sliding_window_sizes,
     )
-  # Cache Update
-  cache_update_module = split_cache_module.CacheUpdate()
-  sample_inputs = cache_update_module.get_sample_inputs(
-      text_model_config, export_config
-  )
-  for signature_name, (sample_input, _) in sample_inputs.items():
-    converter.add_signature(
-        signature_name,
-        cache_update_module.eval(),
-        sample_kwargs=sample_input,
-    )
+    # Cache Update
+    cache_update_module = split_cache_module.CacheUpdate()
+
+    aux_modules = [
+        (
+            attention_mask_module,
+            attention_mask_module.get_sample_inputs(
+                text_model_config, iter_config
+            ),
+        ),
+        (
+            cache_update_module,
+            cache_update_module.get_sample_inputs(
+                text_model_config, iter_config
+            ),
+        ),
+    ]
+    for module, sample_inputs in aux_modules:
+      for signature_name, (sample_input, _) in sample_inputs.items():
+        sig_name = signature_name
+        if export_config.cache_lengths and len(export_config.cache_lengths) > 1:
+          sig_name = f'{signature_name}_cache_{cache_len}'
+        converter.add_signature(
+            sig_name,
+            module.eval(),
+            sample_kwargs=sample_input,
+        )
   lrt_model = converter.convert(strict_export=False)
   model_path = os.path.join(work_dir, 'auxiliary.tflite')  # pyrefly: ignore[no-matching-overload]
   lrt_model.export(model_path)
