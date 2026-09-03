@@ -15,10 +15,10 @@
 """Tests for litert_lm_builder."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 from litert_torch.generative.export_hf.core import export_lib
 from litert_torch.generative.export_hf.core import exportable_module
-import litert_lm_builder as litertlm_builder
+from litert_torch.generative.export_hf.core import litert_lm_builder
+from absl.testing import parameterized
 
 _EMPTY_CHAT_TEMPLATES = ((None, None), (None, None), (None, None))
 
