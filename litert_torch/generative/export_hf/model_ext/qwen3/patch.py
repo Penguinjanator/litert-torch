@@ -338,7 +338,7 @@ def qwen3_litert_patch():
     attn_funs["sdpa"] = original_sdpa
 
 
-@patches_lib.register_model_patch(["qwen3", "qwen3_text"])
+@patches_lib.register_model_patch(["qwen3", "qwen3_text", "qwen3_asr"])
 @contextlib.contextmanager
 def patch_qwen3_model(model, export_config):
   """Dynamic model patch for Qwen3 export."""

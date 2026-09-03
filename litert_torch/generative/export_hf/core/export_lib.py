@@ -35,6 +35,8 @@ from litert_torch.generative.export_hf.core.external_emb import exportable_modul
 from litert_torch.generative.export_hf.core.external_rope import exportable_module as external_rope_module
 from litert_torch.generative.export_hf.core.external_rope import preprocess_model as external_rope_preprocess_model
 from litert_torch.generative.export_hf.core.mu import mu_pass_lib
+from litert_torch.generative.export_hf.core.speech import asr_model
+from litert_torch.generative.export_hf.core.speech import exportables as speech_exportables
 from litert_torch.generative.export_hf.core.split_cache import attention as _
 from litert_torch.generative.export_hf.core.split_cache import exportable_module as split_cache_module
 from litert_torch.generative.export_hf.experimental.litert_lm_npu_compiler import litert_lm_npu_compiler
@@ -76,6 +78,7 @@ class ExportedModelArtifacts:
   vision_encoder_model_path: str | None = None
   vision_adapter_model_path: str | None = None
   eoi_model_path: str | None = None
+  audio_encoder_model_path: str | None = None
   auxiliary_model_path: str | None = None
   tokenizer_model_path: str | None = None
   additional_model_paths: dict[str, str] | None = None
@@ -232,7 +235,7 @@ def load_model(
     return SourceModelArtifacts(
         model=model,
         model_config=config,
-        text_model_config=config,
+        text_model_config=getattr(config, 'text_config', config),
         tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
     )
 
@@ -381,11 +384,17 @@ def export_text_prefill_decode_model(
 ):
   """Exports text model to tflite."""
   model = source_model_artifacts.model
+  if hasattr(model, 'get_text_model'):
+    model = model.get_text_model()
 
+  model_type = (
+      source_model_artifacts.text_model_config.model_type
+      if hasattr(source_model_artifacts, 'text_model_config')
+      and source_model_artifacts.text_model_config
+      else source_model_artifacts.model_config.model_type
+  )
   # Patch model instance for export.
-  with model_ext_patches.patch_model(
-      model, source_model_artifacts.model_config.model_type, export_config
-  ):
+  with model_ext_patches.patch_model(model, model_type, export_config):
     text_model_config = source_model_artifacts.text_model_config
     quantization_recipe = export_config.quantization_recipe
     work_dir = export_config.work_dir
@@ -557,14 +566,20 @@ def export_embedder_model(
 ):
   """Exports embedder."""
   model = source_model_artifacts.model
+  if hasattr(model, 'get_text_model'):
+    model = model.get_text_model()
   text_model_config = source_model_artifacts.text_model_config
   quantization_recipe = export_config.quantization_recipe
   work_dir = export_config.work_dir
 
+  model_type = (
+      source_model_artifacts.text_model_config.model_type
+      if hasattr(source_model_artifacts, 'text_model_config')
+      and source_model_artifacts.text_model_config
+      else source_model_artifacts.model_config.model_type
+  )
   # Patch model instance for export.
-  with model_ext_patches.patch_model(
-      model, source_model_artifacts.model_config.model_type, export_config
-  ):
+  with model_ext_patches.patch_model(model, model_type, export_config):
     embedder_module = external_emb_module.LiteRTExportableModuleForEmbedder(
         model.get_input_embeddings()
     )
@@ -696,6 +711,74 @@ def export_vision_encoder_models(
       vision_encoder_model_path=vision_encoder_path,
       vision_adapter_model_path=adapter_path,
       eoi_model_path=eoi_path,
+  )
+
+
+@progress.task('Export audio encoder models')
+def export_audio_encoder_models(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+) -> ExportedModelArtifacts:
+  """Exports audio encoder models."""
+  asr_model_obj = source_model_artifacts.model
+  model_config = source_model_artifacts.model_config
+  quantization_recipe = export_config.quantization_recipe
+  work_dir = export_config.work_dir
+
+  if isinstance(asr_model_obj, asr_model.AsrModel):
+    encode_module = speech_exportables.LiteRTExportableModuleForAsrEncode(
+        asr_model_obj, export_config
+    )
+  else:
+    exportables = model_ext_exportables.get_speech_exportables(model_config)
+    encode_module_cls = exportables[0]
+    encode_module = encode_module_cls(asr_model_obj, export_config)
+
+  sample_inputs = encode_module.get_sample_inputs(model_config)
+  converter = converter_utils.Converter()
+  for signature_name, (sample_args, _) in sample_inputs.items():
+    if isinstance(sample_args, dict):
+      converter.add_signature(
+          signature_name,
+          encode_module.eval(),
+          sample_kwargs=sample_args,
+      )
+    else:
+      converter.add_signature(
+          signature_name,
+          encode_module.eval(),
+          sample_args=sample_args,
+      )
+
+  with patch_builtin_tuple_for_export():
+    lrt_model = converter.convert(
+        lightweight_conversion=export_config.experimental_lightweight_conversion,
+        strict_export=False,
+    )
+
+  lrt_model = mu_pass_lib.update_model(lrt_model)  # pyrefly: ignore[bad-argument-type]
+  if export_config.experimental_use_mixed_precision:
+    print('Applying mixed precision to model...')
+    lrt_model = mu_pass_lib.apply_mixed_precision(lrt_model)
+
+  audio_encoder_path = os.path.join(work_dir, 'audio_encoder.tflite')  # pyrefly: ignore[no-matching-overload]
+  lrt_model.export(audio_encoder_path)
+
+  del lrt_model
+  del converter
+  gc.collect()
+
+  quantization_recipe_list = (
+      quantization_recipe.split(',') if quantization_recipe else [None]
+  )
+  for recipe in quantization_recipe_list:
+    audio_encoder_path = maybe_quantize_model(audio_encoder_path, recipe)
+    gc.collect()
+
+  return dataclasses.replace(
+      exported_model_artifacts,
+      audio_encoder_model_path=audio_encoder_path,
   )
 
 

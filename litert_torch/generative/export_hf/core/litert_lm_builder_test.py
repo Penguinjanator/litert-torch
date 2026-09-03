@@ -14,11 +14,13 @@
 # ==============================================================================
 """Tests for litert_lm_builder."""
 
+import types
 from absl.testing import absltest
+from absl.testing import parameterized
 from litert_torch.generative.export_hf.core import export_lib
 from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core import litert_lm_builder
-from absl.testing import parameterized
+import litert_lm_builder as litertlm_builder
 
 _EMPTY_CHAT_TEMPLATES = ((None, None), (None, None), (None, None))
 
@@ -255,6 +257,30 @@ class BuildLlmMetadataStartTokenTest(parameterized.TestCase):
     )
     llm_metadata = _build_llm_metadata(tokenizer)
     self.assertFalse(llm_metadata.HasField("start_token"))
+
+  def test_build_llm_metadata_qwen3_asr_model_type(self):
+    class _FakeConfig:
+      model_type = "qwen3_asr"
+      text_config = types.SimpleNamespace(model_type="qwen3")
+    class _FakeAsrModel:
+      config = _FakeConfig()
+      generation_config = None
+    tokenizer = _FakeTokenizer(bos_token=None, bos_token_id=None, prepends_bos=False)
+    source_artifacts = export_lib.SourceModelArtifacts(
+        model=_FakeAsrModel(),
+        model_config=_FakeConfig(),  # pyrefly: ignore[bad-argument-type]
+        text_model_config=_FakeConfig.text_config,  # pyrefly: ignore[bad-argument-type]
+        tokenizer=tokenizer,
+    )
+    export_config = exportable_module.ExportableModuleConfig(
+        model="dummy",
+        task=export_lib.exportable_module_config.ExportTask.AUTOMATIC_SPEECH_RECOGNITION,
+    )
+    exported_artifacts = export_lib.ExportedModelArtifacts()
+    metadata = litert_lm_builder.build_llm_metadata(
+        source_artifacts, export_config, "", exported_artifacts
+    )
+    self.assertTrue(metadata.llm_model_type.HasField("qwen3"))
 
 
 if __name__ == "__main__":

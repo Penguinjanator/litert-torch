@@ -141,12 +141,30 @@ class ExportLibTest(parameterized.TestCase):
         export_lib.exportable_module_config.ExportTask.AUTOMATIC_SPEECH_RECOGNITION,
     )
     self.assertTrue(config.export_audio_encoder)
+    self.assertTrue(config.bundle_litert_lm)
     self.assertFalse(config.export_vision_encoder)
     self.assertFalse(config.split_cache)
-    self.assertFalse(config.externalize_embedder)
+    self.assertTrue(config.externalize_embedder)
+    self.assertTrue(config.single_token_embedder)
     self.assertFalse(config.externalize_rope)
     self.assertEqual(config.input_sec, 1.0)
     self.assertEqual(config.stateful_after, -1)
+
+    config_legacy = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_asr_model",
+        task=export_lib.exportable_module_config.ExportTask.AUTOMATIC_SPEECH_RECOGNITION,
+        bundle_litert_lm=False,
+    )
+    self.assertFalse(config_legacy.bundle_litert_lm)
+    self.assertFalse(config_legacy.export_audio_encoder)
+
+  def test_exported_model_artifacts_audio_fields(self):
+    artifacts = export_lib.ExportedModelArtifacts(
+        audio_encoder_model_path="path/to/audio_encoder.tflite",
+    )
+    self.assertEqual(
+        artifacts.audio_encoder_model_path, "path/to/audio_encoder.tflite"
+    )
 
   def test_cache_lengths_config_rules(self):
     # Test default initialization

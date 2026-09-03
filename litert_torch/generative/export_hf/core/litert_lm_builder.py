@@ -176,6 +176,8 @@ def build_llm_metadata(
 ):
   """Builds LLM metadata."""
   model = source_model_artifacts.model
+  if hasattr(model, 'get_text_model'):
+    model = model.get_text_model()
   tokenizer = source_model_artifacts.tokenizer
   context_length = export_config.cache_length
 
@@ -333,10 +335,15 @@ def build_llm_metadata(
         export_config.llm_metadata_max_num_tokens_override
     )
 
-  model_type = litert_lm_model_type_override or model.config.model_type
+  model_cfg = getattr(model, 'config', source_model_artifacts.model_config)
+  text_cfg = getattr(model_cfg, 'text_config', model_cfg)
+  model_type = (
+      litert_lm_model_type_override
+      or getattr(text_cfg, 'model_type', getattr(model_cfg, 'model_type', ''))
+  )
 
   match (model_type):
-    case 'qwen3':
+    case 'qwen3' | 'qwen3_asr':
       llm_metadata.llm_model_type.CopyFrom(
           llm_model_type_pb2.LlmModelType(qwen3=llm_model_type_pb2.Qwen3())
       )
@@ -443,9 +450,14 @@ def package_model(
     with open(llm_metadata_path, 'wb') as f:
       f.write(llm_metadata.SerializeToString())
 
+  model_cfg = getattr(
+      source_model_artifacts.model,
+      'config',
+      source_model_artifacts.model_config,
+  )
   executor_metadata_builder = (
       metadata_builder_lib.get_executor_metadata_builder(
-          source_model_artifacts.model.config  # pyrefly: ignore[bad-argument-type]
+          model_cfg  # pyrefly: ignore[bad-argument-type]
       )
   )
   if executor_metadata_builder:
@@ -508,6 +520,11 @@ def package_model(
     builder.add_tflite_model(
         exported_model_artifacts.eoi_model_path,
         litertlm_builder.TfLiteModelType.END_OF_VISION,
+    )
+  if exported_model_artifacts.audio_encoder_model_path:
+    builder.add_tflite_model(
+        exported_model_artifacts.audio_encoder_model_path,
+        litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW,
     )
   if exported_model_artifacts.auxiliary_model_path:
     builder.add_tflite_model(

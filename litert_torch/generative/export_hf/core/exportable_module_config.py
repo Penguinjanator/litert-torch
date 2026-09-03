@@ -172,9 +172,10 @@ class ExportableModuleConfig:
       case ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
         self.export_vision_encoder = False
         self.split_cache = False
-        self.externalize_embedder = False
         self.externalize_rope = False
-        self.bundle_litert_lm = False
+        self.externalize_embedder = self.bundle_litert_lm
+        self.export_audio_encoder = self.bundle_litert_lm
+        self.single_token_embedder = self.bundle_litert_lm
       case ExportTask.TEXT_TO_SPEECH:
         self.export_vision_encoder = False
         self.export_audio_encoder = False

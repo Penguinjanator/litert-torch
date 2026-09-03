@@ -91,8 +91,8 @@ class Qwen3AsrEncoder(torch.nn.Module):
   # Corresponding to Qwen3AsrProcessor.PROMPT.
   # <|im_start|>user<|audio_start|>
   _INPUT_IDS_PREFIX = [151644, 872, 151669]
-  # <|audio_end|><|im_end|><|im_start|>assistant
-  _INPUT_IDS_POSTFIX = [151670, 151645, 151644, 77091]
+  # <|audio_end|><|im_end|><|im_start|>assistant\n
+  _INPUT_IDS_POSTFIX = [151670, 151645, 151644, 77091, 198]
 
   def __init__(self, model: torch.nn.Module):
     super().__init__()
@@ -169,6 +169,7 @@ class Qwen3Asr(asr_model.AsrModel):
           module.forward = types.MethodType(_audio_attention_forward, module)
     self._replace_normalizations(self._model)
     self._replace_rmsnorms(self._model)
+    self.config = self._model.config
     self._encoder = Qwen3AsrEncoder(self._model).eval()
     self._decoder = Qwen3AsrDecoder(self._model, override_transformers).eval()
     self._processor = Qwen3AsrProcessor(model_id)
@@ -190,6 +191,9 @@ class Qwen3Asr(asr_model.AsrModel):
   def get_decoder(self) -> torch.nn.Module:
     return self._decoder
 
+  def get_text_model(self) -> torch.nn.Module:
+    return self._model
+
   def get_processor(self) -> asr_model.AsrProcessor:
     return self._processor
 
@@ -206,7 +210,7 @@ class Qwen3Asr(asr_model.AsrModel):
     return encoder_output + (tokens, asr_model.get_causal_mask(num_masks))
 
   def get_decode_start_token_id(self) -> int:
-    return 198  # \n following 'assistant'
+    return -1
 
   def get_decode_stop_token_id(self) -> int:
     return 151645  # <|im_end|>

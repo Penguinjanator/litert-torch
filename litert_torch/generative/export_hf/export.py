@@ -276,10 +276,19 @@ def export(
   legacy_compile_triggered = False
 
   if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
-    export_tasks.append(export_lib.export_asr_models)
-    if export_config.aot_backend is not None:
-      export_tasks.append(export_lib.aot_compile_model)
-      legacy_compile_triggered = True
+    if export_config.bundle_litert_lm:
+      export_tasks.append(export_lib.export_text_prefill_decode_model)
+      if export_config.externalize_embedder:
+        export_tasks.append(export_lib.export_embedder_model)
+      if export_config.export_audio_encoder:
+        export_tasks.append(export_lib.export_audio_encoder_models)
+      export_tasks.append(export_lib.export_tokenizer)
+      export_tasks.append(litert_lm_builder.package_model)
+    else:
+      export_tasks.append(export_lib.export_asr_models)
+      if export_config.aot_backend is not None:
+        export_tasks.append(export_lib.aot_compile_model)
+        legacy_compile_triggered = True
   elif task == ExportTask.TEXT_TO_SPEECH:
     export_tasks.append(export_lib.export_tts_models)
     if export_config.aot_backend is not None:
