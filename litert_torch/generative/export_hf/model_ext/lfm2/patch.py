@@ -371,12 +371,15 @@ def patch_lfm2_model(model, export_config):
   use_qkv_norm_rope = getattr(
       export_config, "use_qkv_norm_rope_composite", False
   )
+  use_short_conv = getattr(
+      export_config, "use_short_conv_composite", False
+  )
   print(
       "LFM2 model patch applied. "
       f"fuse_gate_up={fuse_gate_up}, fuse_qkv={fuse_qkv}, "
       f"use_rope_composite={use_rope}, use_swiglu_composite={use_swiglu}, "
       f"use_qkv_norm_rope_composite={use_qkv_norm_rope}, "
-      f""
+      f"use_short_conv_composite={use_short_conv}"
   )
 
   replaced_modules = []
@@ -399,6 +402,8 @@ def patch_lfm2_model(model, export_config):
           )
           setattr(module, child_name, fused)
           replaced_modules.append((module, child_name, child))
+      elif isinstance(child, (short_conv_lib.Lfm2ShortConv, modeling_lfm2.Lfm2ShortConv)):
+        child.use_short_conv_composite = use_short_conv
       else:
         replace_modules(child)
 

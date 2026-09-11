@@ -95,6 +95,7 @@ def export(
     use_rope_composite: bool | None = None,
     use_swiglu_composite: bool | None = None,
     use_qkv_norm_rope_composite: bool | None = None,
+    use_short_conv_composite: bool | None = None,
     use_sdpa_composite: bool | None = None,
     externalize_embedder: bool | None = None,
     single_token_embedder: bool | None = None,
@@ -253,7 +254,10 @@ def export(
   config_args = {}
   extra_args = {}
   for key, value in provided_args.items():
-    if key in valid_fields:
+    if key == 'extra_kwargs':
+      if isinstance(value, dict):
+        extra_args.update(value)
+    elif key in valid_fields:
       config_args[key] = value
     else:
       extra_args[key] = value

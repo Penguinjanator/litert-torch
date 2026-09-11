@@ -213,6 +213,84 @@ class PatchTest(parameterized.TestCase):
       edge_attn = litert_torch.convert(attn_wrap, (x, pos))
       self.assertIsNotNone(edge_attn)
 
+  def test_short_conv_decode_and_prefill(self):
+    config = _get_dummy_lfm2_config()
+    conv = patch.short_conv_lib.Lfm2ShortConv(config, layer_idx=0)
+
+    expected_shape = (1, config.hidden_size, config.conv_L_cache - 1)
+
+    class DummyLayer:
+
+      def __init__(self):
+        self.conv_states = torch.zeros(expected_shape)
+
+    class DummyCache:
+
+      def __init__(self):
+        self.layers = [DummyLayer()]
+
+    cache = DummyCache()
+    # Prefill
+    x_prefill = torch.randn(1, 4, config.hidden_size)
+    out_prefill = conv(x_prefill, past_key_values=cache)
+    self.assertEqual(out_prefill.shape, (1, 4, config.hidden_size))
+    self.assertEqual(cache.layers[0].conv_states.shape, expected_shape)
+
+    # Decode
+    x_decode = torch.randn(1, 1, config.hidden_size)
+    out_decode = conv(x_decode, past_key_values=cache)
+    self.assertEqual(out_decode.shape, (1, 1, config.hidden_size))
+    self.assertEqual(cache.layers[0].conv_states.shape, expected_shape)
+
+
+
+  def test_short_conv_decode_composite(self):
+    config = _get_dummy_lfm2_config()
+    conv_standard = patch.short_conv_lib.Lfm2ShortConv(
+        config, layer_idx=0, use_short_conv_composite=False
+    )
+    conv_composite = patch.short_conv_lib.Lfm2ShortConv(
+        config, layer_idx=0, use_short_conv_composite=True
+    )
+    conv_composite.load_state_dict(conv_standard.state_dict())
+
+    expected_shape = (1, config.hidden_size, config.conv_L_cache - 1)
+
+    class DummyLayer:
+
+      def __init__(self, state):
+        self.conv_states = state.clone()
+
+    class DummyCache:
+
+      def __init__(self, state):
+        self.layers = [DummyLayer(state)]
+
+    init_state = torch.randn(expected_shape)
+    cache_std = DummyCache(init_state)
+    cache_comp = DummyCache(init_state)
+
+    x_decode = torch.randn(1, 1, config.hidden_size)
+
+    with torch.no_grad():
+      out_std = conv_standard(x_decode, past_key_values=cache_std)
+      out_comp = conv_composite(x_decode, past_key_values=cache_comp)
+
+    self.assertTrue(
+        torch.allclose(out_std, out_comp, rtol=1e-5, atol=1e-5),
+        "Output mismatch between standard and composite short conv",
+    )
+    self.assertTrue(
+        torch.allclose(
+            cache_std.layers[0].conv_states,
+            cache_comp.layers[0].conv_states,
+            rtol=1e-5,
+            atol=1e-5,
+        ),
+        "Next state mismatch",
+    )
+
 
 if __name__ == "__main__":
+
   googletest.main()

@@ -15,6 +15,7 @@
 """Short convolutions for LFM2."""
 
 from typing import Optional
+from litert_torch.generative.export_hf.experimental.composites import short_conv as short_conv_composite
 import torch
 from transformers.models.lfm2 import modeling_lfm2
 
@@ -26,9 +27,11 @@ class Lfm2ShortConv(modeling_lfm2.Lfm2ShortConv):
       self,
       config: modeling_lfm2.Lfm2Config,
       layer_idx: int,
+      use_short_conv_composite: bool = False,
   ):
     super().__init__(config, layer_idx)
     self.conv_L_cache_size = config.conv_L_cache
+    self.use_short_conv_composite = use_short_conv_composite
     self.conv = torch.nn.Conv1d(
         in_channels=config.hidden_size,
         out_channels=config.hidden_size,
@@ -69,13 +72,13 @@ class Lfm2ShortConv(modeling_lfm2.Lfm2ShortConv):
     if valid_mask is not None:
       hidden_states = hidden_states * valid_mask.unsqueeze(0).unsqueeze(-1)
 
-    b, c, x_proj = self.in_proj(hidden_states).chunk(3, dim=-1)
-    conv_input = b * x_proj
-    conv_input_t = conv_input.transpose(1, 2)
     state = past_key_values.layers[self.layer_idx].conv_states  # pyrefly: ignore[missing-attribute]
-    padded_input = torch.cat([state, conv_input_t], dim=-1)
 
     if seq_len > 1:  # Prefill
+      b, c, x_proj = self.in_proj(hidden_states).chunk(3, dim=-1)
+      conv_input = b * x_proj
+      conv_input_t = conv_input.transpose(1, 2)
+      padded_input = torch.cat([state, conv_input_t], dim=-1)
       if valid_mask is not None:
         L_state = self.conv_L_cache_size - 1
         B, C, S = padded_input.shape
@@ -97,12 +100,34 @@ class Lfm2ShortConv(modeling_lfm2.Lfm2ShortConv):
         next_state = torch.matmul(padded_input, mask)
       else:
         next_state = padded_input[:, :, -(self.conv_L_cache_size - 1) :]
-    else:  # Decode
+      conv_out = self.conv(padded_input)
+      conv_out = conv_out.transpose(1, 2)
+      y = c * conv_out
+    elif self.use_short_conv_composite:  # Fused decode step composite
+      in_proj_out = self.in_proj(hidden_states)
+      y, next_state = short_conv_composite.apply_short_conv_step(
+          in_proj_out=in_proj_out,
+          conv_state=state,
+          conv_weight=self.conv.weight,
+          conv_bias=self.conv.bias,
+          conv_L_cache=self.conv_L_cache_size,
+      )
+    else:  # Decode unfused fallback
+      b, c, x_proj = self.in_proj(hidden_states).chunk(3, dim=-1)
+      conv_input = b * x_proj
+      # Squeeze seq_len=1 and expand along last dim to match state.
+      # Reshape/squeeze avoids aten.transpose and allows direct dot-product!
+      conv_input_s = conv_input.squeeze(1).unsqueeze(-1)
+      padded_input = torch.cat([state, conv_input_s], dim=-1)
       next_state = padded_input[:, :, -(self.conv_L_cache_size - 1) :]
+      # Depthwise 1D conv for length L_cache is elementwise multiply + sum.
+      w = self.conv.weight.squeeze(1).unsqueeze(0)
+      conv_out = (padded_input * w).sum(dim=-1)
+      if self.conv.bias is not None:
+        conv_out = conv_out + self.conv.bias.unsqueeze(0)
+      conv_out = conv_out.unsqueeze(1)
+      y = c * conv_out
 
-    conv_out = self.conv(padded_input)
-    conv_out = conv_out.transpose(1, 2)
-    y = c * conv_out
     y = self.out_proj(y)
     past_key_values.layers[self.layer_idx].conv_states = next_state  # pyrefly: ignore[missing-attribute]
     return y
