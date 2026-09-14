@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from unittest import mock
+
 import litert_torch
 from litert_torch import backend
 import numpy as np
@@ -78,6 +80,9 @@ class TestCoreAtenOps(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     torch.manual_seed(0)
+    self.enter_context(
+        mock.patch.dict("os.environ", {"LITERT_TORCH_FULL_TFL_DECOMPS": "0"})
+    )
 
   def _diff_output(
       self, output1, output2, rtol, atol, equal_nan=True, check_values=True

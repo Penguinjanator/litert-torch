@@ -36,36 +36,58 @@ def register_decomp(op):
 
 @register_decomp(torch.ops.aten.mm.default)
 def _aten_mm_decomp(x, y):
+  x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.batch_matmul(x, y)
 
 
 @register_decomp(torch.ops.aten.bmm.default)
 def _aten_bmm_decomp(x, y):
+  x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.batch_matmul(x, y)
 
 
 def _promote_types_for_binary_op(x, y):
   """Promotes operand types for a binary op."""
-  # TFLite's binary ops require operands to have the same element type.
-  # We promote the types before calling the op.
-  # Handle scalar operand by converting scalar to a tensor.
-  if not isinstance(x, torch.Tensor):
-    x = torch.scalar_tensor(x)
-  elif not isinstance(y, torch.Tensor):
-    y = torch.scalar_tensor(y)
+  # TFLite's binary ops require operands to have the same element type, so we
+  # promote both operands before calling the op.
+  #
+  # `torch.result_type` implements PyTorch's promotion rules for mixed
+  # tensor/scalar operands, where a Python scalar participates *weakly*: it can
+  # widen the result category (int tensor * float scalar -> float) but does not
+  # impose its own default width on a tensor operand (fp16 tensor * float
+  # scalar stays fp16). Coercing the scalar to the tensor's dtype instead would
+  # silently truncate, e.g. int_tensor * 0.5 would become int_tensor * 0.
+  if isinstance(x, torch.Tensor) or isinstance(y, torch.Tensor):
+    target_dtype = torch.result_type(x, y)
+  else:
+    # `torch.result_type` requires at least one tensor operand.
+    target_dtype = torch.promote_types(
+        torch.tensor(x).dtype, torch.tensor(y).dtype
+    )
 
-  target_dtype = torch.promote_types(x.dtype, y.dtype)
-  if x.dtype != target_dtype:
+  if not isinstance(x, torch.Tensor):
+    x = torch.scalar_tensor(x, dtype=target_dtype)
+  elif x.dtype != target_dtype:
     x = x.to(target_dtype)
-  if y.dtype != target_dtype:
+
+  if not isinstance(y, torch.Tensor):
+    y = torch.scalar_tensor(y, dtype=target_dtype)
+  elif y.dtype != target_dtype:
     y = y.to(target_dtype)
+
   return x, y
 
 
 @register_decomp(torch.ops.aten.add.Tensor)
 def _aten_add_tensor_decomp(x, y, alpha=1):
+  x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   if alpha == 1:
-    x, y = _promote_types_for_binary_op(x, y)
     return torch.ops.tfl.add(x, y)
 
   # The op is add(x, mul(y, alpha))
@@ -77,8 +99,10 @@ def _aten_add_tensor_decomp(x, y, alpha=1):
 
 @register_decomp(torch.ops.aten.sub.Tensor)
 def _aten_sub_tensor_decomp(x, y, alpha=1):
+  x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   if alpha == 1:
-    x, y = _promote_types_for_binary_op(x, y)
     return torch.ops.tfl.sub(x, y)
 
   # The op is sub(x, mul(y, alpha))
@@ -91,36 +115,51 @@ def _aten_sub_tensor_decomp(x, y, alpha=1):
 @register_decomp(torch.ops.aten.mul.Tensor)
 def _aten_mul_tensor_decomp(x, y):
   x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.mul(x, y)
 
 
 @register_decomp(torch.ops.aten.mul.Scalar)
 def _aten_mul_scalar_decomp(x, y):
   x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.mul(x, y)
 
 
 @register_decomp(torch.ops.aten.div.Tensor)
 def _aten_div_tensor_decomp(x, y):
   x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
+  if not x.dtype.is_floating_point:
+    x = x.to(torch.float32)
+    y = y.to(torch.float32)
   return torch.ops.tfl.div(x, y)
 
 
 @register_decomp(torch.ops.aten.pow.Scalar)
 def _aten_pow_scalar_decomp(x, y):
   x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.pow(x, y)
 
 
 @register_decomp(torch.ops.aten.pow.Tensor_Scalar)
 def _aten_pow_tensor_scalar_decomp(x, y):
   x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.pow(x, y)
 
 
 @register_decomp(torch.ops.aten.pow.Tensor_Tensor)
 def _aten_pow_tensor_tensor_decomp(x, y):
   x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.pow(x, y)
 
 
@@ -317,6 +356,8 @@ def _aten_squeeze_dims_decomp(x, squeeze_dims: Sequence[int]):
 @register_decomp(torch.ops.aten.select.int)
 def _aten_select_int_decomp(x, dim, index):
   rank = len(x.shape)
+  if rank > 5:
+    return NotImplemented
 
   # Initialize begin, end, strides
   begin = [0] * rank
@@ -337,6 +378,8 @@ def _aten_select_int_decomp(x, dim, index):
 @register_decomp(torch.ops.aten.slice.Tensor)
 def _aten_slice_tensor_decomp(x, dim=0, start=None, end=None, step=1):
   rank = x.dim()
+  if rank > 5:
+    return NotImplemented
   dim_size = x.shape[dim]
 
   # Initialize begin, end, strides for tfl.strided_slice
@@ -369,6 +412,8 @@ def _aten_slice_tensor_decomp(x, dim=0, start=None, end=None, step=1):
 @register_decomp(torch.ops.aten.where.self)
 def _aten_where_self_decomp(condition, x, y):
   x, y = _promote_types_for_binary_op(x, y)
+  if x.dtype == torch.float64:
+    return NotImplemented
   return torch.ops.tfl.select_v2(condition, x, y)
 
 

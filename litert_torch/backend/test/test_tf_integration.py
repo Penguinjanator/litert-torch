@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from unittest import mock
+
 from litert_torch import backend
 from litert_torch import fx_infra
 import numpy as np
@@ -43,6 +45,9 @@ class TensorflowIntegrationTest(googletest.TestCase):
   def setUp(self):
     super().setUp()
     torch.manual_seed(0)
+    self.enter_context(
+        mock.patch.dict("os.environ", {"LITERT_TORCH_FULL_TFL_DECOMPS": "0"})
+    )
 
   def test_mlir_lowered_call(self):
     """Test a simple model with MLIR lowered call."""
