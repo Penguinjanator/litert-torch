@@ -576,7 +576,14 @@ class Qwen3_5StaticModel(nn.Module):
       **kwargs,
   ) -> Tuple[torch.Tensor, Optional[Any]]:
     hidden_states = self.embed_tokens(input_ids)
-    pos_for_rope = positions.unsqueeze(0) if positions.ndim == 1 else positions
+    if positions.ndim == 1:
+      pos_for_rope = positions.view(1, 1, -1).expand(
+          3, hidden_states.shape[0], -1
+      )
+    elif positions.ndim == 2:
+      pos_for_rope = positions.unsqueeze(0).expand(3, -1, -1)
+    else:
+      pos_for_rope = positions
     position_embeddings = self.rotary_emb(hidden_states, pos_for_rope)
 
     for layer in self.layers:
