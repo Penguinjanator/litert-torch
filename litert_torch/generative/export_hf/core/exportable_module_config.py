@@ -156,7 +156,13 @@ class ExportableModuleConfig:
           int(x) for x in self.prefill_lengths.split(",") if x
       ]
 
-    if not self.cache_lengths:
+    if isinstance(self.cache_lengths, int):
+      self.cache_lengths = [self.cache_lengths]
+    elif isinstance(self.cache_lengths, str):
+      self.cache_lengths = [
+          int(x) for x in self.cache_lengths.split(",") if x
+      ]
+    elif not self.cache_lengths:
       self.cache_lengths = [self.cache_length]
 
     if self.enable_dynamic_shape and len(self.cache_lengths) > 1:
@@ -218,6 +224,12 @@ class ExportableModuleConfig:
     if self.cache_implementation is None:
       self.cache_implementation = "LiteRTLMCache"
     # pylint: enable=g-bool-id-comparison
+
+    if self.sliding_window_ring_buffer_size is not None:
+      # Round up to the nearest 32.
+      self.sliding_window_ring_buffer_size = (
+          (self.sliding_window_ring_buffer_size + 31) // 32
+      ) * 32
 
   def __repr__(self):
     """Returns a pretty-printed string representation of the config."""

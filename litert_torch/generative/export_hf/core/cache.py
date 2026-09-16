@@ -126,6 +126,7 @@ def _update_kv_impl(
           kv_batch_size=1,
           cache_len=cache_size,
           head_size=head_size,
+          is_ring_buffer=False,
       )
       return k, v
 
@@ -337,8 +338,21 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     assert (
         cache_position is not None
     ), "For export, cache position should always be set."
+    if cache_position.dim() == 0:
+      cache_position = cache_position.unsqueeze(0)
     merged_kwargs = {**kwargs, **cache_kwargs}
     merged_kwargs.pop("cache_position", None)
+    apply_gpu_composites = merged_kwargs.get("apply_gpu_composites", False)
+    enable_ring_buffer = merged_kwargs.get("enable_ring_buffer", False)
+    if apply_gpu_composites and enable_ring_buffer and self.is_sliding:
+      # In the case where we use actual ring buffer for local layers and
+      # gpu composite op, we pass key and value as tuples so attention
+      # can handle the cache update before or after BMM as needed.
+      param_tensor = merged_kwargs.get("param_tensor", None)
+      return (
+          (self.keys, key_states, self, cache_position, param_tensor),
+          (self.values, value_states, self),
+      )
     valid_mask = merged_kwargs.pop("valid_mask", None)
     if valid_mask is None or not self.is_sliding:
       # Sliding window with full context or Full attention.
@@ -821,7 +835,7 @@ def _unflatten_kvc_t(
               layer_type=layer_types[i],
           )
       )
-    elif layer_type == "full_attention" or layer_type == "sliding_attention":
+    elif layer_type in ["full_attention", "sliding_attention"]:
       k_cache_idx = flat_names.index(f"k_{i}")
       v_cache_idx = flat_names.index(f"v_{i}")
       layers.append(

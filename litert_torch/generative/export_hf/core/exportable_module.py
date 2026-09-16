@@ -79,6 +79,7 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
       use_bool_mask: bool = False,
       **kwargs,
   ):
+    local_mask = kwargs.get("local_mask", None)
     if hasattr(self.model.config, "text_config"):
       text_config = self.model.config.text_config
     else:
@@ -116,9 +117,9 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
           layer_types is not None and "sliding_attention" in layer_types
       ) or is_mistral
       if need_sliding_mask:
-        # TODO(weiyiw): Update LiteRT-LM to provide sliding window mask
-        # instead of computing it inside the model.
-        if use_bool_mask:
+        if local_mask is not None:
+          masks["sliding_attention"] = local_mask
+        elif use_bool_mask:
           if self.export_config.sliding_window_ring_buffer_size:
             assert (
                 self.export_config.sliding_window_ring_buffer_size
@@ -127,15 +128,27 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
                 "Sliding window ring buffer size must be greater than or equal"
                 " to the sliding window size."
             )
-            masks["sliding_attention"] = (
-                sliding_window_attention_mask.build_full_mask_with_valid_mask(
-                    valid_mask,
-                    sliding_window,
-                    self.export_config.sliding_window_ring_buffer_size,
-                    input_pos[0],
-                    use_bool_mask=True,
-                )
-            )
+            # GPU local attention decode does single bmm as before
+            is_decode = input_pos.shape[0] == 1
+            if kwargs.get("apply_gpu_composites", False) and is_decode:
+              masks["sliding_attention"] = (
+                  sliding_window_attention_mask.build_sliding_window_decode_mask(
+                      sliding_window,
+                      self.export_config.sliding_window_ring_buffer_size,
+                      input_pos,
+                      use_bool_mask=True,
+                  )
+              )
+            else:
+              masks["sliding_attention"] = (
+                  sliding_window_attention_mask.build_full_mask_with_valid_mask(
+                      valid_mask,
+                      sliding_window,
+                      self.export_config.sliding_window_ring_buffer_size,
+                      input_pos[0],
+                      use_bool_mask=True,
+                  )
+              )
           else:
             masks["sliding_attention"] = utils.create_sliding_mask(
                 input_pos.clone().unsqueeze(0),
@@ -153,15 +166,26 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
                 "Sliding window ring buffer size must be greater than or equal"
                 " to the sliding window size."
             )
-            masks["sliding_attention"] = (
-                sliding_window_attention_mask.build_full_mask_with_valid_mask(
-                    valid_mask,
-                    sliding_window,
-                    self.export_config.sliding_window_ring_buffer_size,
-                    input_pos[0],
-                    use_bool_mask=False,
-                )
-            )
+            is_decode = input_pos.shape[0] == 1
+            if kwargs.get("apply_gpu_composites", False) and is_decode:
+              masks["sliding_attention"] = (
+                  sliding_window_attention_mask.build_sliding_window_decode_mask(
+                      sliding_window,
+                      self.export_config.sliding_window_ring_buffer_size,
+                      input_pos,
+                      use_bool_mask=False,
+                  )
+              )
+            else:
+              masks["sliding_attention"] = (
+                  sliding_window_attention_mask.build_full_mask_with_valid_mask(
+                      valid_mask,
+                      sliding_window,
+                      self.export_config.sliding_window_ring_buffer_size,
+                      input_pos[0],
+                      use_bool_mask=False,
+                  )
+              )
           else:
             masks["sliding_attention"] = (
                 utils.create_sliding_mask(
@@ -196,7 +220,10 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
           is not None
       ):
         pad_token_id = self.source_model_artifacts.tokenizer.pad_token_id
-      if pad_token_id is None and getattr(text_config, "pad_token_id", None) is not None:
+      if (
+          pad_token_id is None
+          and getattr(text_config, "pad_token_id", None) is not None
+      ):
         pad_token_id = text_config.pad_token_id
       if not isinstance(pad_token_id, int) or pad_token_id < 0:
         pad_token_id = 0
@@ -221,6 +248,14 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
         or kwargs.get("use_sdpa_composite", False)
     ):
       param_tensor = kwargs.get("param_tensor", None)
+      if param_tensor is not None:
+        # Local attn ring buffer uses param_tensor[3] to store update length.
+        # TODO(sulemanshahid): We can move the param tensor as in-graph now.
+        update_length = param_tensor[..., 1:2] - param_tensor[..., 0:1]
+        param_tensor = torch.cat(
+            [param_tensor[..., :3], update_length, param_tensor[..., 4:]],
+            dim=-1,
+        )
       cache_runtime_args["apply_gpu_composites"] = True
       cache_runtime_args["param_tensor"] = param_tensor
       ret["apply_gpu_composites"] = True
@@ -228,6 +263,8 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
     if self.export_config.sliding_window_ring_buffer_size is not None:
       # Ring buffer cache implementation requires valid mask.
       cache_runtime_args["valid_mask"] = valid_mask
+      cache_runtime_args["enable_ring_buffer"] = True
+      ret["enable_ring_buffer"] = True
     kv_cache.set_cache_runtime_args(cache_runtime_args)
     if kwargs.get("use_sdpa_composite", False):
       ret["use_sdpa_composite"] = kwargs["use_sdpa_composite"]
@@ -291,6 +328,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
       input_pos,
       kv_cache,
       mask,
+      local_mask=None,
       **kwargs,
   ):
     if self.export_config.extra_kwargs.get(
@@ -308,6 +346,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
         input_pos,
         kv_cache,
         mask,
+        local_mask=local_mask,
         use_bool_mask=self.export_config.extra_kwargs.get(
             "use_bool_mask", False
         ),
@@ -341,6 +380,17 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
     )
     batch_size = export_config.batch_size
     cache_length = export_config.cache_length
+    text_cfg = getattr(model_config, "text_config", model_config)
+    sliding_window = getattr(text_cfg, "sliding_window", None)
+    layer_types = getattr(text_cfg, "layer_types", None)
+    has_sliding = (
+        sliding_window is not None
+        and (
+            (layer_types is not None and "sliding_attention" in layer_types)
+            or getattr(text_cfg, "model_type", getattr(model_config, "model_type", "")) == "mistral"
+        )
+    )
+    ring_buffer_size = export_config.sliding_window_ring_buffer_size
     sample_inputs = {}
     for prefill_length in export_config.prefill_lengths:
       tokens, tokens_dynamic_shape = self._get_input(
@@ -357,6 +407,11 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
               dtype=torch.bool if use_bool_mask else torch.float32,
           ),
       }
+      if ring_buffer_size is not None and has_sliding:
+        inputs["local_mask"] = torch.ones(
+            (1, 1, prefill_length, ring_buffer_size + prefill_length),
+            dtype=torch.bool if use_bool_mask else torch.float32,
+        )
       if (
           export_config.extra_kwargs.get("apply_gpu_composites", False)
           or getattr(export_config, "apply_gpu_composites", False)
@@ -375,6 +430,10 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
             },
             "input_pos": {0: export_config.prefill_length_dim},
         }
+        if "local_mask" in inputs:
+          dynamic_shapes["local_mask"] = {
+              2: export_config.prefill_length_dim,
+          }
         dynamic_shapes.update(kv_cache_dynamic_shapes)
         sample_inputs["prefill"] = (inputs, dynamic_shapes)
       else:
@@ -393,9 +452,12 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       input_pos,
       kv_cache,
       mask,
+      local_mask=None,
       **kwargs,
   ):
-    if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
+    if self.export_config.extra_kwargs.get(
+        "apply_gpu_composites", False
+    ) or getattr(self.export_config, "apply_gpu_composites", False):
       kwargs["apply_gpu_composites"] = True
     if (
         self.export_config.extra_kwargs.get("use_sdpa_composite", False)
@@ -409,6 +471,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
         input_pos,
         kv_cache,
         mask,
+        local_mask=local_mask,
         use_bool_mask=self.export_config.extra_kwargs.get(
             "use_bool_mask", False
         ),
@@ -459,6 +522,22 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
             dtype=torch.bool if use_bool_mask else torch.float32,
         ),
     }
+    text_cfg = getattr(model_config, "text_config", model_config)
+    sliding_window = getattr(text_cfg, "sliding_window", None)
+    layer_types = getattr(text_cfg, "layer_types", None)
+    has_sliding = (
+        sliding_window is not None
+        and (
+            (layer_types is not None and "sliding_attention" in layer_types)
+            or getattr(text_cfg, "model_type", getattr(model_config, "model_type", "")) == "mistral"
+        )
+    )
+    ring_buffer_size = export_config.sliding_window_ring_buffer_size
+    if ring_buffer_size is not None and has_sliding:
+      inputs["local_mask"] = torch.ones(
+          (1, 1, 1, ring_buffer_size),
+          dtype=torch.bool if use_bool_mask else torch.float32,
+      )
     if (
         export_config.extra_kwargs.get("apply_gpu_composites", False)
         or getattr(export_config, "apply_gpu_composites", False)
@@ -474,6 +553,8 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
           "mask": {3: export_config.cache_length_dim},
           "input_pos": None,
       }
+      if "local_mask" in inputs:
+        decode_dynamic_shapes["local_mask"] = None
       decode_dynamic_shapes.update(kv_cache_dynamic_shapes)
     else:
       decode_dynamic_shapes = {}
@@ -493,6 +574,11 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
               (1, 1, verify_length, cache_length), dtype=torch.bool
           ),
       }
+      if ring_buffer_size is not None and has_sliding:
+        inputs["local_mask"] = torch.ones(
+            (1, 1, verify_length, ring_buffer_size),
+            dtype=torch.bool if use_bool_mask else torch.float32,
+        )
       inputs.update(kv_cache_inputs)
       if export_config.cache_length_dim is not None:
         decode_dynamic_shapes = {
@@ -500,6 +586,8 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
             "mask": {3: export_config.cache_length_dim},
             "input_pos": None,
         }
+        if "local_mask" in inputs:
+          decode_dynamic_shapes["local_mask"] = None
         decode_dynamic_shapes.update(kv_cache_dynamic_shapes)
       else:
         decode_dynamic_shapes = {}

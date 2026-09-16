@@ -31,12 +31,14 @@ def cache_update(
     kv_batch_size: int,
     cache_len: int,
     head_size: int,
+    is_ring_buffer: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Cache update composite op for float cache."""
   attrs = {
       "kv_cache_batch_size": kv_heads * kv_batch_size,
       "cache_size": cache_len,
       "head_size": head_size,
+      "is_ring_buffer": is_ring_buffer,
   }
   builder = composite.StableHLOCompositeBuilder(
       name="odml.cache_update", attr=attrs  # pyrefly: ignore[bad-argument-type]

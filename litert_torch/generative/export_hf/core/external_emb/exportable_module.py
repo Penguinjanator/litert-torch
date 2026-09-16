@@ -30,6 +30,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder(
       input_pos,
       kv_cache,
       mask,
+      local_mask=None,
       **kwargs,
   ):
     if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
@@ -40,6 +41,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder(
         input_pos,
         kv_cache,
         mask,
+        local_mask=local_mask,
         use_bool_mask=self.export_config.extra_kwargs.get(
             "use_bool_mask", False
         ),
@@ -76,6 +78,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder(
       input_pos,
       kv_cache,
       mask,
+      local_mask=None,
       **kwargs,
   ):
     if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
@@ -86,6 +89,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder(
         input_pos,
         kv_cache,
         mask,
+        local_mask=local_mask,
         use_bool_mask=self.export_config.extra_kwargs.get(
             "use_bool_mask", False
         ),

@@ -92,14 +92,22 @@ try:
     if layer_types is None:
       layer_types = ['full_attention'] * num_layers
 
+    apply_gpu_composites = (
+        getattr(export_config, 'apply_gpu_composites', False)
+        or getattr(export_config, 'extra_kwargs', {}).get(
+            'apply_gpu_composites', False
+        )
+    )
+    enable_ring_buffer = (
+        getattr(export_config, 'sliding_window_ring_buffer_size', None)
+        is not None
+    )
     for i, layer_type in enumerate(layer_types):
       if i >= num_layers:
         break
-      if (
-          layer_type == 'sliding_attention'
-          and export_config.sliding_window_ring_buffer_size is None
-      ):
+      if layer_type == 'sliding_attention' and not enable_ring_buffer:
         layer_type = 'full_attention'
+
       if layer_type == 'linear_attention':
         _add_state_buffer(
             llm_metadata,
@@ -133,12 +141,17 @@ try:
             maximum_sequence_length=max_cache_length,
         )
       elif layer_type == 'sliding_attention':
+        local_cache_length = (
+            export_config.sliding_window_ring_buffer_size
+            if export_config.sliding_window_ring_buffer_size is not None
+            else max_cache_length
+        )
         _add_state_buffer(
             llm_metadata,
             f'kv_cache_k_{i}',
             executor_metadata_pb2.StateBuffer.TYPE_LOCAL_KEY_CACHE,
             sequence_axis=export_config.k_ts_idx,
-            maximum_sequence_length=max_cache_length,
+            maximum_sequence_length=local_cache_length,
             minimum_sequence_length=sliding_window_size,
         )
         _add_state_buffer(
@@ -146,7 +159,7 @@ try:
             f'kv_cache_v_{i}',
             executor_metadata_pb2.StateBuffer.TYPE_LOCAL_VALUE_CACHE,
             sequence_axis=export_config.v_ts_idx,
-            maximum_sequence_length=max_cache_length,
+            maximum_sequence_length=local_cache_length,
             minimum_sequence_length=sliding_window_size,
         )
       else:
@@ -161,6 +174,22 @@ try:
       llm_metadata.max_history_size = 0
     else:
       llm_metadata.max_history_size = max_cache_length
+
+    if sliding_window_size is not None and enable_ring_buffer:
+      local_mask_type = executor_metadata_pb2.ATTENTION_MASK_TYPE_CAUSAL
+      if getattr(source_model_artifacts.model_config, 'vision_config', None) is not None:
+        local_mask_type = (
+            executor_metadata_pb2.ATTENTION_MASK_TYPE_VISION_BIDIRECTIONAL
+        )
+      llm_metadata.attention_mask_settings.attention_mask_type = (
+          executor_metadata_pb2.ATTENTION_MASK_TYPE_CAUSAL
+      )
+      llm_metadata.attention_mask_settings.local_attention_mask_type = (
+          local_mask_type
+      )
+      llm_metadata.attention_mask_settings.sliding_window_size = (
+          sliding_window_size
+      )
 
     return executor_metadata
 

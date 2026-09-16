@@ -19,7 +19,7 @@ import dataclasses
 import gc
 import json
 import os
-from typing import Any
+from typing import Any, cast
 
 import huggingface_hub
 from litert_torch import fx_infra
@@ -393,8 +393,11 @@ def export_text_prefill_decode_model(
       and source_model_artifacts.text_model_config
       else source_model_artifacts.model_config.model_type
   )
+
   # Patch model instance for export.
-  with model_ext_patches.patch_model(model, model_type, export_config):
+  with model_ext_patches.patch_model(
+      model, model_type, export_config
+  ):
     text_model_config = source_model_artifacts.text_model_config
     quantization_recipe = export_config.quantization_recipe
     work_dir = export_config.work_dir
@@ -412,7 +415,7 @@ def export_text_prefill_decode_model(
       ), 'Dynamic shape is not supported for split cache.'
       model.set_attn_implementation('lrt_split_cache_attention')
       # In case of the attn_implementation is not set.
-      model.config._attn_implementation = 'lrt_split_cache_attention'  # pylint: disable=protected-access  # pyrefly: ignore[missing-attribute]
+      cast(Any, model).config._attn_implementation = 'lrt_split_cache_attention'  # pylint: disable=protected-access
     else:
       model.set_attn_implementation('lrt_transposed_attention')
 

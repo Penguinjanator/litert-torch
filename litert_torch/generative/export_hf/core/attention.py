@@ -15,7 +15,7 @@
 """Optimized Attention layer for HuggingFace integration."""
 
 import math
-from typing import Optional
+from typing import Any, Optional
 import jaxtyping as jt
 from litert_torch.generative.custom_ops import bmm_4d as bmm_lib
 from litert_torch.generative.export_hf.experimental.composites import sdpa as gpu_sdpa
@@ -129,8 +129,8 @@ def scaled_dot_product_attention_transposed(
 def transposed_attention(
     module: torch.nn.Module,
     query: jt.Float[torch.Tensor, "b n t h"],
-    key: jt.Float[torch.Tensor, "1 c s h"],
-    value: jt.Float[torch.Tensor, "1 c h s"],
+    key: Any,
+    value: Any,
     attention_mask: jt.Shaped[torch.Tensor, "1 1 t s"] | None,
     scaling: float | None = None,
     softcap: float | None = None,
@@ -163,14 +163,23 @@ def transposed_attention(
         " passing the kwargs correctly."
     )
 
-  apply_gpu_composites = kwargs.get("apply_gpu_composites", False)
-  use_sdpa_composite = kwargs.get("use_sdpa_composite", False)
+  apply_gpu_composites = bool(kwargs.get("apply_gpu_composites", False))
+  use_sdpa_composite = bool(
+      kwargs.get("use_sdpa_composite", False)
+      or kwargs.get("sdpa_use_composite", False)
+  )
 
   if apply_gpu_composites or use_sdpa_composite:
     is_global = kwargs.get("is_global", None)
     if is_global is None:
       is_sliding = getattr(module, "is_sliding", False)
+      if hasattr(module, "layer_type"):
+        is_sliding = getattr(module, "layer_type", "") == "sliding_attention"
       is_global = not is_sliding
+    is_global = bool(is_global)
+    past_key_value = kwargs.get("past_key_value", None)
+    enable_ring_buffer = bool(kwargs.get("enable_ring_buffer", False))
+    layer_idx = getattr(module, "layer_idx", None)
     sdpa_out = gpu_sdpa.scaled_dot_product_attention_transposed(
         query=query,
         key=key,
@@ -184,6 +193,9 @@ def transposed_attention(
         param_tensor=kwargs.get("param_tensor", None),
         is_global=is_global,
         use_sdpa_composite=use_sdpa_composite,
+        enable_ring_buffer=enable_ring_buffer,
+        past_key_value=past_key_value,
+        layer_idx=layer_idx,
     )
     return sdpa_out, None
 
