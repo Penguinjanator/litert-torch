@@ -607,13 +607,16 @@ class LiteRTLMConvCacheLayer(
     if seq_len > 1:
       if valid_mask is not None:
         l_state = self.conv_kernel_size
-        num_real = valid_mask.to(torch.int32).sum(dtype=torch.int32)
-        start = num_real
-        idx = (
-            torch.arange(l_state, device=conv_states.device, dtype=torch.int32)
-            + start
-        )
-        next_state = padded_input[:, :, idx]
+        total_len = l_state + seq_len
+        num_real = valid_mask.to(padded_input.dtype).sum()
+        row_idx = torch.arange(
+            total_len, device=padded_input.device, dtype=padded_input.dtype
+        ).unsqueeze(1)
+        col_target = num_real + torch.arange(
+            l_state, device=padded_input.device, dtype=padded_input.dtype
+        ).unsqueeze(0)
+        selector = (row_idx == col_target).to(padded_input.dtype)
+        next_state = padded_input @ selector
       else:
         next_state = padded_input[:, :, -self.conv_kernel_size:]
     else:

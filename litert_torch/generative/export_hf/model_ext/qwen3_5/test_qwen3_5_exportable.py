@@ -12,17 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for Qwen 3.5 LiteRT exportable modules (prefill, decode, and split cache)."""
+import importlib.metadata
+
+orig_version = importlib.metadata.version
+
+
+def patched_version(distribution_name: str) -> str:
+  if distribution_name == "torchao":
+    return "0.4.0"
+  return orig_version(distribution_name)
+
+
+importlib.metadata.version = patched_version
 
 from absl.testing import absltest
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3_5Config, Qwen3_5TextConfig
-from transformers import DynamicCache
-
 from litert_torch.generative.export_hf.core import cache as cache_lib
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core.split_cache import cache as split_cache_lib
 from litert_torch.generative.export_hf.model_ext.qwen3_5 import exportable_module as qwen3_5_exportable
+from litert_torch.generative.export_hf.model_ext.qwen3_5 import modeling_qwen3_5_static
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3_5Config, Qwen3_5TextConfig
+from transformers import DynamicCache
 
 
 class Qwen35ExportableTest(absltest.TestCase):
@@ -56,6 +67,24 @@ class Qwen35ExportableTest(absltest.TestCase):
     )
     cls.hf_model = AutoModelForCausalLM.from_config(cls.config)
     cls.hf_model.eval()
+
+  def test_mrope_numerical_equivalence(self):
+    hf_rope = self.hf_model.model.rotary_emb
+    static_rope = modeling_qwen3_5_static.Qwen3_5StaticRotaryEmbedding(
+        config=self.config
+    )
+
+    x = torch.randn(1, 128, self.config.hidden_size)
+    position_ids = torch.arange(128).unsqueeze(0)
+
+    # 1. Hugging Face implementation
+    cos_hf, sin_hf = hf_rope(x, position_ids)
+
+    # 2. Qwen3_5StaticRotaryEmbedding implementation
+    cos_static, sin_static = static_rope(x, position_ids)
+
+    torch.testing.assert_close(cos_static, cos_hf)
+    torch.testing.assert_close(sin_static, sin_hf)
 
   def test_a_prefill_and_decode_exportable_equivalence(self):
     export_config = exportable_module_config.ExportableModuleConfig(
@@ -204,6 +233,5 @@ class Qwen35ExportableTest(absltest.TestCase):
         torch.equal(export_generated[:, : hf_generated.shape[1]], hf_generated)
     )
 
-
 if __name__ == "__main__":
-    absltest.main()
+  absltest.main()

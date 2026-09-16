@@ -206,12 +206,16 @@ def gated_delta_net(
   conv_out = F.silu(conv_out[:, :, -seq_len:]).transpose(1, 2)
 
   if seq_len > 1 and valid_mask is not None and valid_mask.numel() > 0:
-    num_real = valid_mask[0].to(torch.int32).sum(dtype=torch.int32)
-    idx = (
-        torch.arange(state_len, device=full_qkv.device, dtype=torch.int64)
-        + num_real
-    )
-    new_conv_state = full_qkv[:, :, idx]
+    num_real = valid_mask[0].to(full_qkv.dtype).sum()
+    total_len = state_len + seq_len
+    row_idx = torch.arange(
+        total_len, device=full_qkv.device, dtype=full_qkv.dtype
+    ).unsqueeze(1)
+    col_target = num_real + torch.arange(
+        state_len, device=full_qkv.device, dtype=full_qkv.dtype
+    ).unsqueeze(0)
+    selector = (row_idx == col_target).to(full_qkv.dtype)
+    new_conv_state = full_qkv @ selector
   else:
     new_conv_state = full_qkv[:, :, -state_len:]
 
@@ -223,7 +227,9 @@ def gated_delta_net(
   value = value.reshape(batch_size, seq_len, -1, head_v_dim)
 
   beta = b.sigmoid()
-  g = -a_log.to(torch.float32).exp() * F.softplus(a.to(torch.float32) + dt_bias)
+  act_dtype = torch.float32 if use_fp32 else b.dtype
+  a_val = (a.to(act_dtype) + dt_bias.to(act_dtype)).clamp(max=50.0)
+  g = -a_log.to(act_dtype).exp() * torch.log1p(torch.exp(a_val))
 
   if num_v_heads // num_k_heads > 1:
     query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)

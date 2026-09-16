@@ -303,7 +303,7 @@ class Qwen3_5StaticGatedDeltaNet(nn.Module):
           if valid_mask is not None
           else torch.ones(
               (batch_size, seq_len),
-              dtype=torch.int32,
+              dtype=hidden_states.dtype,
               device=hidden_states.device,
           )
       )
@@ -375,9 +375,9 @@ class Qwen3_5StaticGatedDeltaNet(nn.Module):
     value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
     beta = b.sigmoid()
-    g = -self.A_log.to(torch.float32).exp() * F.softplus(
-        a.to(torch.float32) + self.dt_bias
-    )
+    act_dtype = torch.float32 if self.use_fp32 else hidden_states.dtype
+    a_val = (a.to(act_dtype) + self.dt_bias.to(act_dtype)).clamp(max=50.0)
+    g = -self.A_log.to(act_dtype).exp() * torch.log1p(torch.exp(a_val))
     if self.num_v_heads // self.num_k_heads > 1:
       query = query.repeat_interleave(
           self.num_v_heads // self.num_k_heads, dim=2
@@ -638,6 +638,65 @@ class Qwen3_5StaticDecoderLayer(nn.Module):
     return hidden_states
 
 
+class Qwen3_5StaticRotaryEmbedding(nn.Module):
+  """Optimized Rotary Embedding for Qwen3.5 text-only models.
+
+  Eliminates dynamic slice assignments, broadcast, and padding ops from 3D
+  MRoPE,
+  lowering cleanly to GPU as a standard 1D RoPE outer product.
+  """
+
+  def __init__(self, config: Any, device: Optional[torch.device] = None):
+    super().__init__()
+    config = _unwrap_config(config)
+    self.config = config
+    if getattr(config, "model_type", None) == "qwen3_5_vision":
+      raise ValueError(
+          "Qwen3_5StaticRotaryEmbedding is optimized for text-only models and"
+          " cannot be used with multimodal vision model type"
+          f" '{config.model_type}'."
+      )
+    rope_params = getattr(config, "rope_parameters", None) or {}
+    base = rope_params.get("rope_theta", 1000000.0)
+    partial_rotary_factor = rope_params.get("partial_rotary_factor", 1.0)
+    head_dim = getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
+    dim = int(head_dim * partial_rotary_factor)
+    self.attention_scaling = 1.0
+
+    inv_freq = 1.0 / (
+        base
+        ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+    )
+    self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+  def forward(
+      self, x: torch.Tensor, position_ids: torch.Tensor
+  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Check that position_ids corresponds to text-only 1D/2D positions
+    if position_ids.ndim == 3:
+      if position_ids.shape[0] > 1 and not torch.equal(
+          position_ids[0], position_ids[1]
+      ):
+        raise ValueError(
+            "Qwen3_5StaticRotaryEmbedding is for text-only models where "
+            "temporal, height, and width grid positions are identical. "
+            "Received distinct 3D multimodal position grids."
+        )
+      position_ids = position_ids[0]
+    elif position_ids.ndim == 1:
+      position_ids = position_ids.unsqueeze(0)
+
+    freqs = position_ids.float().unsqueeze(-1) * self.inv_freq.unsqueeze(
+        0
+    ).unsqueeze(0)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos() * self.attention_scaling
+    sin = emb.sin() * self.attention_scaling
+    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class Qwen3_5StaticModel(nn.Module):
 
   def __init__(self, config: Qwen3_5Config):
@@ -656,7 +715,7 @@ class Qwen3_5StaticModel(nn.Module):
     self.norm = Qwen3_5RMSNorm(
         config.hidden_size, eps=config.rms_norm_eps
     )
-    self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
+    self.rotary_emb = Qwen3_5StaticRotaryEmbedding(config=config)
 
   def forward(
       self,
