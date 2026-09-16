@@ -347,13 +347,19 @@ def scaled_dot_product_attention_transposed(
   b, n, seq_len, h = query.shape
   is_decode_composite = use_sdpa_composite and seq_len == 1
 
+  # Packing the `g` query heads of each KV group into the sequence dimension
+  # lets the decomposed BMM path avoid broadcasting the KV cache. The fused
+  # SDPA kernels index the sequence dimension as an absolute token position to
+  # build the causal mask, so the packing must be skipped whenever the
+  # composite is emitted; those kernels handle GQA via the head dimension
+  # instead.
   if isinstance(key, tuple) or (
       param_tensor is not None and enable_ring_buffer and is_sliding
   ):
     g = n // key_past.shape[1]
     num_query_groups = n // g
     query = query.reshape(1, b * num_query_groups, g * seq_len, h)
-  elif not is_decode_composite:
+  elif not use_sdpa_composite:
     g = n // key_past.shape[1]
     num_query_groups = n // g
     query = query.reshape(1, b * num_query_groups, g * seq_len, h)
@@ -441,7 +447,7 @@ def scaled_dot_product_attention_transposed(
 
   key_for_bmm = key_past
   value_for_bmm = value_past
-  if is_decode_composite and query.shape[1] != key_past.shape[1]:
+  if query.shape[1] != key_past.shape[1]:
     g_ratio = query.shape[1] // key_past.shape[1]
     key_for_bmm = key_past.repeat_interleave(g_ratio, dim=1)
     value_for_bmm = value_past.repeat_interleave(g_ratio, dim=1)
