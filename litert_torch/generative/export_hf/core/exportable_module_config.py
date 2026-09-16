@@ -159,10 +159,9 @@ class ExportableModuleConfig:
     if isinstance(self.cache_lengths, int):
       self.cache_lengths = [self.cache_lengths]
     elif isinstance(self.cache_lengths, str):
-      self.cache_lengths = [
-          int(x) for x in self.cache_lengths.split(",") if x
-      ]
-    elif not self.cache_lengths:
+      self.cache_lengths = [int(x) for x in self.cache_lengths.split(",") if x]
+
+    if not self.cache_lengths:
       self.cache_lengths = [self.cache_length]
 
     if self.enable_dynamic_shape and len(self.cache_lengths) > 1:

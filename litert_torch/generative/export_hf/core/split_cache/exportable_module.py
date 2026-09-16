@@ -123,16 +123,43 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
     model_config = self.model.model.config
     if hasattr(model_config, 'text_config'):
       model_config = model_config.text_config
-    embed_size_per_head = (
-        getattr(model_config, 'head_dim', None)
-        or model_config.hidden_size // model_config.num_attention_heads  # pyrefly: ignore[unsupported-operation]
-    )
-    if hasattr(model_config, 'global_head_dim'):
-      global_embed_size_per_head = (
-          model_config.global_head_dim or embed_size_per_head
+    if hasattr(model_config, 'allow_global_per_layer_attribute_access'):
+      setattr(model_config, 'allow_global_per_layer_attribute_access', True)
+
+    embed_size_per_head = getattr(model_config, 'head_dim', None)
+    if (
+        embed_size_per_head is None
+        and hasattr(model_config, 'hidden_size')
+        and hasattr(model_config, 'num_attention_heads')
+    ):
+      embed_size_per_head = (
+          model_config.hidden_size // model_config.num_attention_heads  # pyrefly: ignore[unsupported-operation]
       )
-    else:
-      global_embed_size_per_head = embed_size_per_head
+
+    global_head_dim = getattr(model_config, 'global_head_dim', None)
+    if global_head_dim is None:
+      layer_types = getattr(model_config, 'layer_types', None)
+      per_layer_config = getattr(model_config, 'per_layer_config', None)
+      if layer_types is not None and per_layer_config is not None:
+        for idx, layer_type in enumerate(layer_types):
+          if layer_type == 'full_attention':
+            layer_cfg = None
+            if isinstance(per_layer_config, dict):
+              layer_cfg = per_layer_config.get(idx) or per_layer_config.get(
+                  str(idx)
+              )
+            elif idx < len(per_layer_config):
+              layer_cfg = per_layer_config[idx]
+
+            if layer_cfg is not None:
+              if isinstance(layer_cfg, dict):
+                global_head_dim = layer_cfg.get('head_dim')
+              else:
+                global_head_dim = getattr(layer_cfg, 'head_dim', None)
+              if global_head_dim is not None:
+                break
+
+    global_embed_size_per_head = global_head_dim or embed_size_per_head
 
     sample_inputs = {
         'embeddings': torch.ones(  # pyrefly: ignore[no-matching-overload]
@@ -152,10 +179,10 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
     }
     if utils.has_local_rope(self.model):
       pos_emb.update({
-          'local_cos': torch.ones(
+          'local_cos': torch.ones(  # pyrefly: ignore[no-matching-overload]
               (1, input_length, 1, embed_size_per_head), dtype=torch.float32
           ),
-          'local_sin': torch.ones(
+          'local_sin': torch.ones(  # pyrefly: ignore[no-matching-overload]
               (1, input_length, 1, embed_size_per_head), dtype=torch.float32
           ),
       })
