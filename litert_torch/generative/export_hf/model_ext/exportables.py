@@ -78,6 +78,11 @@ def get_prefill_decode_exportables(
           qwen3_5_exportable.LiteRTSplitCacheExportableModuleForQwen3_5Prefill,
           qwen3_5_exportable.LiteRTSplitCacheExportableModuleForQwen3_5Generate,
       )
+    elif export_config.externalize_embedder:
+      return (
+          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5PrefillExternalEmbedder,
+          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5GenerateExternalEmbedder,
+      )
     else:
       return (
           qwen3_5_exportable.LiteRTExportableModuleForQwen3_5Prefill,

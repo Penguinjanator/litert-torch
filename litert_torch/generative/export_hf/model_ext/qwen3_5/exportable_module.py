@@ -16,15 +16,15 @@
 """Qwen 3.5 exportable modules for LiteRT-LM using Full Model Reauthoring."""
 
 from typing import Any, Dict, Optional
-import torch
-import torch.nn as nn
-from transformers.modeling_outputs import CausalLMOutputWithPast
-
-from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core import attention as _
+from litert_torch.generative.export_hf.core import exportable_module
+from litert_torch.generative.export_hf.core.external_emb import exportable_module as external_emb_module
 from litert_torch.generative.export_hf.core.split_cache import attention as _
 from litert_torch.generative.export_hf.core.split_cache import exportable_module as split_cache_module
 from litert_torch.generative.export_hf.model_ext.qwen3_5.modeling_qwen3_5_static import Qwen3_5StaticForCausalLM
+import torch
+import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 def create_qwen3_5_attention_mask(
@@ -138,42 +138,74 @@ class Qwen3_5StaticModelHFWrapper(nn.Module):
     if attention_mask is not None:
       merged_kwargs["attention_mask"] = attention_mask
 
-    logits, past_key_values = self.static_model(
-        tokens,
-        positions,
-        past_key_values=past_key_values,
-        valid_mask=valid_mask,
-        **merged_kwargs,
-    )
+    if inputs_embeds is not None:
+      logits, past_key_values = self.static_model(
+          None,
+          positions,
+          past_key_values=past_key_values,
+          valid_mask=valid_mask,
+          inputs_embeds=inputs_embeds,
+          **merged_kwargs,
+      )
+    else:
+      logits, past_key_values = self.static_model(
+          tokens,
+          positions,
+          past_key_values=past_key_values,
+          valid_mask=valid_mask,
+          **merged_kwargs,
+      )
     return CausalLMOutputWithPast(
         logits=logits, past_key_values=past_key_values
     )
 
 
 class Qwen3_5ExportableMixin:
-    """Mixin that wraps the source HF model with Qwen3_5StaticModelHFWrapper and sets up the attention implementation."""
-    model: Any
+  """Mixin that wraps the source HF model with Qwen3_5StaticModelHFWrapper and sets up the attention implementation."""
+  model: Any
 
-    def __init__(self, model: torch.nn.Module, export_config: Any, source_model_artifacts: Any = None):
-        if not isinstance(model, Qwen3_5StaticModelHFWrapper):
-            model = Qwen3_5StaticModelHFWrapper(model)
-        super().__init__(model, export_config, source_model_artifacts)  # pytype: disable=wrong-arg-count
-        if getattr(export_config, "split_cache", False) or getattr(export_config, "cache_implementation", None) == "SplitCache":
-            self.model.set_attn_implementation("lrt_split_cache_attention")
-        elif getattr(export_config, "cache_implementation", None) == "LiteRTLMCache":
-            self.model.set_attn_implementation("lrt_transposed_attention")
+  def __init__(
+      self,
+      model: torch.nn.Module,
+      export_config: Any,
+      source_model_artifacts: Any = None,
+  ):
+    if not isinstance(model, Qwen3_5StaticModelHFWrapper):
+      model = Qwen3_5StaticModelHFWrapper(model)
+    super().__init__(model, export_config, source_model_artifacts)  # pytype: disable=wrong-arg-count
+    if (
+        getattr(export_config, "split_cache", False)
+        or getattr(export_config, "cache_implementation", None) == "SplitCache"
+    ):
+      self.model.set_attn_implementation("lrt_split_cache_attention")
+    elif (
+        getattr(export_config, "cache_implementation", None) == "LiteRTLMCache"
+    ):
+      self.model.set_attn_implementation("lrt_transposed_attention")
 
-    def _update_sample_masks(self, sample_dict: Dict[str, Any]) -> Dict[str, Any]:
-        for sample_list in sample_dict.values():
-            for sample in sample_list:
-                if "mask" in sample and "input_pos" in sample:
-                    seq_len = sample["tokens"].shape[1]
-                    cache_len = sample["mask"].shape[-1]
-                    mask_dtype = sample["mask"].dtype if hasattr(sample["mask"], "dtype") else torch.float32
-                    sample["mask"] = create_qwen3_5_attention_mask(
-                        seq_len, cache_len, sample["input_pos"], mask_dtype, sample["tokens"].device
-                    )
-        return sample_dict
+  def _update_sample_masks(self, sample_dict: Dict[str, Any]) -> Dict[str, Any]:
+    for sample_list in sample_dict.values():
+      for sample in sample_list:
+        if "mask" in sample and "input_pos" in sample:
+          if "tokens" in sample:
+            seq_len = sample["tokens"].shape[1]
+            device = sample["tokens"].device
+          elif "embeddings" in sample:
+            seq_len = sample["embeddings"].shape[1]
+            device = sample["embeddings"].device
+          else:
+            seq_len = sample["input_pos"].shape[0]
+            device = sample["input_pos"].device
+          cache_len = sample["mask"].shape[-1]
+          mask_dtype = (
+              sample["mask"].dtype
+              if hasattr(sample["mask"], "dtype")
+              else torch.float32
+          )
+          sample["mask"] = create_qwen3_5_attention_mask(
+              seq_len, cache_len, sample["input_pos"], mask_dtype, device
+          )
+    return sample_dict
 
 
 class LiteRTExportableModuleForQwen3_5Prefill(Qwen3_5ExportableMixin, exportable_module.LiteRTExportableModuleForDecoderOnlyLMPrefill):
@@ -182,8 +214,39 @@ class LiteRTExportableModuleForQwen3_5Prefill(Qwen3_5ExportableMixin, exportable
 
 
 class LiteRTExportableModuleForQwen3_5Generate(Qwen3_5ExportableMixin, exportable_module.LiteRTExportableModuleForDecoderOnlyLMGenerate):
-    def get_sample_inputs(self, model_config: Any, **kwargs: Any) -> Dict[str, Any]:
-        return self._update_sample_masks(super().get_sample_inputs(model_config, **kwargs))
+
+  def get_sample_inputs(
+      self, model_config: Any, **kwargs: Any
+  ) -> Dict[str, Any]:
+    return self._update_sample_masks(
+        super().get_sample_inputs(model_config, **kwargs)
+    )
+
+
+class LiteRTExportableModuleForQwen3_5PrefillExternalEmbedder(
+    Qwen3_5ExportableMixin,
+    external_emb_module.LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder,
+):
+
+  def get_sample_inputs(
+      self, model_config: Any, **kwargs: Any
+  ) -> Dict[str, Any]:
+    return self._update_sample_masks(
+        super().get_sample_inputs(model_config, **kwargs)
+    )
+
+
+class LiteRTExportableModuleForQwen3_5GenerateExternalEmbedder(
+    Qwen3_5ExportableMixin,
+    external_emb_module.LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder,
+):
+
+  def get_sample_inputs(
+      self, model_config: Any, **kwargs: Any
+  ) -> Dict[str, Any]:
+    return self._update_sample_masks(
+        super().get_sample_inputs(model_config, **kwargs)
+    )
 
 
 class LiteRTSplitCacheExportableModuleForQwen3_5Prefill(Qwen3_5ExportableMixin, split_cache_module.LiteRTSplitCacheExportableModuleForDecoderOnlyLMPrefill):

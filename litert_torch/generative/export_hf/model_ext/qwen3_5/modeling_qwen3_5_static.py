@@ -713,18 +713,22 @@ class Qwen3_5StaticModel(nn.Module):
 
   def forward(
       self,
-      input_ids: torch.Tensor,
-      positions: torch.Tensor,
+      input_ids: Optional[torch.Tensor] = None,
+      positions: Optional[torch.Tensor] = None,
       past_key_values: Optional[Any] = None,
       valid_mask: Optional[torch.Tensor] = None,
+      inputs_embeds: Optional[torch.Tensor] = None,
       **kwargs,
   ) -> Tuple[torch.Tensor, Optional[Any]]:
-    hidden_states = self.embed_tokens(input_ids)
-    if positions.ndim == 1:
+    if inputs_embeds is not None:
+      hidden_states = inputs_embeds
+    else:
+      hidden_states = self.embed_tokens(input_ids)
+    if positions is not None and positions.ndim == 1:
       pos_for_rope = positions.view(1, 1, -1).expand(
           3, hidden_states.shape[0], -1
       )
-    elif positions.ndim == 2:
+    elif positions is not None and positions.ndim == 2:
       pos_for_rope = positions.unsqueeze(0).expand(3, -1, -1)
     else:
       pos_for_rope = positions
@@ -784,14 +788,20 @@ class Qwen3_5StaticForCausalLM(nn.Module):
 
   def forward(
       self,
-      input_ids: torch.Tensor,
-      positions: torch.Tensor,
+      input_ids: Optional[torch.Tensor] = None,
+      positions: Optional[torch.Tensor] = None,
       past_key_values: Optional[Any] = None,
       valid_mask: Optional[torch.Tensor] = None,
+      inputs_embeds: Optional[torch.Tensor] = None,
       **kwargs,
   ) -> Tuple[torch.Tensor, Optional[Any]]:
     hidden_states, past_key_values = self.model(
-        input_ids, positions, past_key_values=past_key_values, valid_mask=valid_mask, **kwargs
+        input_ids,
+        positions,
+        past_key_values=past_key_values,
+        valid_mask=valid_mask,
+        inputs_embeds=inputs_embeds,
+        **kwargs,
     )
     logits = self.lm_head(hidden_states)
     return logits, past_key_values
