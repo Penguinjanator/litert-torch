@@ -54,6 +54,12 @@ bazel run \
 *   `--single_token_embedder`: Use single token embedder during export (default:
     False).
 *   `--split_cache`: Split KV cache during export (default: False).
+*   `--sliding_window_ring_buffer_size`: Size of the sliding window ring buffer
+    (default: None).
+*   `--apply_gpu_composites`: Apply GPU composites during export (default:
+    False).
+*   `--use_bool_mask`: Use boolean mask during export (default: False).
+*   `--use_sdpa_composite`: Use SDPA composite during export (default: False).
 *   `--backend`: Hardware backend to use for LiteRT LM (cpu | npu, default:
     cpu).
 

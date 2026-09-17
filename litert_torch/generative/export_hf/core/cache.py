@@ -127,6 +127,8 @@ def _update_kv_impl(
           cache_len=cache_size,
           head_size=head_size,
           is_ring_buffer=False,
+          k_ts_idx=k_ts_idx,
+          v_ts_idx=v_ts_idx,
       )
       return k, v
 
@@ -142,76 +144,8 @@ def _update_kv_impl(
   return k, v
 
 
-def int32_one_hot(
-    indices: torch.Tensor, num_classes: int, dtype: torch.dtype
-) -> torch.Tensor:
-  """A LiteRT-friendly one-hot encoder that stays entirely in int32."""
-  # Create an int32 array of class indices [0, 1, 2, ... num_classes-1]
-  classes = torch.arange(num_classes, dtype=torch.int32, device=indices.device)
-
-  # Broadcast an equality check, then cast the boolean mask to int32
-  # e.g., Shape (N,) -> (N, 1) == (num_classes,) -> Shape (N, num_classes)
-  return (indices.unsqueeze(-1) == classes).to(dtype)
-
-
-def update_kv_cache_with_sliding(
-    cache: torch.Tensor,
-    update: torch.Tensor,
-    positions: torch.Tensor,
-    valid_mask: torch.Tensor,
-    ts_idx: int = 2,
-) -> torch.Tensor:
-  """Updates the ring buffer KV cache.
-
-  Args:
-      cache: [B, H, S, D] (if ts_idx=2) or [B, H, D, S] (if ts_idx=3)
-      update: [B, H, T, D] (if ts_idx=2) or [B, H, D, T] (if ts_idx=3)
-      positions: [T] - Global token positions
-      valid_mask: [T] - 1 for valid tokens, 0 for padding
-      ts_idx: 2 or 3, indicating the time sequence dimension
-
-  Returns:
-      Updated cache tensor.
-  """
-  S = cache.size(ts_idx)  # pylint: disable=invalid-name
-  T = positions.size(0)  # pylint: disable=invalid-name
-
-  # 1. Calculate modulo indices
-  indices = positions % S  # [T]
-
-  # 2. One-Hot routing matrix: [T, S]
-  one_hot = int32_one_hot(indices, num_classes=S, dtype=cache.dtype)
-
-  # 3. Apply the valid_mask (Zero out padding rows)
-  valid_mask_float = valid_mask.to(cache.dtype).unsqueeze(1)  # [T, 1]
-  one_hot = one_hot * valid_mask_float  # [T, S]
-
-  # 4. Project and Route based on the sequence dimension
-  if ts_idx == 2:
-    # cache: [B, H, S, D] | update: [B, H, T, D]
-    # Matmul: [1, 1, S, T] @ [B, H, T, D] -> [B, H, S, D]
-    routing_matrix = one_hot.transpose(0, 1).view(1, 1, S, T)
-    update_expanded = torch.matmul(routing_matrix, update)
-
-    # Blend mask broadcasts across the D dimension
-    update_mask = (one_hot.sum(dim=0) > 0).view(1, 1, S, 1)
-
-  elif ts_idx == 3:
-    # cache: [B, H, D, S] | update: [B, H, D, T]
-    # Matmul: [B, H, D, T] @ [1, 1, T, S] -> [B, H, D, S]
-    routing_matrix = one_hot.view(1, 1, T, S)
-    update_expanded = torch.matmul(update, routing_matrix)
-
-    # Blend mask broadcasts across the D dimension
-    update_mask = (one_hot.sum(dim=0) > 0).view(1, 1, 1, S)
-
-  else:
-    raise ValueError("ts_idx must be 2 or 3")
-
-  # 5. BLEND: Combine projected updates with the old cache
-  updated_cache = torch.where(update_mask, update_expanded, cache)
-
-  return updated_cache
+int32_one_hot = gpu_cache_update.int32_one_hot
+update_kv_cache_with_sliding = gpu_cache_update.update_kv_cache_with_sliding
 
 
 def _update_kv_sliding_impl(
@@ -223,7 +157,7 @@ def _update_kv_sliding_impl(
     valid_mask: jt.Bool[torch.Tensor, "T"],
     k_ts_idx: int,
     v_ts_idx: int,
-    **kwargs,
+    **unused_kwargs,
 ):
   """Updates the cache buffer using tfl.dynamic_update_slice."""
   new_k = update_kv_cache_with_sliding(

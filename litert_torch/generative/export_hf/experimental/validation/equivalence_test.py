@@ -84,11 +84,15 @@ _SPLIT_CACHE = flags.DEFINE_bool(
     'Split KV cache during export.',
 )
 
-_BACKEND = flags.DEFINE_enum(
-    'backend',
-    'cpu',
-    ['cpu', 'npu'],
-    'Hardware backend to use for LiteRT LM.',
+_BACKEND = (
+    flags.FLAGS['backend']
+    if 'backend' in flags.FLAGS
+    else flags.DEFINE_enum(
+        'backend',
+        'cpu',
+        ['cpu', 'npu'],
+        'Hardware backend to use for LiteRT LM.',
+    )
 )
 
 _LITERT_LM_MODEL_PATH = flags.DEFINE_string(
@@ -109,6 +113,30 @@ _SLIDING_WINDOW_RING_BUFFER_SIZE = flags.DEFINE_integer(
     'sliding_window_ring_buffer_size',
     None,
     'Size of the sliding window ring buffer.',
+)
+
+_APPLY_GPU_COMPOSITES = flags.DEFINE_bool(
+    'apply_gpu_composites',
+    False,
+    'Apply GPU composites during export.',
+)
+
+_USE_BOOL_MASK = flags.DEFINE_bool(
+    'use_bool_mask',
+    False,
+    'Use boolean mask during export.',
+)
+
+_USE_SDPA_COMPOSITE = flags.DEFINE_bool(
+    'use_sdpa_composite',
+    False,
+    'Use SDPA composite during export.',
+)
+
+_ENABLE_THINKING = flags.DEFINE_bool(
+    'enable_thinking',
+    False,
+    'Whether thinking is enabled in LiteRT LM.',
 )
 
 
@@ -167,9 +195,10 @@ def run_litert_lm(
     prompts: list[str],
     max_new_tokens: int,
     max_num_tokens: int,
-    backend_str: str = 'cpu',
+    backend_str: str | None = 'cpu',
 ) -> list[str]:
   print('Running litert_lm...')
+  backend_str = backend_str or 'cpu'
   if backend_str == 'npu':
     backend = litert_lm.Backend.NPU(litert_dispatch_lib_dir='')  # pyrefly: ignore[missing-attribute]
   else:
@@ -186,7 +215,10 @@ def run_litert_lm(
 
   responses = []
   with engine.create_conversation(
-      sampler_config=sampler_config
+      sampler_config=sampler_config,
+      thinking_config=litert_lm.ThinkingConfig(
+          enable_thinking=_ENABLE_THINKING.value
+      ),
   ) as conversation:
     for prompt in prompts:
       response = conversation.send_message(
@@ -236,6 +268,9 @@ def main(argv):
           single_token_embedder=_SINGLE_TOKEN_EMBEDDER.value,
           split_cache=_SPLIT_CACHE.value,
           sliding_window_ring_buffer_size=_SLIDING_WINDOW_RING_BUFFER_SIZE.value,
+          apply_gpu_composites=_APPLY_GPU_COMPOSITES.value,
+          use_bool_mask=_USE_BOOL_MASK.value,
+          use_sdpa_composite=_USE_SDPA_COMPOSITE.value,
       )
 
       exported_model_path = os.path.join(export_dir, 'model.litertlm')
@@ -282,6 +317,7 @@ def main(argv):
       print('\nSUCCESS: All turns are equivalent!')
     else:
       print('\nFAILURE: Some turns differ!')
+      raise RuntimeError('LiteRT LM and Transformers outputs differ.')
 
   finally:
     if not _WORK_DIR.value:

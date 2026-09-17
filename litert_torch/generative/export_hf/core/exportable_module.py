@@ -15,13 +15,14 @@
 """Exportable modules."""
 
 import abc
+
+from litert_torch.generative.export_hf.core import attention as _
 from litert_torch.generative.export_hf.core import cache as cache_lib
 from litert_torch.generative.export_hf.core import cache_base as kv_cache_lib
-from litert_torch.generative.export_hf.core import attention as _
-from litert_torch.generative.export_hf.core.split_cache import attention as _
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import utils
 from litert_torch.generative.export_hf.core.sliding_window import attention_mask as sliding_window_attention_mask
+from litert_torch.generative.export_hf.core.split_cache import attention as _
 import torch
 
 ExportableModuleConfig = exportable_module_config.ExportableModuleConfig
@@ -128,9 +129,13 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
                 "Sliding window ring buffer size must be greater than or equal"
                 " to the sliding window size."
             )
-            # GPU local attention decode does single bmm as before
             is_decode = input_pos.shape[0] == 1
-            if kwargs.get("apply_gpu_composites", False) and is_decode:
+            use_sdpa_composite = kwargs.get("use_sdpa_composite", False)
+            if (
+                kwargs.get("apply_gpu_composites", False)
+                and is_decode
+                and not use_sdpa_composite
+            ):
               masks["sliding_attention"] = (
                   sliding_window_attention_mask.build_sliding_window_decode_mask(
                       sliding_window,
@@ -167,7 +172,12 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
                 " to the sliding window size."
             )
             is_decode = input_pos.shape[0] == 1
-            if kwargs.get("apply_gpu_composites", False) and is_decode:
+            use_sdpa_composite = kwargs.get("use_sdpa_composite", False)
+            if (
+                kwargs.get("apply_gpu_composites", False)
+                and is_decode
+                and not use_sdpa_composite
+            ):
               masks["sliding_attention"] = (
                   sliding_window_attention_mask.build_sliding_window_decode_mask(
                       sliding_window,
@@ -282,7 +292,6 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
   def get_sample_kv_cache(self, model_config):
     """Returns the input sample KV cache for the model."""
     export_config = self.export_config
-    num_layers = model_config.num_hidden_layers
     kv_cache = kv_cache_lib.CACHE_REGISTRY[
         export_config.cache_implementation  # pyrefly: ignore[bad-index]
     ].create_from_config(
@@ -335,8 +344,12 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
         "apply_gpu_composites", False
     ) or getattr(self.export_config, "apply_gpu_composites", False):
       kwargs["apply_gpu_composites"] = True
-    if self.export_config.extra_kwargs.get(
-        "use_sdpa_composite_for_prefill", False
+    if (
+        self.export_config.extra_kwargs.get("use_sdpa_composite", False)
+        or getattr(self.export_config, "use_sdpa_composite", False)
+        or self.export_config.extra_kwargs.get(
+            "use_sdpa_composite_for_prefill", False
+        )
     ):
       kwargs["use_sdpa_composite"] = True
       kwargs["apply_gpu_composites"] = True
@@ -383,12 +396,12 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
     text_cfg = getattr(model_config, "text_config", model_config)
     sliding_window = getattr(text_cfg, "sliding_window", None)
     layer_types = getattr(text_cfg, "layer_types", None)
-    has_sliding = (
-        sliding_window is not None
-        and (
-            (layer_types is not None and "sliding_attention" in layer_types)
-            or getattr(text_cfg, "model_type", getattr(model_config, "model_type", "")) == "mistral"
-        )
+    model_type = getattr(
+        text_cfg, "model_type", getattr(model_config, "model_type", "")
+    )
+    has_sliding = sliding_window is not None and (
+        (layer_types is not None and "sliding_attention" in layer_types)
+        or model_type == "mistral"
     )
     ring_buffer_size = export_config.sliding_window_ring_buffer_size
     sample_inputs = {}
@@ -525,17 +538,23 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
     text_cfg = getattr(model_config, "text_config", model_config)
     sliding_window = getattr(text_cfg, "sliding_window", None)
     layer_types = getattr(text_cfg, "layer_types", None)
-    has_sliding = (
-        sliding_window is not None
-        and (
-            (layer_types is not None and "sliding_attention" in layer_types)
-            or getattr(text_cfg, "model_type", getattr(model_config, "model_type", "")) == "mistral"
-        )
+    model_type = getattr(
+        text_cfg, "model_type", getattr(model_config, "model_type", "")
+    )
+    has_sliding = sliding_window is not None and (
+        (layer_types is not None and "sliding_attention" in layer_types)
+        or model_type == "mistral"
     )
     ring_buffer_size = export_config.sliding_window_ring_buffer_size
     if ring_buffer_size is not None and has_sliding:
+      use_sdpa_composite = export_config.extra_kwargs.get(
+          "use_sdpa_composite", False
+      ) or getattr(export_config, "use_sdpa_composite", False)
+      decode_local_mask_len = (
+          ring_buffer_size + 1 if use_sdpa_composite else ring_buffer_size
+      )
       inputs["local_mask"] = torch.ones(
-          (1, 1, 1, ring_buffer_size),
+          (1, 1, 1, decode_local_mask_len),
           dtype=torch.bool if use_bool_mask else torch.float32,
       )
     if (
