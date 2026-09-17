@@ -75,16 +75,26 @@ class Qwen35ExportableTest(absltest.TestCase):
     )
 
     x = torch.randn(1, 128, self.config.hidden_size)
-    position_ids = torch.arange(128).unsqueeze(0)
+    position_ids_3d = torch.arange(128).view(1, 1, -1).expand(3, 1, -1)
 
-    # 1. Hugging Face implementation
-    cos_hf, sin_hf = hf_rope(x, position_ids)
+    # 1. Hugging Face implementation (expects 3D [3, batch_size, seq_len])
+    cos_hf, sin_hf = hf_rope(x, position_ids_3d)
 
     # 2. Qwen3_5StaticRotaryEmbedding implementation
-    cos_static, sin_static = static_rope(x, position_ids)
+    # Verify equivalence across 3D, 2D, and 1D position representations
+    cos_static_3d, sin_static_3d = static_rope(x, position_ids_3d)
+    torch.testing.assert_close(cos_static_3d, cos_hf)
+    torch.testing.assert_close(sin_static_3d, sin_hf)
 
-    torch.testing.assert_close(cos_static, cos_hf)
-    torch.testing.assert_close(sin_static, sin_hf)
+    position_ids_2d = torch.arange(128).unsqueeze(0)
+    cos_static_2d, sin_static_2d = static_rope(x, position_ids_2d)
+    torch.testing.assert_close(cos_static_2d, cos_hf)
+    torch.testing.assert_close(sin_static_2d, sin_hf)
+
+    position_ids_1d = torch.arange(128)
+    cos_static_1d, sin_static_1d = static_rope(x, position_ids_1d)
+    torch.testing.assert_close(cos_static_1d, cos_hf)
+    torch.testing.assert_close(sin_static_1d, sin_hf)
 
   def test_a_prefill_and_decode_exportable_equivalence(self):
     export_config = exportable_module_config.ExportableModuleConfig(
@@ -155,7 +165,7 @@ class Qwen35ExportableTest(absltest.TestCase):
     with torch.no_grad():
       hf_decode_out = self.hf_model(
           input_ids=next_token,
-          position_ids=next_pos.unsqueeze(0),
+          position_ids=next_pos.view(1, 1, -1).expand(3, 1, -1),
           past_key_values=hf_cache,
           use_cache=True,
       )

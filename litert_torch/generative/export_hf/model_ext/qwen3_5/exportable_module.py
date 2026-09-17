@@ -122,6 +122,8 @@ class Qwen3_5StaticModelHFWrapper(nn.Module):
           tokens.shape[1], device=tokens.device, dtype=torch.int32
       )
     positions = positions.to(torch.int32)
+    if positions.ndim == 3:
+      positions = positions[0]
     if positions.ndim == 2 and positions.shape[0] == 1:
       positions = positions.squeeze(0)
 

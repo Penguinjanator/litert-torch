@@ -674,16 +674,10 @@ class Qwen3_5StaticRotaryEmbedding(nn.Module):
   def forward(
       self, x: torch.Tensor, position_ids: torch.Tensor
   ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Check that position_ids corresponds to text-only 1D/2D positions
-    if position_ids.ndim == 3:
-      if position_ids.shape[0] > 1 and not torch.equal(
-          position_ids[0], position_ids[1]
-      ):
-        raise ValueError(
-            "Qwen3_5StaticRotaryEmbedding is for text-only models where "
-            "temporal, height, and width grid positions are identical. "
-            "Received distinct 3D multimodal position grids."
-        )
+    # Extract 2D grid from 3D/4D multimodal position_ids if passed
+    if position_ids.ndim == 4:
+      position_ids = position_ids[0, 0]
+    elif position_ids.ndim == 3:
       position_ids = position_ids[0]
     elif position_ids.ndim == 1:
       position_ids = position_ids.unsqueeze(0)
