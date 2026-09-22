@@ -280,6 +280,38 @@ def ring_buffer_sdpa(
     return encoded
 
 
+def _broadcast_mask_to_packed_query(
+    mask: torch.Tensor,
+    g: int,
+    param_tensor: Optional[torch.Tensor],
+) -> torch.Tensor:
+  """Repeats the attention mask to match query heads packed into the seq dim.
+
+  The `g` query heads of a KV group are packed into the query-sequence
+  dimension group-major, so row `gi * T + ti` of the logits belongs to head
+  `gi` at token `ti` and needs row `ti` of the mask.
+
+  Args:
+    mask: Attention mask of shape [1, 1, T, S].
+    g: Number of query heads per KV group.
+    param_tensor: Runtime BMM parameter tensor, or None. When set the mask is
+      boolean and `torch.cat` is routed through float32, which is what the
+      export pipeline supports.
+
+  Returns:
+    A mask of shape [1, 1, g * T, S], or `mask` unchanged when `g == 1`.
+  """
+  if g == 1:
+    return mask
+  if param_tensor is not None:
+    gt = g * mask.shape[2]
+    float_mask = mask.to(torch.float32)
+    float_mask = torch.cat([float_mask] * g, dim=1)
+    bool_mask: torch.Tensor = float_mask != 0
+    return bool_mask.reshape(1, 1, gt, -1)
+  return torch.cat([mask] * g, dim=-2)
+
+
 def scaled_dot_product_attention_transposed(
     query: torch.Tensor,
     key: torch.Tensor | tuple[Any, ...],
@@ -346,23 +378,24 @@ def scaled_dot_product_attention_transposed(
 
   b, n, seq_len, h = query.shape
   is_decode_composite = use_sdpa_composite and seq_len == 1
+  is_ring_buffer_sdpa = isinstance(key, tuple) or (
+      param_tensor is not None and enable_ring_buffer and is_sliding
+  )
 
   # Packing the `g` query heads of each KV group into the sequence dimension
-  # lets the decomposed BMM path avoid broadcasting the KV cache. The fused
-  # SDPA kernels index the sequence dimension as an absolute token position to
-  # build the causal mask, so the packing must be skipped whenever the
-  # composite is emitted; those kernels handle GQA via the head dimension
-  # instead.
-  if isinstance(key, tuple) or (
-      param_tensor is not None and enable_ring_buffer and is_sliding
-  ):
-    g = n // key_past.shape[1]
-    num_query_groups = n // g
-    query = query.reshape(1, b * num_query_groups, g * seq_len, h)
-  elif not use_sdpa_composite:
-    g = n // key_past.shape[1]
-    num_query_groups = n // g
-    query = query.reshape(1, b * num_query_groups, g * seq_len, h)
+  # lets the decomposed BMM read the KV cache as-is instead of tiling it `g`
+  # times. The fused SDPA kernels index the sequence dimension as an absolute
+  # token position to build the causal mask, so they need GQA in the head
+  # dimension instead. Rather than dropping the packing when the composite is
+  # emitted, it is applied *inside* the composite region further down: the
+  # region boundary keeps the [B, N, T, H] layout the kernel matches on, while
+  # the decomposition it stands in for -- which is what CPU backends actually
+  # execute -- never materializes a broadcast copy of the KV cache.
+  g_query_per_kv = n // key_past.shape[1]
+  num_query_groups = n // g_query_per_kv
+  pack_outside_composite = is_ring_buffer_sdpa or not use_sdpa_composite
+  if pack_outside_composite:
+    query = query.reshape(1, b * num_query_groups, g_query_per_kv * seq_len, h)
 
   if scale is None:
     scale = 1.0 / math.sqrt(head_size)
@@ -378,9 +411,7 @@ def scaled_dot_product_attention_transposed(
 
   assert mask is not None, "Mask should not be None!"
 
-  if isinstance(key, tuple) or (
-      param_tensor is not None and enable_ring_buffer and is_sliding
-  ):
+  if is_ring_buffer_sdpa:
     encoded = ring_buffer_sdpa(
         query=query,
         key_past=key_past,
@@ -412,21 +443,11 @@ def scaled_dot_product_attention_transposed(
   gt = query.shape[2]
   g = gt // t
 
-  # broadcasting mask
-  if param_tensor is not None:
-    if mask.dtype != torch.bool:
-      mask: torch.Tensor = mask == 0
-    if g != 1:
-      mask = mask.to(torch.float32)  # pyrefly: ignore[missing-attribute]
-      mask = torch.cat([mask] * g, dim=1)
-      mask: torch.Tensor = mask != 0
-      mask = mask.reshape(1, 1, gt, -1)  # pyrefly: ignore[missing-attribute]
-  else:
-    if g != 1:
-      mask_to_bc = []
-      for _ in range(g):
-        mask_to_bc.append(mask)
-      mask = torch.cat(mask_to_bc, dim=-2)  # 1, 1, gt, s
+  # The fused kernels take a boolean mask. Convert before the composite is
+  # opened so the region boundary dtype is unchanged.
+  if param_tensor is not None and mask.dtype != torch.bool:
+    mask: torch.Tensor = mask == 0
+  mask = _broadcast_mask_to_packed_query(mask, g, param_tensor)
 
   attrs = {}
   attrs.update({
@@ -444,6 +465,14 @@ def scaled_dot_product_attention_transposed(
     )
   else:
     sdpa_builder = None
+
+  # GQA inside the composite region: packing here is invisible to the fused
+  # kernel (the whole region is replaced) but removes the KV cache broadcast
+  # from the decomposition that CPU backends run.
+  pack_inside_composite = not pack_outside_composite and g_query_per_kv != 1
+  if pack_inside_composite:
+    query = query.reshape(1, b * num_query_groups, g_query_per_kv * seq_len, h)
+    mask = _broadcast_mask_to_packed_query(mask, g_query_per_kv, param_tensor)
 
   key_for_bmm = key_past
   value_for_bmm = value_past
@@ -502,13 +531,14 @@ def scaled_dot_product_attention_transposed(
     assert v_ts_idx == 2, "v_ts_idx must be 2 or 3."
     bmm_fn = lambda x, y: torch.einsum("abts,absh->abth", x, y)
   encoded = bmm_fn(probs, value_for_bmm)
+  if pack_inside_composite:
+    # Undo the packing so the composite output keeps the [B, N, T, H] layout.
+    encoded = encoded.reshape(b, n, seq_len, h)
+  if sdpa_builder is not None:
+    encoded = sdpa_builder.mark_outputs(encoded)
   if is_decode_composite:
-    encoded = encoded.permute(0, 2, 1, 3).reshape(b, 1, -1)
-    if sdpa_builder is not None:
-      encoded = sdpa_builder.mark_outputs(encoded)
+    encoded = encoded.reshape(b, 1, n * h)
   else:
-    if sdpa_builder is not None:
-      encoded = sdpa_builder.mark_outputs(encoded)
-    encoded = encoded.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
+    encoded = encoded.reshape(b, n, seq_len, h).permute(0, 2, 1, 3)
 
   return encoded

@@ -366,12 +366,18 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
         **kwargs,
     )
     inputs |= self.attention_kwargs()
-    inputs["logits_to_keep"] = 1
+    # Prefill logits are not read by the runtime: sampling uses the decode
+    # signature. Emitting them costs a vocabulary-sized `lm_head` matmul on
+    # every prefill call, so it is off unless the GPU composite path needs a
+    # live consumer. `logits_to_keep=1` keeps it to the final position.
+    emit_logits = bool(self.export_config.prefill_logits)
+    if emit_logits:
+      inputs["logits_to_keep"] = 1
     output = self.model(**inputs)
-    return {
-        "kv_cache": output.past_key_values,
-        "logits": output.logits,
-    }
+    outputs = {"kv_cache": output.past_key_values}
+    if emit_logits:
+      outputs["logits"] = output.logits
+    return outputs
 
   def _get_input(
       self, batch_size, prefill_length, prefill_length_dim, model_config

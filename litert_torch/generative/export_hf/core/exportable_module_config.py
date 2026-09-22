@@ -74,6 +74,19 @@ class ExportableModuleConfig:
   use_qkv_norm_rope_composite: bool = False
   use_short_conv_composite: bool = False
   use_sdpa_composite: bool = False
+  # Whether the prefill signature returns logits for the final position.
+  # The LiteRT-LM runtime samples from the decode signature and never reads
+  # the prefill logits, so emitting them adds a vocabulary-sized `lm_head`
+  # matmul to every prefill call -- cheap on GPU, very visible on CPU/YNNPACK.
+  #
+  # Multi-output composites whose `pos=0` activation output is not part of
+  # `past_key_values` (`odml.qkv_norm_rope` and `odml.short_conv`) require a
+  # live consumer in the final layer so FX/MLIR DCE does not delete `pos=0`
+  # while keeping `pos>=1`, which crashes `BuildStableHLOCompositePass`.
+  # Note that `apply_gpu_composites` and `use_sdpa_composite` are also used by
+  # YNNPACK and only emit single-output or full-cache-output composites, so
+  # `prefill_logits` stays `False` for them by default.
+  prefill_logits: bool | None = None
   input_sec: float = 1.0
   # If >= 0, the model runs in stateful mode after this many tokens.
   stateful_after: int = -1
@@ -135,6 +148,10 @@ class ExportableModuleConfig:
 
   def __post_init__(self):
     """Refines configuration based on task-specific rules."""
+    if self.prefill_logits is None:
+      self.prefill_logits = bool(
+          self.use_qkv_norm_rope_composite or self.use_short_conv_composite
+      )
     if self.aot_backend:
       backend_clean = self.aot_backend.lower()
       if backend_clean in vendor_configs.VENDOR_CONFIGS:

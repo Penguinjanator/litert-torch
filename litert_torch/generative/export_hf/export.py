@@ -97,6 +97,7 @@ def export(
     use_qkv_norm_rope_composite: bool | None = None,
     use_short_conv_composite: bool | None = None,
     use_sdpa_composite: bool | None = None,
+    prefill_logits: bool | None = None,
     externalize_embedder: bool | None = None,
     single_token_embedder: bool | None = None,
     k_ts_idx: int | None = None,
@@ -169,6 +170,12 @@ def export(
     use_rope_composite: Whether to enable the RoPE composite.
     use_qkv_norm_rope_composite: Whether to enable the QKV norm rope composite.
     use_sdpa_composite: Whether to enable the fused transposed SDPA composite.
+    prefill_logits: Whether the prefill signature returns logits for the final
+      position. Defaults to on only when multi-output composites
+      (`use_qkv_norm_rope_composite` or `use_short_conv_composite`) are enabled,
+      which require a live consumer for output `pos=0` in the final layer.
+      Exports using `apply_gpu_composites` or `use_sdpa_composite` (including
+      YNNPACK/CPU exports) leave prefill logits off by default.
     externalize_embedder: Whether to externalize the embedder.
     single_token_embedder: Whether to use a single token embedder.
     k_ts_idx: The index of time step dimension in the key tensor.
