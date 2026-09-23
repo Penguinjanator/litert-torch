@@ -114,6 +114,7 @@ def convert_signatures(
     The converted `model.LiteRTModel` object.
   """
   _warn_training_modules(signatures)
+  fx_infra.silence_torch_logs()
 
   def export(**kwargs):
     nonlocal strict_export

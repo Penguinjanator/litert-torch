@@ -94,5 +94,14 @@ class _Config:
   def show_progress(self, value: bool):
     os.environ["LITERT_TORCH_SHOW_PROGRESS"] = "y" if value else "n"
 
+  @property
+  def silence_torch_logs(self) -> bool:
+    """True if internal PyTorch logging spam (like AOT graph dumps) should be silenced."""
+    return _get_bool_env_var("LITERT_TORCH_SILENCE_TORCH_LOGS", default=True)
+
+  @silence_torch_logs.setter
+  def silence_torch_logs(self, value: bool) -> None:
+    os.environ["LITERT_TORCH_SILENCE_TORCH_LOGS"] = "y" if value else "n"
+
 
 config = _Config()

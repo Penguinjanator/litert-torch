@@ -15,6 +15,7 @@
 
 from litert_torch.fx_infra import _canonicalize_pass
 from litert_torch.fx_infra import _safe_run_decompositions
+from litert_torch.fx_infra import _torch_logging
 from litert_torch.fx_infra import decomp
 from litert_torch.fx_infra import graph_utils
 from litert_torch.fx_infra import pass_base
@@ -31,3 +32,4 @@ run_passes = pass_base.run_passes
 CanonicalizePass = _canonicalize_pass.CanonicalizePass
 safe_run_decompositions = _safe_run_decompositions.safe_run_decompositions
 annotate_force_decomp = _safe_run_decompositions.annotate_force_decomp
+silence_torch_logs = _torch_logging.silence_torch_logs
