@@ -427,41 +427,6 @@ def _aten_max_pool3d_with_indices(
   return y, jnp.zeros_like(y, dtype=jnp.int64)
 
 
-@lower_by_jax(torch.ops.aten.pixel_shuffle)
-def _aten_pixel_shuffle(x, upscale_factor):
-  """PixelShuffle implementation in JAX lowering.
-
-  Args:
-    x: Input tensor. Typically a feature map.
-    upscale_factor: Integer by which to upscale the spatial dimensions.
-
-  Returns:
-    Tensor after PixelShuffle operation.
-  """
-
-  batch_size, channels, height, width = x.shape
-
-  if channels % (upscale_factor**2) != 0:
-    raise ValueError(
-        "Number of channels must be divisible by the square of the upscale"
-        " factor."
-    )
-
-  new_channels = channels // (upscale_factor**2)
-  new_height = height * upscale_factor
-  new_width = width * upscale_factor
-
-  x = x.reshape(
-      batch_size, new_channels, upscale_factor, upscale_factor, height, width
-  )
-  x = jnp.transpose(
-      x, (0, 1, 4, 2, 5, 3)
-  )  # Move channels to spatial dimensions
-  x = x.reshape(batch_size, new_channels, new_height, new_width)
-
-  return x
-
-
 @lower_by_jax(torch.ops.aten.unbind)
 def _aten_copy(self, *args, **kwargs):
   return torchax_ops.ALL_OPS[torch.ops.aten.unbind_copy](self, *args, **kwargs)

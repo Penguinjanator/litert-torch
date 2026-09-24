@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import re
 from unittest import mock
 
 import litert_torch
@@ -338,6 +339,23 @@ class TestCoreAtenOps(parameterized.TestCase):
       ("aten_permute_0", torch.ops.aten.permute, (rnd(torch.float32, (10, 10)), [0, 1],), dict()),
       ("aten_permute_copy_0", torch.ops.aten.permute_copy, (rnd(torch.float32, (2, 2, 2)), [1, 2, 0],), dict()),
       ("aten_pixel_shuffle_0", torch.ops.aten.pixel_shuffle, (rnd(torch.float32, (1, 3, 10, 10)), 1,), dict()),
+      ("aten_pixel_shuffle_1", torch.ops.aten.pixel_shuffle, (rnd(torch.float32, (1, 12, 10, 10)), 2,), dict()),
+      ("aten_pixel_shuffle_2", torch.ops.aten.pixel_shuffle, (rnd(torch.float32, (2, 18, 5, 7)), 3,), dict()),
+      ("aten_pixel_shuffle_3", torch.ops.aten.pixel_shuffle, (rnd(torch.float32, (12, 10, 10)), 2,), dict()),
+      ("aten_pixel_unshuffle_0", torch.ops.aten.pixel_unshuffle, (rnd(torch.float32, (1, 3, 10, 10)), 2,), dict()),
+      ("aten_pixel_unshuffle_1", torch.ops.aten.pixel_unshuffle, (rnd(torch.float32, (2, 2, 15, 21)), 3,), dict()),
+      ("aten_pixel_unshuffle_2", torch.ops.aten.pixel_unshuffle, (rnd(torch.float32, (3, 10, 10)), 2,), dict()),
+      ("aten_prelu_0", torch.ops.aten.prelu, (rnd(torch.float32, (1, 8, 5, 5), -1.0, 1.0), rnd(torch.float32, (8,)),), dict()),
+      ("aten_prelu_1", torch.ops.aten.prelu, (rnd(torch.float32, (10, 10), -1.0, 1.0), rnd(torch.float32, (1,)),), dict()),
+      # `rnd` never produces signed zeros, non-finite values, or a zero/negative
+      # weight, which is where the relu-based lowering registered in
+      # `_decomp_registry.py` could diverge from the reference
+      # `where(x > 0, x, w * x)` form. Cover them explicitly.
+      ("aten_prelu_signed_zero", torch.ops.aten.prelu, (torch.tensor([-0.0, 0.0, -1.0, 1.0]), torch.tensor([0.25]),), dict()),
+      ("aten_prelu_non_finite", torch.ops.aten.prelu, (torch.tensor([float("nan"), float("inf"), float("-inf"), -2.0, 2.0]), torch.tensor([0.25]),), dict()),
+      ("aten_prelu_zero_weight", torch.ops.aten.prelu, (torch.tensor([-1.0, -0.0, 0.0, 1.0]), torch.tensor([0.0]),), dict()),
+      ("aten_prelu_negative_weight", torch.ops.aten.prelu, (torch.tensor([-1.0, -0.0, 0.0, 1.0]), torch.tensor([-0.5]),), dict()),
+      ("aten_prelu_per_channel_edges", torch.ops.aten.prelu, (torch.tensor([[[[-0.0]], [[float("inf")]], [[float("-inf")]], [[float("nan")]]]]), torch.tensor([0.0, 0.25, -0.5, 1.0]),), dict()),
       ("aten_pow_Scalar_0", torch.ops.aten.pow.Scalar, (1.123, rnd(torch.float32, (10, 10)),), dict()),
       ("aten_pow_Tensor_Scalar_0", torch.ops.aten.pow.Tensor_Scalar, (rnd(torch.float32, (10, 10)), 1.2,), dict()),
       ("aten_pow_Scalar_1", torch.ops.aten.pow.Scalar, (10000, torch.randn(16 * 8),), dict()),
@@ -418,6 +436,72 @@ class TestCoreAtenOps(parameterized.TestCase):
   )
   def test_lowering_op(self, op, args, kwargs):
     self._run_export_and_compare(op, args, kwargs)
+
+  @parameterized.named_parameters(
+      # fmt: off
+      # pyformat: disable
+      ("prelu", torch.ops.aten.prelu, (rnd(torch.float32, (1, 8, 5, 5), -1.0, 1.0), rnd(torch.float32, (8,)),), dict()),
+      ("pixel_shuffle", torch.ops.aten.pixel_shuffle, (rnd(torch.float32, (1, 12, 10, 10)), 2,), dict()),
+      ("pixel_unshuffle", torch.ops.aten.pixel_unshuffle, (rnd(torch.float32, (1, 3, 10, 10)), 2,), dict()),
+      # fmt: on
+      # pyformat: enable
+  )
+  def test_gpu_clean_lowering(self, op, args, kwargs):
+    """Asserts these ops lower to forms the TFLite GPU delegate accepts.
+
+    The lowered module must contain no op that legalizes to TFLite GATHER_ND
+    (stablehlo.gather), GREATER (stablehlo.compare), or SELECT
+    (stablehlo.select), and no tensor of rank greater than 4.
+
+    This is a coarse proxy: it greps the StableHLO dump, which is an
+    intermediate rather than the flatbuffer the delegate consumes, against a
+    hand-maintained list of op names. It catches the regressions these
+    lowerings were written to prevent, but it cannot see delegate constraints
+    beyond that list. Treat a failure here as real and a pass as weak
+    evidence.
+    """
+    ep, args, kwargs = export_without_scalar_inputs(op, args, kwargs)
+    lowered = backend.export.exported_program_to_mlir(ep)
+    text = lowered.get_text()
+    for bad_op in ("stablehlo.gather", "stablehlo.compare", "stablehlo.select"):
+      self.assertNotIn(bad_op, text)
+    for shape_str in re.findall(r"tensor<([^>]*)>", text):
+      rank = len(re.findall(r"(?:\d+|\?)x", shape_str))
+      self.assertLessEqual(rank, 4, f"tensor<{shape_str}> exceeds rank 4")
+
+  def test_prelu_preserves_signed_zero(self):
+    """PReLU's relu-based lowering must agree with torch on the sign of zero.
+
+    `_run_export_and_compare` compares with `np.allclose`, which treats 0.0 and
+    -0.0 as equal, so the parameterized cases above cannot catch a sign flip.
+    `relu(x) - w * relu(-x)` and `where(x > 0, x, w * x)` are only bit-identical
+    at x = -0.0 because `relu` propagates the negative zero; assert that
+    directly rather than relying on the value comparison.
+    """
+    x = torch.tensor([-0.0, 0.0, -1.0, 1.0])
+    weight = torch.tensor([0.25])
+
+    expected = torch.ops.aten.prelu(x, weight)
+    ep, args, kwargs = export_without_scalar_inputs(
+        torch.ops.aten.prelu, (x, weight), dict()
+    )
+    lowered = backend.export.exported_program_to_mlir(ep)
+    np_args, np_kwargs = pytree.tree_map_only(
+        torch.is_tensor, lambda t: t.detach().numpy(), [args, kwargs]
+    )
+    actual = pytree.tree_flatten([lowered(*np_args, **np_kwargs)])[0][0]
+    actual = np.array(actual)
+    expected_np = expected.detach().numpy()
+
+    # Guard the fixture: without a negative zero in the reference output the
+    # signbit comparison below would pass vacuously.
+    self.assertTrue(np.signbit(expected_np[0]), "fixture lost its -0.0")
+
+    np.testing.assert_array_equal(
+        np.signbit(actual),
+        np.signbit(expected_np),
+        err_msg=f"sign of zero not preserved: got {actual!r}",
+    )
 
   @googletest.skip("wip jax lowering")
   def test_aten_native_batch_norm_legit(self):
