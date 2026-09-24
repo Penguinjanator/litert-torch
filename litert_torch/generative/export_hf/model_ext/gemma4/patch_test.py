@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for Gemma4 model export patches."""
 
+import copy
 import torch
 from transformers.models.gemma4 import modeling_gemma4
 from absl.testing import parameterized
@@ -248,6 +249,68 @@ class PatchTest(parameterized.TestCase):
         "Gemma4TextExperts vs litert_moe_experts_forward mismatch.\n"
         f"Max diff: {(expected_output - actual_output).abs().max().item()}\n"
         f"Expected: {expected_output}\nActual: {actual_output}",
+    )
+
+  def test_gemma4_audio_model_equivalence(self):
+    audio_config = modeling_gemma4.Gemma4AudioConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        output_proj_dims=96,
+        attention_chunk_size=12,
+        attention_context_left=13,
+        attention_context_right=0,
+        conv_kernel_size=5,
+        subsampling_conv_channels=[128, 8],
+        dtype="float32",
+    )
+    audio_config._attn_implementation = "sdpa"
+
+    torch.manual_seed(42)
+    ref_model = modeling_gemma4.Gemma4AudioModel(audio_config).eval()
+
+    with patch.gemma4_litert_patch():
+      patched_model = modeling_gemma4.Gemma4AudioModel(
+          copy.deepcopy(audio_config)
+      ).eval()
+    patched_model.load_state_dict(ref_model.state_dict())
+    # Verify that even when set_attn_implementation("eager") is called on the
+    # patched model (as done during export), it still matches the reference sdpa
+    # boolean mask behavior.
+    patched_model.set_attn_implementation("eager")
+
+    input_features = torch.randn(1, 80, 128, dtype=torch.float32)
+    attention_mask = torch.zeros(1, 80, dtype=torch.bool)
+    attention_mask[:, :52] = True
+
+    with torch.no_grad():
+      ref_out = ref_model(input_features, attention_mask, return_dict=True)
+      patched_out = patched_model(
+          input_features, attention_mask, return_dict=True
+      )
+
+    self.assertTrue(
+        torch.equal(ref_out.attention_mask, patched_out.attention_mask)
+    )
+    valid_mask = ref_out.attention_mask
+    max_diff = (
+        (
+            ref_out.last_hidden_state[valid_mask]
+            - patched_out.last_hidden_state[valid_mask]
+        )
+        .abs()
+        .max()
+        .item()
+    )
+    self.assertTrue(
+        torch.allclose(
+            ref_out.last_hidden_state[valid_mask],
+            patched_out.last_hidden_state[valid_mask],
+            rtol=1e-4,
+            atol=1e-4,
+        ),
+        "LiteRTGemma4AudioModel vs Gemma4AudioModel mismatch.\n"
+        f"Max diff: {max_diff}",
     )
 
 

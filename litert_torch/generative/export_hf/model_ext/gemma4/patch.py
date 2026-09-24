@@ -60,6 +60,8 @@ try:
   Gemma4VisionEncoder = modeling_gemma4.Gemma4VisionEncoder
   Gemma4VisionPatchEmbedder = modeling_gemma4.Gemma4VisionPatchEmbedder
   Gemma4VisionPooler = modeling_gemma4.Gemma4VisionPooler
+  Gemma4AudioAttention = modeling_gemma4.Gemma4AudioAttention
+  Gemma4AudioModel = modeling_gemma4.Gemma4AudioModel
 
   class FusedGemma4TextMLP(torch.nn.Module):
     """Fused Gate + Up MLP layer for Gemma4."""
@@ -305,6 +307,9 @@ try:
               modeling_gemma4.eager_attention_forward,
           )
       )
+      # Signal SDPA to skip cache update when this layer shares KV cache with a
+      # donor layer to avoid redundant or duplicate cache updates.
+      kwargs["skip_cache_update"] = self.is_kv_shared_layer
       attn_output, attn_weights = attention_interface(
           self,
           query_states,
@@ -372,7 +377,7 @@ try:
       return router_probabilities, top_k_weights, top_k_index
 
 
-  @patches_lib.register_model_patch(["gemma4"])
+  @patches_lib.register_model_patch(["gemma4", "gemma4_text"])
   @contextlib.contextmanager
   def patch_gemma4_model(model, export_config):
     """Dynamic model patch for Gemma4 export."""
@@ -423,6 +428,8 @@ except ImportError:
   Gemma4VisionPatchEmbedder = torch.nn.Module
   Gemma4VisionPooler = torch.nn.Module
   Gemma4TextModel = torch.nn.Module
+  Gemma4AudioAttention = torch.nn.Module
+  Gemma4AudioModel = torch.nn.Module
 
   class FusedGemma4TextMLP(torch.nn.Module):
     pass
@@ -430,7 +437,7 @@ except ImportError:
   class FusedGemma4TextAttention(torch.nn.Module):
     pass
 
-  @patches_lib.register_model_patch(["gemma4"])
+  @patches_lib.register_model_patch(["gemma4", "gemma4_text"])
   @contextlib.contextmanager
   def patch_gemma4_model(model, export_config):
     yield
@@ -580,8 +587,307 @@ class LiteRTGemma4VisionEncoder(Gemma4VisionEncoder):
     )
 
 
+class LiteRTGemma4AudioSubSampleConvProjectionLayer(
+    modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer
+):
+  """LiteRT Gemma4 Audio SubSample Conv Projection Layer for GPU export."""
+
+  def forward(
+      self, hidden_states: torch.Tensor, mask: torch.Tensor | None = None
+  ):
+    if mask is not None:
+      mask_f = mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
+      hidden_states = hidden_states * mask_f[:, None, :, None]
+
+    hidden_states = self.conv(hidden_states.to(self.conv.weight.dtype))
+    hidden_states = self.act(
+        self.norm(hidden_states.permute(0, 2, 3, 1))
+        .permute(0, 3, 1, 2)
+        .contiguous()
+    )
+
+    if mask is not None:
+      mask_f = mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
+      batch_size, seq_len = mask_f.shape
+      if seq_len % 2 != 0:
+        pad_one = torch.zeros(
+            (batch_size, 1), dtype=mask_f.dtype, device=mask_f.device
+        )
+        mask_f = torch.cat([mask_f, pad_one], dim=1)
+      half_len = (seq_len + 1) // 2
+      mask = mask_f.reshape(batch_size, half_len, 2)[:, :, :1].reshape(
+          batch_size, half_len
+      )
+
+    return hidden_states, mask
+
+
+class LiteRTGemma4AudioAttention(Gemma4AudioAttention):
+  """LiteRT Gemma4 Audio Attention using <=4D tensors for GPU compatibility."""
+
+  def _convert_to_block_4d(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Converts `(B, L, H, D)` to 4D `(B, H * num_blocks, chunk_size, D)`."""
+    batch_size, seq_len, num_heads, head_dim = hidden_states.shape
+    num_blocks = (seq_len + self.chunk_size - 1) // self.chunk_size
+    pad = num_blocks * self.chunk_size - seq_len
+    if pad > 0:
+      pad_states = torch.zeros(
+          (batch_size, pad, num_heads, head_dim),
+          dtype=hidden_states.dtype,
+          device=hidden_states.device,
+      )
+      hidden_states = torch.cat([hidden_states, pad_states], dim=1)
+    # 4D transpose: (B, num_blocks * chunk_size, H, D) ->
+    # (B, H, num_blocks * chunk_size, D)
+    hidden_states = hidden_states.transpose(1, 2).contiguous()
+    return hidden_states.reshape(
+        batch_size, num_heads * num_blocks, self.chunk_size, head_dim
+    )
+
+  def _extract_block_context_4d(
+      self, hidden_states: torch.Tensor
+  ) -> torch.Tensor:
+    """Extracts context windows into 4D `(B, H*num_blocks, context_size, D)`."""
+    batch_size, seq_len, num_heads, head_dim = hidden_states.shape
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
+    num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
+    num_strips = (self.context_size + self.chunk_size - 1) // self.chunk_size
+    required_len = (num_chunks + num_strips - 1) * self.chunk_size
+    future_len = max(
+        self.max_future_horizon + self.chunk_size - 1,
+        required_len - seq_len - self.max_past_horizon,
+    )
+
+    past_pad = torch.zeros(
+        (batch_size, self.max_past_horizon, num_heads, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    future_pad = torch.zeros(
+        (batch_size, future_len, num_heads, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    # 4D transpose first: (B, L_pad, H, D) -> (B, H, L_pad, D)
+    padded_4d = (
+        torch.cat([past_pad, hidden_states, future_pad], dim=1)
+        .transpose(1, 2)
+        .contiguous()
+    )
+
+    strips = []
+    for k in range(num_strips):
+      start = k * self.chunk_size
+      end = (k + num_chunks) * self.chunk_size
+      strip = padded_4d[:, :, start:end, :].reshape(
+          batch_size * num_heads, num_chunks, self.chunk_size, head_dim
+      )
+      strips.append(strip)
+
+    windows = torch.cat(strips, dim=2)[:, :, : self.context_size, :]
+    return windows.reshape(
+        batch_size, num_heads * num_chunks, self.context_size, head_dim
+    )
+
+  def _rel_shift_4d(
+      self, x: torch.Tensor, num_blocks: int, block_size: int
+  ) -> torch.Tensor:
+    """Relative position shift in 4D `(B, H*num_blocks, block_size, pos_len)`."""
+    batch_size, heads_times_blocks, _, position_length = x.shape
+    context_size = self.context_size
+    pad_len = context_size + 1 - position_length
+    pad_tensor = torch.zeros(
+        (batch_size, heads_times_blocks, block_size, pad_len),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    x = torch.cat([x, pad_tensor], dim=-1)
+    x = x.view(
+        batch_size, heads_times_blocks, block_size * (context_size + 1)
+    )
+    x = x[:, :, : block_size * context_size]
+    return x.view(
+        batch_size, heads_times_blocks, block_size, context_size
+    )
+
+  def forward(
+      self,
+      hidden_states: torch.Tensor,
+      position_embeddings: torch.Tensor,
+      attention_mask: torch.Tensor | None = None,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seq_length, _ = hidden_states.shape
+    hidden_shape = (batch_size, seq_length, self.num_heads, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).float().view(hidden_shape)
+    key_states = self.k_proj(hidden_states).float().view(hidden_shape)
+    value_states = self.v_proj(hidden_states).float().view(hidden_shape)
+
+    query_states = (
+        query_states
+        * self.q_scale
+        * torch.nn.functional.softplus(self.per_dim_scale)
+    )
+    key_states = key_states * self.k_scale
+
+    num_blocks = (seq_length + self.chunk_size - 1) // self.chunk_size
+    queries_4d = self._convert_to_block_4d(query_states)
+    keys_4d = self._extract_block_context_4d(key_states)
+    values_4d = self._extract_block_context_4d(value_states)
+
+    relative_key_states = self.relative_k_proj(position_embeddings)
+    relative_key_states = relative_key_states.view(
+        -1, self.num_heads, self.head_dim
+    ).to(dtype=queries_4d.dtype)
+    # (1, H, head_dim, pos_len)
+    rel_k_4d = relative_key_states.permute(1, 2, 0).unsqueeze(0)
+
+    # queries_flat: (B, H, num_blocks * chunk_size, head_dim)
+    queries_flat = queries_4d.view(
+        batch_size, self.num_heads, num_blocks * self.chunk_size, self.head_dim
+    )
+    matrix_bd = queries_flat @ rel_k_4d
+    matrix_bd = matrix_bd.reshape(
+        batch_size, self.num_heads * num_blocks, self.chunk_size, -1
+    )
+    matrix_bd = self._rel_shift_4d(matrix_bd, num_blocks, self.chunk_size)
+
+    matrix_ac = queries_4d @ keys_4d.transpose(-1, -2)
+
+    attn_weights = matrix_ac + matrix_bd
+    attn_weights = attn_weights / self.softcap
+    attn_weights = torch.tanh(attn_weights)
+    attn_weights = attn_weights * self.softcap
+
+    if attention_mask is not None:
+      attn_weights = attn_weights + attention_mask
+
+    attn_weights = torch.nn.functional.softmax(
+        attn_weights, dim=-1, dtype=torch.float32
+    ).to(values_4d.dtype)
+    attn_output = attn_weights @ values_4d
+    # (B, H * num_blocks, chunk_size, D) -> (B, H, num_blocks * chunk_size, D)
+    attn_output = attn_output.view(
+        batch_size, self.num_heads, num_blocks * self.chunk_size, self.head_dim
+    )
+    # 4D transpose -> (B, num_blocks * chunk_size, H, D)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(
+        batch_size, num_blocks * self.chunk_size, -1
+    )
+    attn_output = attn_output[:, :seq_length].contiguous()
+    attn_output = self.post(attn_output.to(hidden_states.dtype))
+
+    return attn_output, attn_weights
+
+
+class LiteRTGemma4AudioModel(Gemma4AudioModel):
+  """LiteRT Gemma4 Audio Model with 4D additive attention mask for GPU/CPU."""
+
+  def _build_blocked_4d_attention_mask(
+      self, output_mask: torch.Tensor, dtype: torch.dtype
+  ) -> torch.Tensor:
+    batch_size, seq_len = output_mask.shape
+    device = output_mask.device
+
+    chunk_size = self.config.attention_chunk_size
+    max_past_horizon = self.config.attention_context_left - 1
+    max_future_horizon = self.config.attention_context_right
+    context_size = chunk_size + max_past_horizon + max_future_horizon
+
+    num_blocks = (seq_len + chunk_size - 1) // chunk_size
+    num_strips = (context_size + chunk_size - 1) // chunk_size
+    required_len = (num_blocks + num_strips - 1) * chunk_size
+    future_len = max(
+        (num_blocks * chunk_size - seq_len)
+        + max_future_horizon
+        + chunk_size
+        - 1,
+        required_len - seq_len - max_past_horizon,
+    )
+
+    past_pad = torch.zeros(
+        (batch_size, max_past_horizon), dtype=dtype, device=device
+    )
+    future_pad = torch.zeros(
+        (batch_size, future_len), dtype=dtype, device=device
+    )
+    padded_key_mask = torch.cat(
+        [past_pad, output_mask.to(dtype=dtype), future_pad], dim=1
+    )
+
+    mask_strips = []
+    for k in range(num_strips):
+      start = k * chunk_size
+      end = (k + num_blocks) * chunk_size
+      mask_strips.append(
+          padded_key_mask[:, start:end].reshape(
+              batch_size, num_blocks, 1, chunk_size
+          )
+      )
+    key_mask_4d = torch.cat(mask_strips, dim=3)[:, :, :, :context_size]
+
+    block_starts = torch.arange(num_blocks, device=device) * chunk_size
+    q_idx = torch.arange(chunk_size, device=device)[:, None]
+    c_idx = torch.arange(context_size, device=device)[None, :]
+    dist = max_past_horizon + q_idx - c_idx
+    left_mask = (dist >= 0) & (dist < max_past_horizon)
+    right_mask = (dist < 0) & (-dist < max_future_horizon)
+    window_mask = (left_mask | right_mask).to(dtype=dtype)[None, None, :, :]
+
+    q_global_idx = (
+        block_starts[:, None]
+        + torch.arange(chunk_size, device=device)[None, :]
+    )
+    q_valid_4d = (q_global_idx < seq_len).to(dtype=dtype)[None, :, :, None]
+
+    static_mask_4d = window_mask * q_valid_4d
+    valid_mask_4d = key_mask_4d * static_mask_4d
+    valid_mask_4d = torch.cat(
+        [valid_mask_4d] * self.config.num_attention_heads, dim=1
+    )
+    return (1.0 - valid_mask_4d) * self.config.attention_invalid_logits_value
+
+  def forward(
+      self,
+      input_features: torch.Tensor,
+      attention_mask: torch.Tensor | None = None,
+      **kwargs,
+  ):
+    hidden_states, output_mask = self.subsample_conv_projection(
+        input_features, attention_mask
+    )
+    position_embeddings = self.rel_pos_enc(hidden_states)
+
+    if output_mask is None:
+      output_mask = torch.ones(
+          hidden_states.shape[:2],
+          dtype=hidden_states.dtype,
+          device=hidden_states.device,
+      )
+    attention_mask_4d = self._build_blocked_4d_attention_mask(
+        output_mask, dtype=hidden_states.dtype
+    )
+
+    for encoder_layer in self.layers[: self.config.num_hidden_layers]:
+      hidden_states = encoder_layer(
+          hidden_states,
+          attention_mask=attention_mask_4d,
+          position_embeddings=position_embeddings,
+          **kwargs,
+      )
+
+    hidden_states = self.output_proj(hidden_states)
+    return modeling_gemma4.Gemma4AudioModelOutput(
+        last_hidden_state=hidden_states,
+        attention_mask=output_mask > 0.5,
+    )
+
+
 # pytype: disable=import-error
-@patches_lib.register_patch(["gemma4"])
+@patches_lib.register_patch(["gemma4", "gemma4_text"])
 @contextlib.contextmanager
 def gemma4_litert_patch():
   """Gemma4 patch."""
@@ -606,6 +912,19 @@ def gemma4_litert_patch():
   original_text_router = modeling_gemma4.Gemma4TextRouter
   modeling_gemma4.Gemma4TextRouter = LiteRTGemma4TextRouter
 
+  original_audio_subsample_layer = (
+      modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer
+  )
+  modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer = (
+      LiteRTGemma4AudioSubSampleConvProjectionLayer
+  )
+
+  original_audio_attention = modeling_gemma4.Gemma4AudioAttention
+  modeling_gemma4.Gemma4AudioAttention = LiteRTGemma4AudioAttention
+
+  original_audio_model = modeling_gemma4.Gemma4AudioModel
+  modeling_gemma4.Gemma4AudioModel = LiteRTGemma4AudioModel
+
   try:
     yield
   finally:
@@ -615,6 +934,11 @@ def gemma4_litert_patch():
     modeling_gemma4.Gemma4VisionPooler = original_pooler
     modeling_gemma4.Gemma4TextModel = original_text_model
     modeling_gemma4.Gemma4TextRouter = original_text_router
+    modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer = (
+        original_audio_subsample_layer
+    )
+    modeling_gemma4.Gemma4AudioAttention = original_audio_attention
+    modeling_gemma4.Gemma4AudioModel = original_audio_model
 
 
 # pytype: enable=import-error

@@ -60,8 +60,29 @@ def ring_buffer_sdpa(
     layer_idx: Optional[int] = None,
     mask: Optional[torch.Tensor] = None,
     softcap: float | None = None,
+    skip_cache_update: bool = False,
 ):
-  """Ring buffer SDPA."""
+  """Ring buffer SDPA.
+
+  Args:
+    query: Query tensor.
+    key_past: Past key cache tensor.
+    value_past: Past value cache tensor.
+    k_ts_idx: The index of the time step dimension in key cache.
+    v_ts_idx: The index of the time step dimension in value cache.
+    param_tensor: Parameter tensor for runtime BMM.
+    is_global: Whether the attention is global.
+    key_states: Incoming new key states for update.
+    value_states: Incoming new value states for update.
+    layer: Cache layer object.
+    cache_position: Current cache position tensor.
+    past_key_value: Past key-value cache structure.
+    layer_idx: The layer index.
+    mask: Attention mask tensor.
+    softcap: Optional logit softcapping value.
+    skip_cache_update: Whether to skip updating the KV cache (e.g. for shared
+      KV layers that reuse keys/values from earlier donor layers).
+  """
   if layer is None and past_key_value is not None and layer_idx is not None:
     layer = past_key_value.layers[layer_idx]
   assert layer is not None, "layer must be provided for ring buffer SDPA"
@@ -191,7 +212,9 @@ def ring_buffer_sdpa(
     probs_all = F.softmax(padded_logits_all, dim=-1)
     probs_all = builder.mark_outputs(probs_all)
     probs_all = probs_all.type_as(query)
-    probs_past, probs_current = probs_all.split(S_past, dim=-1)
+    probs_past, probs_current = probs_all.split(
+        [S_past, probs_all.shape[-1] - S_past], dim=-1
+    )
 
     # 3. V Matmuls
     # encoded_past uses old cache 'value_past' and runtime_bmm
@@ -206,53 +229,58 @@ def ring_buffer_sdpa(
 
     encoded = encoded_past + encoded_current
 
-    # Force dependency: Make cache_update inputs depend on BMM2 output (encoded)
-    # This ensures all reads of the old cache (both K and V) are completed
-    # before cache_update overwrites them.
-    dummy_dep = encoded.sum() * 0
-    key_states_for_update_dep = key_states_for_update + dummy_dep
-    value_states_for_update_dep = value_states_for_update + dummy_dep
+    if not skip_cache_update:
+      # Force dependency: Make cache_update inputs depend on BMM2 output (encoded)
+      # This ensures all reads of the old cache (both K and V) are completed
+      # before cache_update overwrites them.
+      dummy_dep = encoded.sum() * 0
+      key_states_for_update_dep = key_states_for_update + dummy_dep
+      value_states_for_update_dep = value_states_for_update + dummy_dep
 
-    # 4. Update Cache (using old cache key_past/value_past as baseline)
-    new_k, new_v = gpu_cache_update.cache_update(
-        key_states_for_update_dep,
-        value_states_for_update_dep.transpose(-2, -1),
-        modified_param_tensor,
-        key_past,
-        value_past,
-        indices_k=k_slice_indices,
-        indices_v=v_slice_indices,
-        kv_heads=bk_size,
-        kv_batch_size=1,
-        cache_len=cache_size,
-        head_size=v_head_size,
-        is_ring_buffer=layer.is_sliding,
-    )
-    layer.keys = new_k
-    layer.values = new_v
-    if past_key_value is not None and layer_idx is not None:
-      _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v)
+      # 4. Update Cache (using old cache key_past/value_past as baseline)
+      new_k, new_v = gpu_cache_update.cache_update(
+          key_states_for_update_dep,
+          value_states_for_update_dep.transpose(-2, -1),
+          modified_param_tensor,
+          key_past,
+          value_past,
+          indices_k=k_slice_indices,
+          indices_v=v_slice_indices,
+          kv_heads=bk_size,
+          kv_batch_size=1,
+          cache_len=cache_size,
+          head_size=v_head_size,
+          is_ring_buffer=layer.is_sliding,
+      )
+      layer.keys = new_k
+      layer.values = new_v
+      if past_key_value is not None and layer_idx is not None:
+        _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v)
 
     return encoded
   else:
-    new_k, new_v = gpu_cache_update.cache_update(
-        key_states_for_update,
-        value_states_for_update.transpose(-2, -1),
-        modified_param_tensor,
-        key_past,
-        value_past,
-        indices_k=k_slice_indices,
-        indices_v=v_slice_indices,
-        kv_heads=bk_size,
-        kv_batch_size=1,
-        cache_len=cache_size,
-        head_size=v_head_size,
-        is_ring_buffer=layer.is_sliding,
-    )
-    layer.keys = new_k
-    layer.values = new_v
-    if past_key_value is not None and layer_idx is not None:
-      _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v)
+    if not skip_cache_update:
+      new_k, new_v = gpu_cache_update.cache_update(
+          key_states_for_update,
+          value_states_for_update.transpose(-2, -1),
+          modified_param_tensor,
+          key_past,
+          value_past,
+          indices_k=k_slice_indices,
+          indices_v=v_slice_indices,
+          kv_heads=bk_size,
+          kv_batch_size=1,
+          cache_len=cache_size,
+          head_size=v_head_size,
+          is_ring_buffer=layer.is_sliding,
+      )
+      layer.keys = new_k
+      layer.values = new_v
+      if past_key_value is not None and layer_idx is not None:
+        _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v)
+    else:
+      new_k = layer.keys
+      new_v = layer.values
 
     logits = bmm_fn_k(query, new_k)
     g = gt // mask.size(2)
@@ -329,6 +357,7 @@ def scaled_dot_product_attention_transposed(
     enable_ring_buffer: bool = False,
     past_key_value: Optional[Any] = None,
     layer_idx: Optional[int] = None,
+    skip_cache_update: bool = False,
 ):
   """Scaled dot product attention with transposed key and value.
 
@@ -349,6 +378,8 @@ def scaled_dot_product_attention_transposed(
     enable_ring_buffer (bool): whether to enable ring buffer.
     past_key_value (Any): past key value cache.
     layer_idx (int): the index of the layer.
+    skip_cache_update (bool): whether to skip updating the KV cache (e.g. for
+      shared KV layers that reuse keys/values from earlier donor layers).
 
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
@@ -428,6 +459,7 @@ def scaled_dot_product_attention_transposed(
         layer_idx=layer_idx,
         mask=mask,
         softcap=softcap,
+        skip_cache_update=skip_cache_update,
     )
     if is_decode_composite:
       encoded = encoded.permute(0, 2, 1, 3).reshape(b, 1, -1)

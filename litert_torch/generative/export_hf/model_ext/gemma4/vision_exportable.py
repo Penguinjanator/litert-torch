@@ -127,3 +127,37 @@ class LiteRTExportableModuleForGemma4VisionAdapter(
     )
     inputs = {'soft_tokens': features}
     return {f'vision_adapter_{vision_output_length}': (inputs, {})}
+
+
+class LiteRTExportableModuleForGemma4EndOfImage(
+    exportable_module_base.ExportableModuleBase
+):
+  """Exportable module for Gemma4 end of image token."""
+
+  def __init__(self, model: torch.nn.Module, export_config, tokenizer):
+    super().__init__(export_config)
+    self.model = model
+    self.tokenizer = tokenizer
+
+  def forward(self):
+    return {
+        'eoi_embedding': self.model.get_input_embeddings()(
+            torch.tensor(
+                [
+                    self.tokenizer.encode(
+                        self.tokenizer.special_tokens_map['eoi_token'],
+                        add_special_tokens=False,
+                    )
+                ],
+                dtype=torch.int32,
+            )
+        )
+    }
+
+  def get_sample_inputs(
+      self, model_config, **kwargs
+  ) -> dict[str, tuple[dict[str, torch.Tensor], dict[str, torch.export.Dim]]]:
+    """Returns the sample inputs for the model."""
+    del model_config, kwargs
+    return {'eoi': (dict(), {})}
+

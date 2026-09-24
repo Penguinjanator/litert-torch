@@ -526,6 +526,16 @@ def package_model(
         exported_model_artifacts.audio_encoder_model_path,
         litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW,
     )
+  if exported_model_artifacts.audio_adapter_model_path:
+    builder.add_tflite_model(
+        exported_model_artifacts.audio_adapter_model_path,
+        litertlm_builder.TfLiteModelType.AUDIO_ADAPTER,
+    )
+  if exported_model_artifacts.eoa_model_path:
+    builder.add_tflite_model(
+        exported_model_artifacts.eoa_model_path,
+        litertlm_builder.TfLiteModelType.END_OF_AUDIO,
+    )
   if exported_model_artifacts.auxiliary_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.auxiliary_model_path,

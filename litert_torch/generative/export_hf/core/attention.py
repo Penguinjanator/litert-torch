@@ -180,6 +180,13 @@ def transposed_attention(
     past_key_value = kwargs.get("past_key_value", None)
     enable_ring_buffer = bool(kwargs.get("enable_ring_buffer", False))
     layer_idx = getattr(module, "layer_idx", None)
+    # Check if the layer should skip cache updates (e.g. KV-shared layers in
+    # Gemma 4 that reuse key/value states from a preceding donor layer).
+    skip_cache_update = bool(
+        getattr(module, "is_kv_shared_layer", False)
+        or kwargs.get("skip_cache_update", False)
+        or kwargs.get("is_kv_shared_layer", False)
+    )
     sdpa_out = gpu_sdpa.scaled_dot_product_attention_transposed(
         query=query,
         key=key,
@@ -196,6 +203,7 @@ def transposed_attention(
         enable_ring_buffer=enable_ring_buffer,
         past_key_value=past_key_value,
         layer_idx=layer_idx,
+        skip_cache_update=skip_cache_update,
     )
     return sdpa_out, None
 

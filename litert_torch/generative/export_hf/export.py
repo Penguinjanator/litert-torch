@@ -111,6 +111,7 @@ def export(
     export_vision_encoder: bool | None = None,
     vision_encoder_quantization_recipe: str | None = None,
     export_audio_encoder: bool | None = None,
+    audio_encoder_quantization_recipe: str | None = None,
     input_sec: float | None = None,
     stateful_after: int | None = None,
     litert_lm_model_type_override: str | None = None,
@@ -320,6 +321,8 @@ def export(
     export_tasks.append(export_lib.export_additional_models)
     if export_config.export_vision_encoder:
       export_tasks.append(export_lib.export_vision_encoder_models)
+    if export_config.export_audio_encoder:
+      export_tasks.append(export_lib.export_audio_encoder_models_for_llm)
     export_tasks.append(export_lib.export_tokenizer)
     if export_config.bundle_litert_lm:
       export_tasks.append(litert_lm_builder.package_model)

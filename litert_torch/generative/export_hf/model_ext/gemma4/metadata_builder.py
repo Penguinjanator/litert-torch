@@ -75,4 +75,15 @@ def build_llm_metadata(
         * 3
         * export_config.extra_kwargs.get('gemma4_vision_max_soft_tokens', 140)
     )
+  if exported_model_artifacts.audio_encoder_model_path:
+    feature_extractor = source_model_artifacts.feature_extractor
+    assert (
+        feature_extractor is not None
+    ), 'Feature extractor is required for Gemma4 audio export.'
+    boa_token = token_map.get('boa_token', '')
+    eoa_token = token_map.get('eoa_token', '')
+    llm_metadata.llm_model_type.gemma4.start_of_audio_token.token_str = (
+        boa_token  # pyrefly: ignore[bad-assignment]
+    )
+    llm_metadata.llm_model_type.gemma4.end_of_audio_token.token_str = eoa_token  # pyrefly: ignore[bad-assignment]
   return llm_metadata

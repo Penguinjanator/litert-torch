@@ -27,6 +27,7 @@ import torch
 class ExportTask(str, enum.Enum):
   TEXT_GENERATION = "text_generation"
   IMAGE_TEXT_TO_TEXT = "image_text_to_text"
+  MULTIMODAL_LM = "multimodal_lm"
   AUTOMATIC_SPEECH_RECOGNITION = "automatic_speech_recognition"
   TEXT_TO_SPEECH = "text_to_speech"
 
@@ -95,6 +96,7 @@ class ExportableModuleConfig:
   # if you intend to run on CPU, and set dynamic_wi8_afp32 if you intend to run
   # on GPU.
   vision_encoder_quantization_recipe: str | None = "dynamic_wi8_afp32"
+  audio_encoder_quantization_recipe: str | None = "dynamic_wi8_afp32"
   litert_lm_model_type_override: str | None = None
   litert_lm_llm_metadata_override: str | None = None
   tokenizer_path_override: str | None = None
@@ -194,6 +196,13 @@ class ExportableModuleConfig:
           self.externalize_embedder = True
           self.single_token_embedder = True
         self.export_audio_encoder = False
+      case ExportTask.MULTIMODAL_LM:
+        if self.export_vision_encoder:
+          self.externalize_embedder = True
+          self.single_token_embedder = True
+        if self.export_audio_encoder:
+          self.externalize_embedder = True
+          self.single_token_embedder = True
       case ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
         self.export_vision_encoder = False
         self.split_cache = False

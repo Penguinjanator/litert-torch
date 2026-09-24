@@ -19,6 +19,7 @@ from litert_torch.generative.export_hf.core.speech import exportables as speech_
 from litert_torch.generative.export_hf.model_ext.gemma3 import vision_exportable as gemma3_vision_exportable
 from litert_torch.generative.export_hf.model_ext.gemma3n import exportable_module as gemma3n_exportable
 from litert_torch.generative.export_hf.model_ext.gemma3n import vision_exportable as gemma3n_vision_exportable
+from litert_torch.generative.export_hf.model_ext.gemma4 import audio_exportable as gemma4_audio_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4 import exportable_module as gemma4_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_exportable_module as gemma4_split_cache_exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
@@ -109,11 +110,13 @@ def get_vision_exportables(
         gemma3n_vision_exportable.LiteRTExportableModuleForGemma3nVisionAdapter,
         None,
     )
-  elif model_config.model_type == 'gemma4':
+  elif (
+      model_config.model_type == 'gemma4'
+  ):
     return (
         gemma4_vision_exportable.LiteRTExportableModuleForGemma4VisionEncoder,
         gemma4_vision_exportable.LiteRTExportableModuleForGemma4VisionAdapter,
-        None,
+        gemma4_vision_exportable.LiteRTExportableModuleForGemma4EndOfImage,
     )
   elif model_config.model_type == 'gemma4_unified':
     return (
@@ -126,6 +129,22 @@ def get_vision_exportables(
         lfm2_vl_vision_exportable.LiteRTExportableModuleForLFM2VisionEncoder,
         lfm2_vl_vision_exportable.LiteRTExportableModuleForLFM2VisionAdapter,
         None,
+    )
+  else:
+    raise ValueError(f'Unsupported model type: {model_config.model_type}')
+
+
+def get_audio_exportables(
+    model_config: transformers.PretrainedConfig,
+):
+  """Gets audio exportables."""
+  if (
+      model_config.model_type == 'gemma4'
+  ):
+    return (
+        gemma4_audio_exportable.LiteRTExportableModuleForGemma4AudioEncoder,
+        gemma4_audio_exportable.LiteRTExportableModuleForGemma4AudioAdapter,
+        gemma4_audio_exportable.LiteRTExportableModuleForGemma4EndOfAudio,
     )
   else:
     raise ValueError(f'Unsupported model type: {model_config.model_type}')

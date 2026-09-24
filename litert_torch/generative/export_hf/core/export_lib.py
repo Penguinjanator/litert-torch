@@ -67,6 +67,7 @@ class SourceModelArtifacts:
   tokenizer: transformers.PreTrainedTokenizerBase
 
   image_processor: transformers.AutoImageProcessor | None = None
+  feature_extractor: transformers.AutoFeatureExtractor | None = None
 
 
 @dataclasses.dataclass
@@ -79,6 +80,8 @@ class ExportedModelArtifacts:
   vision_adapter_model_path: str | None = None
   eoi_model_path: str | None = None
   audio_encoder_model_path: str | None = None
+  audio_adapter_model_path: str | None = None
+  eoa_model_path: str | None = None
   auxiliary_model_path: str | None = None
   tokenizer_model_path: str | None = None
   additional_model_paths: dict[str, str] | None = None
@@ -262,10 +265,17 @@ def load_model(
     if hasattr(config, 'text_config'):
       config.text_config._experts_implementation = export_config.moe_exports_implementation  # pylint: disable=protected-access
 
+  for subcfg_name in ('text_config', 'vision_config', 'audio_config'):
+    subcfg = getattr(config, subcfg_name, None)
+    if subcfg is not None and hasattr(subcfg, 'dtype'):
+      subcfg.dtype = torch.float32
+
   if task == ExportTask.TEXT_GENERATION:
     auto_model_cls = transformers.AutoModelForCausalLM
   elif task == ExportTask.IMAGE_TEXT_TO_TEXT:
     auto_model_cls = transformers.AutoModelForImageTextToText
+  elif task == ExportTask.MULTIMODAL_LM:
+    auto_model_cls = transformers.AutoModelForMultimodalLM
   else:
     raise ValueError(f'Unsupported task: {task}')
   if auto_model_override is not None:
@@ -285,6 +295,7 @@ def load_model(
           torch_dtype=torch.float32,
           trust_remote_code=trust_remote_code,
       )
+    model = model.to(torch.float32)
 
   if task == ExportTask.TEXT_GENERATION:
     model.generation_config.cache_implementation = 'static'
@@ -300,12 +311,22 @@ def load_model(
     # TODO(weiyiw): Add support for other tasks.
     pass
 
-  if task == ExportTask.IMAGE_TEXT_TO_TEXT:
+  if (
+      task in (ExportTask.IMAGE_TEXT_TO_TEXT, ExportTask.MULTIMODAL_LM)
+      and export_config.export_vision_encoder
+  ):
     image_processor = transformers.AutoImageProcessor.from_pretrained(
         model_path
     )
   else:
     image_processor = None
+
+  if task == ExportTask.MULTIMODAL_LM and export_config.export_audio_encoder:
+    feature_extractor = transformers.AutoFeatureExtractor.from_pretrained(
+        model_path
+    )
+  else:
+    feature_extractor = None
 
   # TODO(weiyiw): Refactor into a separate function.
   tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
@@ -334,6 +355,7 @@ def load_model(
       text_model_config=text_model_config,
       tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
       image_processor=image_processor,
+      feature_extractor=feature_extractor,
   )
 
 
@@ -627,7 +649,8 @@ def export_vision_encoder_models(
   tokenizer = source_model_artifacts.tokenizer
   quantization_recipe = (
       export_config.vision_encoder_quantization_recipe
-      or export_config.quantization_recipe
+      if export_config.vision_encoder_quantization_recipe is not None
+      else export_config.quantization_recipe
   )
   work_dir = export_config.work_dir
 
@@ -717,6 +740,111 @@ def export_vision_encoder_models(
   )
 
 
+@progress.task('Export audio encoder models for LLM')
+def export_audio_encoder_models_for_llm(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+) -> ExportedModelArtifacts:
+  """Exports audio encoder models for multimodal LLM."""
+  model = source_model_artifacts.model
+  feature_extractor = source_model_artifacts.feature_extractor
+  if feature_extractor is None:
+    print('Feature extractor not found. Skipping audio encoder export.')
+    return exported_model_artifacts
+  model_config = source_model_artifacts.model_config
+  tokenizer = source_model_artifacts.tokenizer
+  quantization_recipe = (
+      export_config.audio_encoder_quantization_recipe
+      if export_config.audio_encoder_quantization_recipe is not None
+      else export_config.quantization_recipe
+  )
+  work_dir = export_config.work_dir
+
+  model.set_attn_implementation('eager')
+  encoder_module_cls, adapter_module_cls, eoa_module_cls = (
+      model_ext_exportables.get_audio_exportables(model_config)
+  )
+  encode_module = encoder_module_cls(model, export_config)
+  adapter_module = (
+      adapter_module_cls(model, export_config, tokenizer)
+      if adapter_module_cls is not None
+      else None
+  )
+  eoa_module = (
+      eoa_module_cls(model, export_config, tokenizer)
+      if eoa_module_cls is not None
+      else None
+  )
+  converter = converter_utils.Converter()
+  sample_inputs = encode_module.get_sample_inputs(
+      model_config,
+      feature_extractor=feature_extractor,
+      **export_config.extra_kwargs,
+  )
+  for signature_name, (sample_inputs, _) in sample_inputs.items():
+    converter.add_signature(
+        signature_name,
+        encode_module.eval(),
+        sample_kwargs=sample_inputs,
+    )
+  lrt_model = converter.convert(strict_export=False)
+  audio_encoder_path = os.path.join(work_dir, 'audio_encoder.tflite')  # pyrefly: ignore[no-matching-overload]
+  lrt_model.export(audio_encoder_path)
+  quantization_recipe_list = (
+      quantization_recipe.split(',') if quantization_recipe else [None]
+  )
+  for recipe in quantization_recipe_list:
+    audio_encoder_path = maybe_quantize_model(audio_encoder_path, recipe)
+    gc.collect()
+
+  if adapter_module is not None:
+    converter = converter_utils.Converter()
+    sample_inputs = adapter_module.get_sample_inputs(
+        model_config,
+        feature_extractor=feature_extractor,
+        **export_config.extra_kwargs,
+    )
+    for signature_name, (sample_inputs, _) in sample_inputs.items():
+      converter.add_signature(
+          signature_name,
+          adapter_module.eval(),
+          sample_kwargs=sample_inputs,
+      )
+    lrt_model = converter.convert(strict_export=False)
+    adapter_path = os.path.join(work_dir, 'audio_adapter.tflite')  # pyrefly: ignore[no-matching-overload]
+    lrt_model.export(adapter_path)
+    for recipe in quantization_recipe_list:
+      adapter_path = maybe_quantize_model(adapter_path, recipe)
+      gc.collect()
+  else:
+    adapter_path = None
+
+  if eoa_module is not None:
+    converter = converter_utils.Converter()
+    sample_inputs = eoa_module.get_sample_inputs(
+        model_config,
+        **export_config.extra_kwargs,
+    )
+    for signature_name, (sample_inputs, _) in sample_inputs.items():
+      converter.add_signature(
+          signature_name,
+          eoa_module.eval(),
+          sample_kwargs=sample_inputs,
+      )
+    lrt_model = converter.convert(strict_export=False)
+    eoa_path = os.path.join(work_dir, 'eoa.tflite')  # pyrefly: ignore[no-matching-overload]
+    lrt_model.export(eoa_path)
+  else:
+    eoa_path = None
+  return dataclasses.replace(
+      exported_model_artifacts,
+      audio_encoder_model_path=audio_encoder_path,
+      audio_adapter_model_path=adapter_path,
+      eoa_model_path=eoa_path,
+  )
+
+
 @progress.task('Export audio encoder models')
 def export_audio_encoder_models(
     source_model_artifacts: SourceModelArtifacts,
@@ -724,6 +852,7 @@ def export_audio_encoder_models(
     exported_model_artifacts: ExportedModelArtifacts,
 ) -> ExportedModelArtifacts:
   """Exports audio encoder models."""
+
   asr_model_obj = source_model_artifacts.model
   model_config = source_model_artifacts.model_config
   quantization_recipe = export_config.quantization_recipe
