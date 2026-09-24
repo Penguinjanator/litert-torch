@@ -130,11 +130,9 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
                 " to the sliding window size."
             )
             is_decode = input_pos.shape[0] == 1
-            use_sdpa_composite = kwargs.get("use_sdpa_composite", False)
             if (
                 kwargs.get("apply_gpu_composites", False)
                 and is_decode
-                and not use_sdpa_composite
             ):
               masks["sliding_attention"] = (
                   sliding_window_attention_mask.build_sliding_window_decode_mask(
@@ -172,11 +170,9 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
                 " to the sliding window size."
             )
             is_decode = input_pos.shape[0] == 1
-            use_sdpa_composite = kwargs.get("use_sdpa_composite", False)
             if (
                 kwargs.get("apply_gpu_composites", False)
                 and is_decode
-                and not use_sdpa_composite
             ):
               masks["sliding_attention"] = (
                   sliding_window_attention_mask.build_sliding_window_decode_mask(
@@ -553,14 +549,8 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
     )
     ring_buffer_size = export_config.sliding_window_ring_buffer_size
     if ring_buffer_size is not None and has_sliding:
-      use_sdpa_composite = export_config.extra_kwargs.get(
-          "use_sdpa_composite", False
-      ) or getattr(export_config, "use_sdpa_composite", False)
-      decode_local_mask_len = (
-          ring_buffer_size + 1 if use_sdpa_composite else ring_buffer_size
-      )
       inputs["local_mask"] = torch.ones(
-          (1, 1, 1, decode_local_mask_len),
+          (1, 1, 1, ring_buffer_size),
           dtype=torch.bool if use_bool_mask else torch.float32,
       )
     if (
@@ -601,7 +591,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       }
       if ring_buffer_size is not None and has_sliding:
         inputs["local_mask"] = torch.ones(
-            (1, 1, verify_length, ring_buffer_size),
+            (1, 1, verify_length, ring_buffer_size + verify_length),
             dtype=torch.bool if use_bool_mask else torch.float32,
         )
       inputs.update(kv_cache_inputs)
