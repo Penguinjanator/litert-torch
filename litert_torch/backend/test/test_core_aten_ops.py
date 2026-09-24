@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import re
+import sys
 from unittest import mock
 
 import litert_torch
@@ -396,6 +397,12 @@ class TestCoreAtenOps(parameterized.TestCase):
       # ("aten_slice_scatter_5", torch.ops.aten.slice_scatter, (rnd(torch.float32, (0, 10)), rnd(torch.float32, (0, 3)), 1, 0, -7), dict()),
       # ("aten_slice_scatter_6", torch.ops.aten.slice_scatter, (rnd(torch.float32, (8, 3, 3)), rnd(torch.float32, (0, 3, 3)), 0, -8, 0), dict()),
       ("aten_slice_Tensor_0", torch.ops.aten.slice.Tensor, (rnd(torch.float32, (10, 10)), 1,), dict()),
+      ("aten_slice_Tensor_1", torch.ops.aten.slice.Tensor, (rnd(torch.float32, (10, 10)), 1, 0, 9, 2), dict()),
+      ("aten_slice_Tensor_2", torch.ops.aten.slice.Tensor, (rnd(torch.float32, (2, 5, 10, 10)), 2, 1, None, 2), dict()),
+      ("aten_slice_Tensor_3", torch.ops.aten.slice.Tensor, (rnd(torch.float32, (10, 10)), 0, -8, -1, 3), dict()),
+      ("aten_slice_Tensor_4", torch.ops.aten.slice.Tensor, (rnd(torch.float32, (10, 10)), 1, 0, sys.maxsize, 2), dict()),
+      ("aten_slice_Tensor_5", torch.ops.aten.slice.Tensor, (rnd(torch.float32, (2, 5, 10, 10)), 2, None, sys.maxsize, 2), dict()),
+      ("aten_slice_copy_Tensor_1", torch.ops.aten.slice_copy.Tensor, (rnd(torch.float32, (10, 10)), 1, 0, 10, 2), dict()),
       ("aten__softmax_0", torch.ops.aten._softmax, (rnd(torch.float32, (10, 10)), 1, False,), dict()),
       ("aten_split_copy_Tensor_0", torch.ops.aten.split_copy.Tensor, (rnd(torch.float32, (10, 10)), 2,), dict()),
       ("aten_split_with_sizes_0", torch.ops.aten.split_with_sizes, (rnd(torch.float32, (10, 10)), [1, 2, 3, 4],), dict()),
@@ -443,6 +450,7 @@ class TestCoreAtenOps(parameterized.TestCase):
       ("prelu", torch.ops.aten.prelu, (rnd(torch.float32, (1, 8, 5, 5), -1.0, 1.0), rnd(torch.float32, (8,)),), dict()),
       ("pixel_shuffle", torch.ops.aten.pixel_shuffle, (rnd(torch.float32, (1, 12, 10, 10)), 2,), dict()),
       ("pixel_unshuffle", torch.ops.aten.pixel_unshuffle, (rnd(torch.float32, (1, 3, 10, 10)), 2,), dict()),
+      ("slice_step2", torch.ops.aten.slice.Tensor, (rnd(torch.float32, (1, 4, 10, 10)), 2, 0, sys.maxsize, 2), dict()),
       # fmt: on
       # pyformat: enable
   )

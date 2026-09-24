@@ -19,6 +19,7 @@ import logging
 
 import jax
 import jax.numpy as jnp
+from litert_torch.backend import export_utils
 from litert_torch.backend import jax_bridge
 from litert_torch.backend.lowerings import context
 from litert_torch.backend.lowerings import registry
@@ -181,8 +182,6 @@ lower_by_torchax(torch.ops.aten.sign)
 lower_by_torchax(torch.ops.aten.silu)
 lower_by_torchax(torch.ops.aten.sin)
 lower_by_torchax(torch.ops.aten.sinh)
-lower_by_torchax(torch.ops.aten.slice)
-lower_by_torchax(torch.ops.aten.slice_copy)
 lower_by_torchax(torch.ops.aten.sort)
 lower_by_torchax(torch.ops.aten.split)
 lower_by_torchax(torch.ops.aten.split_copy)
@@ -425,6 +424,53 @@ def _aten_max_pool3d_with_indices(
   # TFLite's reduce_window kernel doesn't support multiple inputs/outputs,
   # so we emit reduce_window with a single output and return dummy indices.
   return y, jnp.zeros_like(y, dtype=jnp.int64)
+
+
+# torchax implements aten.slice with jnp basic indexing, whose step > 1 path
+# lowers to gather (TFLite GATHER_ND), which the GPU delegate rejects. Emit
+# jax.lax.slice (TFLite STRIDED_SLICE) for static strided slices instead and
+# keep the torchax lowering for everything else.
+_torchax_slice = torchax_ops.ALL_OPS[torch.ops.aten.slice]
+
+
+@lower_by_jax(torch.ops.aten.slice)
+@lower_by_jax(torch.ops.aten.slice_copy)
+def _aten_slice(self, dim=0, start=None, end=None, step=1):
+  if dim < 0:
+    dim += len(self.shape)
+  dim_size = self.shape[dim]
+  # A dynamic dimension reaches this lowering as export_utils.IR_DYNAMIC,
+  # which is a plain int, so isinstance alone cannot prove staticness.
+  # jax.lax.slice also needs concrete bounds for every dimension (not just
+  # the sliced one), so require the full shape to be static.
+  static = (
+      all(
+          isinstance(d, int) and not export_utils.is_ir_dynamic(d)
+          for d in self.shape
+      )
+      and isinstance(step, int)
+      and (start is None or isinstance(start, int))
+      and (end is None or isinstance(end, int))
+  )
+  if static and step > 1:
+    if start is None:
+      start = 0
+    elif start < 0:
+      start += dim_size
+    start = min(max(start, 0), dim_size)
+    if end is None:
+      end = dim_size
+    elif end < 0:
+      end += dim_size
+    end = min(max(end, start), dim_size)
+    start_indices = [0] * len(self.shape)
+    limit_indices = list(self.shape)
+    strides = [1] * len(self.shape)
+    start_indices[dim] = start
+    limit_indices[dim] = end
+    strides[dim] = step
+    return jax.lax.slice(self, start_indices, limit_indices, strides)
+  return _torchax_slice(self, dim, start, end, step)
 
 
 @lower_by_jax(torch.ops.aten.unbind)
