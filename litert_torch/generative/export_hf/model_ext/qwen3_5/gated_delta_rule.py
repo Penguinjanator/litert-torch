@@ -91,7 +91,12 @@ def gated_delta_update(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Reference PyTorch implementation of Gated Delta Update."""
   del mode
-  batch_size, num_v_heads, seq_len, _ = q_t.shape
+  batch_size, num_v_heads, seq_len, _ = v_t.shape
+  num_k_heads = q_t.shape[1]
+  if num_v_heads != num_k_heads:
+    g_ratio = num_v_heads // num_k_heads
+    q_t = q_t.repeat_interleave(g_ratio, dim=1)
+    k_t = k_t.repeat_interleave(g_ratio, dim=1)
 
   # Recurrent path
   new_recurrent_state = recurrent_state.clone()
@@ -123,8 +128,7 @@ def _gated_delta_update_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Fake implementation for shape inference."""
   del k_t, beta_t, g_t, mode
-  batch_size, num_v_heads, seq_len, _ = q_t.shape
-  head_v_dim = v_t.shape[-1]
+  batch_size, num_v_heads, seq_len, head_v_dim = v_t.shape
   out1 = torch.empty(
       (batch_size, num_v_heads, seq_len, head_v_dim),
       dtype=q_t.dtype,
@@ -230,10 +234,6 @@ def gated_delta_net(
   act_dtype = torch.float32 if use_fp32 else b.dtype
   a_val = (a.to(act_dtype) + dt_bias.to(act_dtype)).clamp(max=50.0)
   g = -a_log.to(act_dtype).exp() * torch.log1p(torch.exp(a_val))
-
-  if num_v_heads // num_k_heads > 1:
-    query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
-    key = key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
 
   if valid_mask is not None and valid_mask.numel() > 0:
     vm_4d = valid_mask.view(batch_size, seq_len, 1, 1).to(query.dtype)
