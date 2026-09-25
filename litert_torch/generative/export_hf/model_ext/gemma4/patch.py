@@ -358,7 +358,6 @@ try:
           k=self.config.top_k_experts,
           dim=-1,
       )  # both [B*S, K]
-      top_k_index = top_k_index.int()
 
       expert_ids = torch.arange(
           self.config.num_experts,

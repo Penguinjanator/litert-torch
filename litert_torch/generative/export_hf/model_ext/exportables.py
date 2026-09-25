@@ -163,7 +163,7 @@ def get_additional_exportables(
   elif (
       model_config.model_type == 'gemma4'
   ):
-    if not model_config.text_config.hidden_size_per_layer_input:
+    if not model_config.get_text_config().hidden_size_per_layer_input:
       return {}
     return {
         'per_layer_embedder': (

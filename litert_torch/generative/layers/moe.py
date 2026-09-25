@@ -443,17 +443,39 @@ def moe_experts(
 
 
 def litert_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights):
-  gate_weight, ff1_weight = self.gate_up_proj.chunk(2, dim=1)
-  per_expert_scale = torch.ones(
-      (1, 1, 1, self.num_experts), dtype=torch.float32
+  use_pre_flattened = (
+      hasattr(self, "flattened_gate_weight")
+      and hasattr(self, "flattened_ff1_weight")
+      and hasattr(self, "flattened_linear_weight")
   )
+  if use_pre_flattened:
+    gate_weight = self.flattened_gate_weight
+    ff1_weight = self.flattened_ff1_weight
+    linear_weight = self.flattened_linear_weight
+    per_expert_scale = getattr(self, "per_expert_scale", None)
+    if per_expert_scale is None:
+      per_expert_scale = torch.ones(
+          (1, 1, 1, self.num_experts), dtype=torch.float32
+      )
+  else:
+    if hasattr(self, "gate_up_proj"):
+      gate_w, ff1_w = self.gate_up_proj.chunk(2, dim=1)
+    else:
+      gate_w, ff1_w = self.gate_proj, self.up_proj
+    gate_weight = flatten_expert_weight(gate_w)
+    ff1_weight = flatten_expert_weight(ff1_w)
+    linear_weight = flatten_expert_weight(self.down_proj)
+    per_expert_scale = torch.ones(
+        (1, 1, 1, self.num_experts), dtype=torch.float32
+    )
+
   output = moe_experts(
       hidden_states.reshape(1, -1, self.hidden_dim),
       top_k_weights.reshape(1, -1, self.config.top_k_experts),
       top_k_index.reshape(1, -1, self.config.top_k_experts).to(torch.int32),
-      flatten_expert_weight(gate_weight),
-      flatten_expert_weight(ff1_weight),
-      flatten_expert_weight(self.down_proj),
+      gate_weight,
+      ff1_weight,
+      linear_weight,
       per_expert_scale,
       num_experts=self.num_experts,
       num_active_experts=self.config.top_k_experts,

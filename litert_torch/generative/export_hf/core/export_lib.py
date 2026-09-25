@@ -43,6 +43,7 @@ from litert_torch.generative.export_hf.experimental.litert_lm_npu_compiler impor
 from litert_torch.generative.export_hf.model_ext import exportables as model_ext_exportables
 from litert_torch.generative.export_hf.model_ext import extension as model_ext_extension
 from litert_torch.generative.export_hf.model_ext import patches as model_ext_patches
+from litert_torch.generative.layers import moe
 from litert_torch.generative.tools import tokenizer_to_sentencepiece_lib as tokenizer_lib
 import torch
 from torch import nn
@@ -199,6 +200,62 @@ def pre_split_model_experts(model: nn.Module) -> nn.Module:
   return model
 
 
+def pre_flatten_model_experts(model: nn.Module) -> nn.Module:
+  """Flattens 3D expert weight tensors into 4D delegate layout parameters to bypass LiteRT runtime slicing and reshaping."""
+  for module in model.modules():
+    if (
+        hasattr(module, 'gate_up_proj')
+        and hasattr(module, 'down_proj')
+        and getattr(module, 'num_experts', None) is not None
+    ):
+      num_experts = int(getattr(module, 'num_experts'))
+      gate_w, ff1_w = module.gate_up_proj.data.chunk(2, dim=1)
+      module.flattened_gate_weight = nn.Parameter(
+          moe.flatten_expert_weight(gate_w)
+      )
+      module.flattened_ff1_weight = nn.Parameter(
+          moe.flatten_expert_weight(ff1_w)
+      )
+      delattr(module, 'gate_up_proj')
+
+      module.flattened_linear_weight = nn.Parameter(
+          moe.flatten_expert_weight(module.down_proj.data)
+      )
+      delattr(module, 'down_proj')
+
+      module.per_expert_scale = nn.Parameter(
+          torch.ones((1, 1, 1, num_experts), dtype=torch.float32),
+          requires_grad=False,
+      )
+      gc.collect()
+    elif (
+        hasattr(module, 'gate_proj')
+        and hasattr(module, 'up_proj')
+        and hasattr(module, 'down_proj')
+        and getattr(module, 'num_experts', None) is not None
+    ):
+      num_experts = int(getattr(module, 'num_experts'))
+      module.flattened_gate_weight = nn.Parameter(
+          moe.flatten_expert_weight(module.gate_proj.data)
+      )
+      delattr(module, 'gate_proj')
+      module.flattened_ff1_weight = nn.Parameter(
+          moe.flatten_expert_weight(module.up_proj.data)
+      )
+      delattr(module, 'up_proj')
+      module.flattened_linear_weight = nn.Parameter(
+          moe.flatten_expert_weight(module.down_proj.data)
+      )
+      delattr(module, 'down_proj')
+      module.per_expert_scale = nn.Parameter(
+          torch.ones((1, 1, 1, num_experts), dtype=torch.float32),
+          requires_grad=False,
+      )
+      gc.collect()
+
+  return model
+
+
 @progress.task('Load source model')
 def load_model(
     model_path: str,
@@ -348,6 +405,8 @@ def load_model(
 
   if export_config.moe_exports_implementation == 'litert_moe_sequential':
     model = pre_split_model_experts(model)
+  elif export_config.moe_exports_implementation == 'litert_moe':
+    model = pre_flatten_model_experts(model)
 
   return SourceModelArtifacts(
       model=model,

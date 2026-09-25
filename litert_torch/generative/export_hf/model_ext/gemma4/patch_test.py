@@ -15,14 +15,16 @@
 """Tests for Gemma4 model export patches."""
 
 import copy
-import torch
-from transformers.models.gemma4 import modeling_gemma4
+
 from absl.testing import parameterized
-import litert_torch.generative.export_hf
+from litert_torch.generative.export_hf.core import export_lib
 from litert_torch.generative.export_hf.core import exportable_module_config
+import litert_torch.generative.export_hf.model_ext as _
 from litert_torch.generative.export_hf.model_ext.gemma4 import patch
 from litert_torch.generative.layers import moe
 from litert_torch.generative.layers import rotary_position_embedding as rotary_pos_emb
+import torch
+from transformers.models.gemma4 import modeling_gemma4
 
 from absl.testing import absltest as googletest
 
@@ -63,6 +65,7 @@ class MockCache:
     self.layers = [MockCacheLayer(k_ts_idx, v_ts_idx)]
 
   def update(self, key_states, value_states, layer_idx, **kwargs):
+    del layer_idx
     if kwargs.get("apply_gpu_composites", False):
       b, n, s, h = key_states.shape
       k = key_states.reshape(1, b * n, s, h)
@@ -215,21 +218,60 @@ class PatchTest(parameterized.TestCase):
         model.model.layers[0].self_attn, modeling_gemma4.Gemma4TextAttention
     )
 
-  def test_gemma4_experts_litert_moe_equivalence(self):
+  def test_gemma4_router_equivalence(self):
     config = _get_dummy_gemma4_text_config()
-    config.num_experts = 4
-    config.top_k_experts = 2
-    config.moe_intermediate_size = 32
+    config.num_experts = 128
+    config.top_k_experts = 8
+    config.hidden_size = 2816
+    config.rms_norm_eps = 1e-6
+
+    torch.manual_seed(42)
+    original_router = modeling_gemma4.Gemma4TextRouter(config)
+    litert_router = patch.LiteRTGemma4TextRouter(config)
+
+    # Copy weights
+    with torch.no_grad():
+      litert_router.proj.weight.copy_(original_router.proj.weight)
+      litert_router.scale.copy_(original_router.scale)
+      litert_router.per_expert_scale.copy_(original_router.per_expert_scale)
+
+    batch_size = 2
+    seq_len = 4
+    hidden_states = torch.randn(batch_size * seq_len, config.hidden_size)
+
+    with torch.no_grad():
+      orig_probs, orig_weights, orig_index = original_router(hidden_states)
+      lrt_probs, lrt_weights, lrt_index = litert_router(hidden_states)
+
+    self.assertTrue(
+        torch.allclose(orig_probs, lrt_probs, rtol=1e-5, atol=1e-5),
+        "Router probabilities mismatch.",
+    )
+    self.assertTrue(
+        torch.equal(orig_index, lrt_index.long()),
+        "Router top-k indices mismatch.",
+    )
+    self.assertTrue(
+        torch.allclose(orig_weights, lrt_weights, rtol=1e-5, atol=1e-5),
+        "Router top-k weights mismatch.",
+    )
+
+  def test_gemma4_26b_experts_litert_moe_equivalence(self):
+    config = _get_dummy_gemma4_text_config()
+    config.num_experts = 128
+    config.top_k_experts = 8
+    config.hidden_size = 2816
+    config.moe_intermediate_size = 704
 
     torch.manual_seed(42)
     experts = modeling_gemma4.Gemma4TextExperts(config)
     experts.config = config
     with torch.no_grad():
-      experts.gate_up_proj.normal_()
-      experts.down_proj.normal_()
+      experts.gate_up_proj.normal_(std=0.02)
+      experts.down_proj.normal_(std=0.02)
 
-    batch_size = 2
-    seq_len = 5
+    batch_size = 1
+    seq_len = 4
     hidden_states = torch.randn(batch_size * seq_len, config.hidden_size)
     top_k_index = torch.randint(
         0, config.num_experts, (batch_size * seq_len, config.top_k_experts)
@@ -246,7 +288,124 @@ class PatchTest(parameterized.TestCase):
 
     self.assertTrue(
         torch.allclose(expected_output, actual_output, rtol=1e-4, atol=1e-4),
-        "Gemma4TextExperts vs litert_moe_experts_forward mismatch.\n"
+        "Gemma4 26B MoE Experts vs litert_moe_experts_forward mismatch.\n"
+        f"Max diff: {(expected_output - actual_output).abs().max().item()}\n"
+        f"Expected: {expected_output}\nActual: {actual_output}",
+    )
+
+  def test_gemma4_26b_experts_pre_flattened_litert_moe_equivalence(self):
+    config = _get_dummy_gemma4_text_config()
+    config.num_experts = 128
+    config.top_k_experts = 8
+    config.hidden_size = 2816
+    config.moe_intermediate_size = 704
+
+    torch.manual_seed(42)
+    experts = modeling_gemma4.Gemma4TextExperts(config)
+    experts.config = config
+    with torch.no_grad():
+      experts.gate_up_proj.normal_(std=0.02)
+      experts.down_proj.normal_(std=0.02)
+
+    batch_size = 1
+    seq_len = 4
+    hidden_states = torch.randn(batch_size * seq_len, config.hidden_size)
+    top_k_index = torch.randint(
+        0, config.num_experts, (batch_size * seq_len, config.top_k_experts)
+    )
+    top_k_weights = torch.softmax(
+        torch.randn(batch_size * seq_len, config.top_k_experts), dim=-1
+    )
+
+    with torch.no_grad():
+      expected_output = experts(hidden_states, top_k_index, top_k_weights)
+
+    export_lib.pre_flatten_model_experts(experts)
+
+    self.assertTrue(hasattr(experts, "flattened_gate_weight"))
+    self.assertTrue(hasattr(experts, "flattened_ff1_weight"))
+    self.assertTrue(hasattr(experts, "flattened_linear_weight"))
+    self.assertTrue(hasattr(experts, "per_expert_scale"))
+    self.assertFalse(hasattr(experts, "gate_up_proj"))
+    self.assertFalse(hasattr(experts, "down_proj"))
+
+    with torch.no_grad():
+      actual_output = moe.litert_moe_experts_forward(
+          experts, hidden_states, top_k_index, top_k_weights
+      )
+
+    self.assertTrue(
+        torch.allclose(expected_output, actual_output, rtol=1e-4, atol=1e-4),
+        "Pre-flattened Gemma4 26B MoE Experts mismatch.\n"
+        f"Max diff: {(expected_output - actual_output).abs().max().item()}\n"
+        f"Expected: {expected_output}\nActual: {actual_output}",
+    )
+
+  def test_gemma4_decoder_layer_with_moe(self):
+    config = _get_dummy_gemma4_text_config()
+    config.enable_moe_block = True
+    config.num_experts = 8
+    config.top_k_experts = 2
+    config.moe_intermediate_size = 32
+    config.hidden_size = 64
+    config.rms_norm_eps = 1e-6
+    config.hidden_size_per_layer_input = 0
+
+    torch.manual_seed(42)
+    layer = modeling_gemma4.Gemma4TextDecoderLayer(config, layer_idx=0)
+    with torch.no_grad():
+      layer.experts.gate_up_proj.normal_(std=0.02)
+      layer.experts.down_proj.normal_(std=0.02)
+    layer.eval()
+
+    batch_size = 2
+    seq_len = 4
+    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+    position_embeddings = _get_dummy_position_embeddings(
+        batch_size, seq_len, config.head_dim
+    )
+    attention_mask = torch.ones(
+        (batch_size, 1, seq_len, seq_len), dtype=torch.bool
+    )
+    shared_kv_states = {}
+
+    with torch.no_grad():
+      expected_output = layer(
+          hidden_states=hidden_states,
+          position_embeddings=position_embeddings,
+          attention_mask=attention_mask,
+          shared_kv_states=shared_kv_states,
+      )
+
+    with patch.gemma4_litert_patch():
+      patched_config = _get_dummy_gemma4_text_config()
+      patched_config.enable_moe_block = True
+      patched_config.num_experts = 8
+      patched_config.top_k_experts = 2
+      patched_config.moe_intermediate_size = 32
+      patched_config.hidden_size = 64
+      patched_config.rms_norm_eps = 1e-6
+      patched_config.hidden_size_per_layer_input = 0
+      patched_config._experts_implementation = "litert_moe"
+
+      patched_layer = modeling_gemma4.Gemma4TextDecoderLayer(
+          patched_config, layer_idx=0
+      )
+      # Copy layer weights
+      patched_layer.load_state_dict(layer.state_dict())
+      patched_layer.eval()
+
+      with torch.no_grad():
+        actual_output = patched_layer(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+        )
+
+    self.assertTrue(
+        torch.allclose(expected_output, actual_output, rtol=1e-4, atol=1e-4),
+        "Gemma4TextDecoderLayer with MoE block mismatch.\n"
         f"Max diff: {(expected_output - actual_output).abs().max().item()}\n"
         f"Expected: {expected_output}\nActual: {actual_output}",
     )
