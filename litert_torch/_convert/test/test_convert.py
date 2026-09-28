@@ -658,6 +658,32 @@ class TestConvert(googletest.TestCase):
         atol=1e-4,
     )
 
+  def test_runtime_folding_removes_constant_subgraph(self):
+    """Runtime folding must replace input-independent ops with constants."""
+
+    def mask(n, value):
+      # Built from constants only, the way Swin builds its attention mask.
+      m = torch.zeros((n, n))
+      m[: n // 2, n // 2 :] = value
+      return m.masked_fill(m != 0, -100.0 * value)
+
+    class MaskedAdd(nn.Module):
+
+      def forward(self, x, y, z):
+        # x and y get same-shape masks with different values, z a different
+        # shape: each folded array must land in its own constant.
+        return x + mask(8, 1.0), y + mask(8, 2.0), z + mask(4, 3.0)
+
+    model = MaskedAdd().eval()
+    args = (torch.randn(8, 8), torch.randn(8, 8), torch.randn(4, 4))
+    em = litert_torch.convert(model, args, runtime_constant_folding=True)
+
+    interpreter = tfl_interpreter.Interpreter(model_content=em.model_content())
+    op_names = [op["op_name"] for op in interpreter._get_ops_details()]
+    self.assertEqual(op_names, ["ADD", "ADD", "ADD"])
+    for got, want in zip(em(*args), model(*args)):
+      np.testing.assert_allclose(got, want.detach().numpy(), atol=1e-4)
+
   def test_compile_model(self):
     """Tests AOT compilation of a simple Add module."""
 

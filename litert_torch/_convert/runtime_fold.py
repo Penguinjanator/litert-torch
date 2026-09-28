@@ -63,16 +63,17 @@ class RuntimeFoldPass(mu.core.ModulePassBase):
         cst_values.update(op.results)
         cst_ops.append(op)
 
+    # Walk cst_ops (not the cst_values set) so the order matches the output
+    # order of the constant-only module, which appends outputs in op order.
+    # Set iteration order is arbitrary, and a mismatch pairs folded arrays with
+    # the wrong constants.
     output_cst_values = []
-    for val in cst_values:
-      owner = val.owner
-      if (
-          owner
-          and "tfl.no_value" not in owner.name
-          and not isinstance(owner, tfl.ConstOp)
-          and any(use.operation not in cst_ops for use in val.uses)
-      ):
-        output_cst_values.append(val)
+    for op in cst_ops:
+      if "tfl.no_value" in op.name or isinstance(op, tfl.ConstOp):
+        continue
+      for val in op.results:
+        if any(use.operation not in cst_ops for use in val.uses):
+          output_cst_values.append(val)
 
     return cst_ops, output_cst_values
 
@@ -180,6 +181,12 @@ class RuntimeFoldPass(mu.core.ModulePassBase):
 
     log(f"Replacing {len(output_cst_values)} constants in module")
     for val, arr in zip(output_cst_values, cst_np_arrs):
+      expected_shape = tuple(cast(mlir.RankedTensorType, val.type).shape)
+      if arr.shape != expected_shape:
+        raise AssertionError(
+            f"Runtime fold output shape {arr.shape} does not match constant"
+            f" type {val.type}."
+        )
       ir_attr = ir.DenseResourceElementsAttr.get_from_buffer(
           memoryview(arr),
           f"runtime_fold_{id(arr)}",
