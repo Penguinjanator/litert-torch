@@ -97,6 +97,8 @@ def export(
     use_qkv_norm_rope_composite: bool | None = None,
     use_short_conv_composite: bool | None = None,
     use_sdpa_composite: bool | None = None,
+    apply_gpu_composites: bool | None = None,
+    use_bool_mask: bool | None = None,
     prefill_logits: bool | None = None,
     externalize_embedder: bool | None = None,
     single_token_embedder: bool | None = None,
@@ -170,7 +172,12 @@ def export(
       numbers) for cache length.
     use_rope_composite: Whether to enable the RoPE composite.
     use_qkv_norm_rope_composite: Whether to enable the QKV norm rope composite.
-    use_sdpa_composite: Whether to enable the fused transposed SDPA composite.
+    use_sdpa_composite: Whether to enable the fused transposed SDPA composite
+      in both prefill and decode signatures.
+    apply_gpu_composites: Master switch for GPU composite emission. Implied by
+      use_sdpa_composite.
+    use_bool_mask: Whether to use a boolean attention mask instead of
+      materializing fp32 mask constants.
     prefill_logits: Whether the prefill signature returns logits for the final
       position. Defaults to on only when multi-output composites
       (`use_qkv_norm_rope_composite` or `use_short_conv_composite`) are enabled,

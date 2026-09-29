@@ -15,9 +15,11 @@
 """Exportable modules."""
 
 import dataclasses
+import difflib
 import enum
 import pprint
 from typing import Any
+import warnings
 
 from litert_torch.generative.export_hf.core import utils
 from litert_torch.generative.export_hf.experimental.npu_export.configs import vendor_configs
@@ -30,6 +32,22 @@ class ExportTask(str, enum.Enum):
   MULTIMODAL_LM = "multimodal_lm"
   AUTOMATIC_SPEECH_RECOGNITION = "automatic_speech_recognition"
   TEXT_TO_SPEECH = "text_to_speech"
+
+
+# Keys that are legitimately passed through to model-specific code via
+# `extra_kwargs`. Anything else is rejected so that a mistyped flag fails loudly
+# instead of being silently ignored.
+_KNOWN_EXTRA_KWARGS = frozenset({
+    "gemma4_vision_max_soft_tokens",
+    "litert_samples_conversion_dir",
+    "targets",
+})
+
+# Legacy flag names accepted for one release, mapped in `__post_init__`.
+_DEPRECATED_EXTRA_KWARGS = frozenset({
+    "use_sdpa_composite",
+    "use_sdpa_composite_for_prefill",
+})
 
 
 @dataclasses.dataclass
@@ -74,7 +92,13 @@ class ExportableModuleConfig:
   use_swiglu_composite: bool = False
   use_qkv_norm_rope_composite: bool = False
   use_short_conv_composite: bool = False
+  # Whether to emit the fused `odml.sdpa_transposed` composite in both prefill
+  # and decode signatures.
   use_sdpa_composite: bool = False
+  # Master switch for GPU composite emission. Implied by use_sdpa_composite.
+  apply_gpu_composites: bool = False
+  # Use a boolean attention mask instead of materializing fp32 mask constants.
+  use_bool_mask: bool = False
   # Whether the prefill signature returns logits for the final position.
   # The LiteRT-LM runtime samples from the decode signature and never reads
   # the prefill logits, so emitting them adds a vocabulary-sized `lm_head`
@@ -148,8 +172,80 @@ class ExportableModuleConfig:
   prefill_length_dim: torch.export.Dim | None = None
   externalize_rope: bool = False
 
+  def _normalize_sdpa_composite(self):
+    """Normalizes `use_sdpa_composite` and maps legacy `extra_kwargs` flags.
+
+    Historically `use_sdpa_composite_for_prefill` was an undeclared
+    `extra_kwargs` flag needed to enable `odml.sdpa_transposed` in the prefill
+    signature. `use_sdpa_composite=True` now enables the composite in both
+    prefill and decode; the legacy prefill flag is accepted with a
+    `DeprecationWarning`.
+    """
+    legacy_prefill = self.extra_kwargs.pop(
+        "use_sdpa_composite_for_prefill", None
+    )
+    legacy_decode = self.extra_kwargs.pop("use_sdpa_composite", None)
+    if legacy_decode is not None and not self.use_sdpa_composite:
+      self.use_sdpa_composite = legacy_decode
+
+    if legacy_prefill is not None:
+      warnings.warn(
+          "use_sdpa_composite_for_prefill is deprecated; use"
+          " use_sdpa_composite=True.",
+          DeprecationWarning,
+          stacklevel=3,
+      )
+      if legacy_prefill:
+        self.use_sdpa_composite = True
+
+    if not isinstance(self.use_sdpa_composite, bool):
+      raise TypeError(
+          "use_sdpa_composite must be bool, got"
+          f" {type(self.use_sdpa_composite).__name__}."
+      )
+
+    # The fused SDPA kernels are only reachable on the GPU composite path, so
+    # enabling them implies the master switch. Centralizing the implication here
+    # keeps the prefill/decode traces and their sample inputs consistent.
+    if self.use_sdpa_composite:
+      self.apply_gpu_composites = True
+
+    # Transitional: several call sites still read these through `extra_kwargs`.
+    # Mirror the typed fields so they observe the resolved values.
+    # TODO: Migrate those readers to the typed fields and drop this.
+    self.extra_kwargs["apply_gpu_composites"] = self.apply_gpu_composites
+    self.extra_kwargs["use_bool_mask"] = self.use_bool_mask
+
+  def _validate_extra_kwargs(self):
+    """Rejects unrecognized `extra_kwargs` keys.
+
+    `export()` funnels every unrecognized keyword argument into `extra_kwargs`,
+    so without this check a mistyped flag is silently ignored and the model is
+    exported without the requested optimization.
+    """
+    known = (
+        _KNOWN_EXTRA_KWARGS
+        | _DEPRECATED_EXTRA_KWARGS
+        | {f.name for f in dataclasses.fields(self)}
+    )
+    unknown = sorted(set(self.extra_kwargs) - known)
+    if not unknown:
+      return
+    details = []
+    for key in unknown:
+      close = difflib.get_close_matches(key, sorted(known), n=3, cutoff=0.7)
+      hint = f" (did you mean: {', '.join(close)}?)" if close else ""
+      details.append(f"  {key}{hint}")
+    raise ValueError(
+        "Unrecognized export flag(s):\n"
+        + "\n".join(details)
+        + "\nPass them via extra_kwargs={...} if this is intentional."
+    )
+
   def __post_init__(self):
     """Refines configuration based on task-specific rules."""
+    self._validate_extra_kwargs()
+    self._normalize_sdpa_composite()
     if self.prefill_logits is None:
       self.prefill_logits = bool(
           self.use_qkv_norm_rope_composite or self.use_short_conv_composite
