@@ -1221,9 +1221,36 @@ def _strided_index(sizes, strides, storage_offset=None):
   return ind
 
 
+def _is_contiguous_view(sizes, strides) -> bool:
+  """Whether (sizes, strides) walks row-major storage with no gaps or repeats.
+
+  Strides of size-1 dims are ignored: they never contribute to an offset, and
+  eager torch leaves them arbitrary (e.g. `mean` of a channels-last tensor
+  yields sizes [1, C, 1, 1] with strides [C, 1, C, C]).
+  """
+  expected = 1
+  for size, stride in reversed(list(zip(sizes, strides))):
+    if size != 1 and stride != expected:
+      return False
+    expected *= size
+  return True
+
+
 @op(torch.ops.aten.as_strided)
 @op(torch.ops.aten.as_strided_copy)
 def _aten_as_strided(x, sizes, strides, storage_offset=None):
+  offset = storage_offset or 0
+  static = all(isinstance(v, int) for v in (*sizes, *strides, offset))
+  if static and _is_contiguous_view(sizes, strides):
+    # A contiguous window of storage is a slice + reshape; avoid the generic
+    # index gather, which GPU delegates generally cannot run.
+    numel = math.prod(sizes)
+    if offset + numel <= x.size:
+      flattened = jnp.ravel(x)
+      if offset != 0 or numel != x.size:
+        flattened = jax.lax.slice(flattened, (offset,), (offset + numel,))
+      return jnp.reshape(flattened, sizes)
+
   ind = _strided_index(sizes, strides, storage_offset)
   flattened = jnp.ravel(x)
   return flattened[ind]

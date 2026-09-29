@@ -175,6 +175,8 @@ class TestCoreAtenOps(parameterized.TestCase):
       ("aten_argmax_0", torch.ops.aten.argmax, (rnd(torch.float32, (10, 10)),), dict()),
       ("aten_argmin_0", torch.ops.aten.argmin, (rnd(torch.float32, (10, 10)),), dict()),
       ("aten_as_strided_0", torch.ops.aten.as_strided, (rnd(torch.float32, (10, 10)), [2, 2, 2], [8, 4, 1],), dict()),
+      ("aten_as_strided_1", torch.ops.aten.as_strided, (rnd(torch.float32, (1, 768)), [1, 768, 1, 1], [768, 1, 768, 768],), dict()),
+      ("aten_as_strided_2", torch.ops.aten.as_strided, (rnd(torch.float32, (10, 10)), [4, 5], [5, 1], 20,), dict()),
       ("aten_as_strided_copy_0", torch.ops.aten.as_strided_copy, (rnd(torch.float32, (10, 10)), [5, 5], [2, 2],), dict()),
       ("aten_asin_0", torch.ops.aten.asin, (rnd(torch.float32, (10, 10)),), dict()),
       ("aten_asinh_0", torch.ops.aten.asinh, (rnd(torch.float32, (10, 10)),), dict()),
