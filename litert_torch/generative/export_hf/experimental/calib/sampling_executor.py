@@ -726,7 +726,7 @@ class Executor:
     for i in range(suffix_tokens.shape[1]):
       decode_state = self.decode_step(decode_state, suffix_tokens[:, i : i + 1])
       # Collects the prob of i-th token in the suffix.
-      logits = decode_state.logits[0, -1, :]  # [V]
+      logits = decode_state.logits[0, -1, :]  # [V]  # pyrefly: ignore[unsupported-operation]
       token = suffix_tokens[0, i : i + 1]  # [1]
       probs = torch.nn.functional.softmax(torch.tensor(logits), dim=-1).numpy()
       ret = np.concatenate([ret, probs[token]])  # [S]

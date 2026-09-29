@@ -586,9 +586,9 @@ class Qwen3_5StaticDecoderLayer(nn.Module):
           layer_idx=layer_idx,
       )
     elif self.block_type == "full_attention":
-      self.self_attn = Qwen3_5Attention(config, layer_idx)
+      self.self_attn = Qwen3_5Attention(config, layer_idx)  # pyrefly: ignore[bad-argument-type]
     self.mlp = Qwen3_5MLP(
-        config,
+        config,  # pyrefly: ignore[bad-argument-type]
         config.intermediate_size,
     )
     self.input_layernorm = Qwen3_5RMSNorm(
