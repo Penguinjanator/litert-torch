@@ -23,6 +23,7 @@ from litert_torch._convert.converter_v2 import convert
 from litert_torch._convert.converter_v2 import convert_signatures_v2
 from litert_torch._convert.converter_v2 import Converter
 from litert_torch._convert.converter_v2 import export_to_dir
+from litert_torch._convert.converter_v2 import is_supported
 from litert_torch._convert.converter_v2 import ParameterRegistry
 from litert_torch._convert.converter_v2 import signature
 
@@ -31,6 +32,7 @@ __all__ = [
     "convert_signatures_v2",
     "Converter",
     "export_to_dir",
+    "is_supported",
     "ParameterRegistry",
     "signature",
 ]

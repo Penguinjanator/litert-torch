@@ -17,6 +17,7 @@
 import json
 import os
 import types
+from unittest import mock
 
 import litert_torch
 from litert_torch import converter_v2
@@ -77,6 +78,10 @@ class TestConverterV2(googletest.TestCase):
 
   def setUp(self):
     super().setUp()
+    if not converter_v2_lib.is_supported():
+      self.skipTest(
+          "Converter V2 is not supported by the installed TensorFlow."
+      )
     torch.manual_seed(42)
 
   def test_single_signature_conversion(self):
@@ -458,6 +463,16 @@ class TestConverterV2(googletest.TestCase):
         rtol=1e-3,
         atol=1e-3,
     )
+
+  def test_is_supported(self):
+    self.assertTrue(converter_v2_lib.is_supported())
+
+  def test_unsupported_tensorflow_raises_actionable_error(self):
+    with mock.patch.object(
+        converter_v2_lib, "is_supported", return_value=False
+    ):
+      with self.assertRaisesRegex(RuntimeError, "requires a newer TensorFlow"):
+        converter_v2_lib._build_tfl_converter_flags()
 
 
 if __name__ == "__main__":

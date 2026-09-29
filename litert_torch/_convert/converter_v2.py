@@ -25,6 +25,7 @@ intermediate file formats.
 from __future__ import annotations
 
 from collections.abc import Callable
+import functools
 import gc
 import json
 import logging
@@ -32,7 +33,7 @@ import os
 import shutil
 import tempfile
 import time
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, TYPE_CHECKING
 import uuid
 
 from litert_torch import backend
@@ -44,8 +45,48 @@ from litert_torch._convert import litert_converter
 from litert_torch._convert import signature as signature_module
 import torch
 
-from tensorflow.compiler.mlir.lite import converter_flags_pb2
-from tensorflow.lite.python import convert as tfl_convert
+# TensorFlow is imported lazily: this module is imported by
+# `litert_torch/__init__.py`, and the OSS `litert-torch` package does not depend
+# on TensorFlow, so a module-level import would break `import litert_torch`.
+if TYPE_CHECKING:
+  from tensorflow.compiler.mlir.lite import converter_flags_pb2  # pylint: disable=g-import-not-at-top,g-bad-import-order
+
+# ConverterFlags fields set by `_build_tfl_converter_flags`.
+_REQUIRED_CONVERTER_FLAGS = (
+    "enable_composite_direct_lowering",
+    "fold_fp16_resource_casts",
+    "enable_debug",
+    "debug_dir",
+)
+
+
+@functools.cache
+def is_supported() -> bool:
+  """Returns whether the installed TensorFlow supports the V2 MLIR pipeline.
+
+  Older TensorFlow builds (e.g. the last tf-nightly with Python 3.10 wheels)
+  predate the `ConverterFlags` fields and the `convert_mlir_bytecode` entry
+  point that the V2 converter relies on.
+  """
+  try:
+    from tensorflow.compiler.mlir.lite import converter_flags_pb2  # pylint: disable=g-import-not-at-top,redefined-outer-name
+    from tensorflow.lite.python import convert as tfl_convert  # pylint: disable=g-import-not-at-top
+  except ImportError:
+    return False
+  fields = converter_flags_pb2.ConverterFlags.DESCRIPTOR.fields_by_name
+  return hasattr(tfl_convert, "convert_mlir_bytecode") and all(
+      name in fields for name in _REQUIRED_CONVERTER_FLAGS
+  )
+
+
+def _check_supported() -> None:
+  if not is_supported():
+    raise RuntimeError(
+        "LiteRT Torch Converter V2 requires a newer TensorFlow build that"
+        " provides `tensorflow.lite.python.convert.convert_mlir_bytecode` and"
+        " the matching `ConverterFlags` fields. Upgrade `tf-nightly` (Python"
+        " >= 3.11) or use the default converter (use_v2=False)."
+    )
 
 
 def _apply_tfl_converter_flags(
@@ -53,6 +94,7 @@ def _apply_tfl_converter_flags(
     tfl_converter_flags: dict[str, Any],
 ) -> None:
   """Applies TFLite converter flags to ConverterFlags proto."""
+  from tensorflow.compiler.mlir.lite import converter_flags_pb2  # pylint: disable=g-import-not-at-top,redefined-outer-name
 
   def _normalize_flag_name(name: str) -> str:
     if name.startswith("_experimental_"):
@@ -96,18 +138,16 @@ def _apply_tfl_converter_flags(
   _iterate_dict_tree(tfl_converter_flags, [])
 
 
-def _get_param_id(
-    p: torch.Tensor, origin: torch.Tensor | None = None
-) -> Any:
+def _get_param_id(p: torch.Tensor, origin: torch.Tensor | None = None) -> Any:
   """Returns a unique fingerprint for a parameter tensor to enable deduplication.
 
   Args:
     p: The tensor to fingerprint.
-    origin: For meta tensors, the module parameter/buffer `p` was exported
-      from. Meta tensors have no storage, so identity of the originating module
-      tensor is the only reliable way to tell shared weights (same object
-      reached via different signatures) from distinct weights that happen to
-      share a relative FQN. Falls back to `p` itself.
+    origin: For meta tensors, the module parameter/buffer `p` was exported from.
+      Meta tensors have no storage, so identity of the originating module tensor
+      is the only reliable way to tell shared weights (same object reached via
+      different signatures) from distinct weights that happen to share a
+      relative FQN. Falls back to `p` itself.
   """
   if p.device.type == "meta":
     anchor = origin if origin is not None else p
@@ -577,6 +617,9 @@ def _build_tfl_converter_flags(
     _litert_converter_flags: Optional[dict[str, Any]] = None,
 ) -> converter_flags_pb2.ConverterFlags:
   """Builds ConverterFlags proto with standard V2 flags and user overrides."""
+  _check_supported()
+  from tensorflow.compiler.mlir.lite import converter_flags_pb2  # pylint: disable=g-import-not-at-top,redefined-outer-name
+
   flags = converter_flags_pb2.ConverterFlags()
   flags.model_origin_framework = converter_flags_pb2.ConverterFlags.PYTORCH
   flags.enable_composite_direct_lowering = True
@@ -688,6 +731,17 @@ def _log_benchmark_summary(
     pass
 
 
+def _convert_mlir_bytecode(
+    conversion_flags: converter_flags_pb2.ConverterFlags,
+    input_dir: str,
+    output_path: str,
+) -> None:
+  """Runs the LiteRT converter MLIR pipeline on exported intermediates."""
+  from tensorflow.lite.python import convert as tfl_convert  # pylint: disable=g-import-not-at-top
+
+  tfl_convert.convert_mlir_bytecode(conversion_flags, input_dir, output_path)
+
+
 def convert_signatures_v2(
     signatures: list[signature_module.Signature],
     *,
@@ -776,9 +830,7 @@ def convert_signatures_v2(
     )
     t_mlir_start = time.perf_counter()
     with progress.task("MLIR Pipeline Execution"):
-      tfl_convert.convert_mlir_bytecode(
-          conversion_flags, export_dir, target_path
-      )
+      _convert_mlir_bytecode(conversion_flags, export_dir, target_path)
     t_mlir_duration = time.perf_counter() - t_mlir_start
     t_total_convert = time.perf_counter() - t_conv_start
 
@@ -846,9 +898,7 @@ def convert_signatures_v2(
       )
       t_mlir_start = time.perf_counter()
       with progress.task("MLIR Pipeline Execution"):
-        tfl_convert.convert_mlir_bytecode(
-            conversion_flags, temp_dir, target_path
-        )
+        _convert_mlir_bytecode(conversion_flags, temp_dir, target_path)
       t_mlir_duration = time.perf_counter() - t_mlir_start
       t_total_convert = time.perf_counter() - t_conv_start
 

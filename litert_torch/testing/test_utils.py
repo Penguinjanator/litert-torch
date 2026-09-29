@@ -38,6 +38,10 @@ class V1V2TestCase(googletest.TestCase):
     self.addCleanup(setattr, litert_torch, "Converter", _ORIG_CONVERTER_CLS)
 
     use_v2 = getattr(self, "use_v2", False)
+    if use_v2 and not litert_torch.converter_v2.is_supported():
+      self.skipTest(
+          "Converter V2 is not supported by the installed TensorFlow."
+      )
 
     def patched_convert(*args, **kwargs):
       kwargs.setdefault("use_v2", use_v2)
