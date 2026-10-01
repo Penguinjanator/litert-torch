@@ -280,3 +280,39 @@ fx_infra.decomp.add_pre_convert_decomp(
 fx_infra.decomp.add_pre_convert_decomp(
     torch.ops.aten.pixel_unshuffle.default, _pixel_unshuffle_rank4
 )
+
+
+# Override the linear decomposition for non-contiguous inputs of rank >= 3.
+# Torch's matmul only folds the batch dims of a contiguous input into a 2-D
+# matmul; otherwise, to avoid a copy in eager mode, it broadcasts the weight to
+# the input's full rank and emits a batched matmul. After a windowing
+# transpose (Twins, Swin-style attention) that is a rank-5/6 BROADCAST_TO +
+# BATCH_MATMUL, and every tensor downstream of it stays at that rank. On the
+# converted graph the copy costs nothing extra -- a TRANSPOSE is materialized
+# either way -- so always fold: reshape the input to 2-D and use addmm.
+#
+# The remaining cases mirror at::linear (aten/src/ATen/native/Linear.cpp).
+# Calling the default decomposition from here would recurse into this override.
+def _linear_fold_batch_dims(x, weight, bias=None):
+  if x.dim() == 2 and bias is not None:
+    return torch.addmm(bias, x, weight.t())
+  fold = x.dim() >= 3 and (
+      not x.is_contiguous() or (bias is not None and x.dim() == 3)
+  )
+  if fold:
+    out_features = weight.shape[0]
+    x2d = x.reshape(-1, x.shape[-1])
+    if bias is None:
+      out = torch.mm(x2d, weight.t())
+    else:
+      out = torch.addmm(bias, x2d, weight.t())
+    return out.reshape(*x.shape[:-1], out_features)
+  out = torch.matmul(x, weight.t())
+  if bias is not None:
+    out = out + bias
+  return out
+
+
+fx_infra.decomp.add_pre_convert_decomp(
+    torch.ops.aten.linear.default, _linear_fold_batch_dims
+)
