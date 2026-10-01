@@ -282,6 +282,32 @@ class BuildLlmMetadataStartTokenTest(parameterized.TestCase):
     )
     self.assertTrue(metadata.llm_model_type.HasField("qwen3"))
 
+  def test_build_llm_metadata_gemma3_text_model_type(self):
+    class _FakeConfig:
+      model_type = "gemma3_text"
+
+    class _FakeModelWithConfig:
+      config = _FakeConfig()
+      generation_config = None
+
+    tokenizer = _FakeTokenizer(
+        bos_token=None, bos_token_id=None, prepends_bos=False
+    )
+    source_artifacts = export_lib.SourceModelArtifacts(
+        model=_FakeModelWithConfig(),
+        model_config=_FakeConfig(),  # pyrefly: ignore[bad-argument-type]
+        text_model_config=_FakeConfig(),  # pyrefly: ignore[bad-argument-type]
+        tokenizer=tokenizer,
+    )
+    export_config = exportable_module.ExportableModuleConfig(
+        model="dummy",
+    )
+    exported_artifacts = export_lib.ExportedModelArtifacts()
+    metadata = litert_lm_builder.build_llm_metadata(
+        source_artifacts, export_config, "", exported_artifacts
+    )
+    self.assertTrue(metadata.llm_model_type.HasField("gemma3"))
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -351,7 +351,7 @@ def build_llm_metadata(
       llm_metadata.llm_model_type.CopyFrom(
           llm_model_type_pb2.LlmModelType(qwen2p5=llm_model_type_pb2.Qwen2p5())
       )
-    case 'gemma3':
+    case 'gemma3' | 'gemma3_text':
       llm_metadata.llm_model_type.CopyFrom(
           llm_model_type_pb2.LlmModelType(gemma3=llm_model_type_pb2.Gemma3())
       )
