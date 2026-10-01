@@ -81,6 +81,57 @@ class QkvNormRopeTest(parameterized.TestCase):
     edge_model = litert_torch.convert(module, (qkv, position))
     self.assertIsNotNone(edge_model)
 
+  def test_apply_qkv_norm_rope_with_v_norm_and_proportion(self):
+    batch_size = 1
+    seq_len = 4
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 16
+
+    total_dim = (num_heads + 2 * num_kv_heads) * head_dim
+    qkv = torch.randn(batch_size, seq_len, total_dim)
+    position = torch.arange(seq_len).unsqueeze(0)
+    q_weight = torch.ones(head_dim)
+    k_weight = torch.ones(head_dim)
+
+    q_out, k_out, v_out = qkv_norm_rope.apply_qkv_norm_rope(
+        qkv,
+        position,
+        q_weight,
+        k_weight,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        base=1000000.0,
+        eps=1e-6,
+        proportion=0.25,
+        has_v_norm=True,
+    )
+    self.assertEqual(q_out.shape, (batch_size, num_heads, seq_len, head_dim))
+    self.assertEqual(k_out.shape, (batch_size, num_kv_heads, seq_len, head_dim))
+    self.assertEqual(v_out.shape, (batch_size, num_kv_heads, seq_len, head_dim))
+
+  def test_apply_q_only_norm_rope(self):
+    batch_size = 1
+    seq_len = 4
+    num_heads = 4
+    head_dim = 16
+
+    q = torch.randn(batch_size, seq_len, num_heads * head_dim)
+    position = torch.arange(seq_len).unsqueeze(0)
+    q_weight = torch.ones(head_dim)
+
+    q_out = qkv_norm_rope.apply_q_norm_rope(
+        q,
+        position,
+        q_weight,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        base=10000.0,
+        eps=1e-6,
+    )
+    self.assertEqual(q_out.shape, (batch_size, num_heads, seq_len, head_dim))
+
 
 if __name__ == "__main__":
   googletest.main()

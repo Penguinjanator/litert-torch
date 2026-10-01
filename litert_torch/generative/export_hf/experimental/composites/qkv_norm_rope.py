@@ -29,8 +29,10 @@ def apply_qkv_norm_rope(
     head_dim: int,
     base: float = 1000000.0,
     eps: float = 1e-6,
+    has_v_norm: bool = False,
+    proportion: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Computes fused QKV split, RMSNorm on Q & K, and RoPE on Q & K from linear qkv tensor.
+  """Computes fused QKV split, RMSNorm on Q & K (and optionally V), and RoPE on Q & K.
 
   Args:
     qkv: Fused QKV tensor with shape [B, T, (num_heads + 2 * num_kv_heads) * head_dim].
@@ -42,6 +44,8 @@ def apply_qkv_norm_rope(
     head_dim: Dimension of each attention head.
     base: RoPE theta base value (default 1000000.0).
     eps: Epsilon for RMSNorm (default 1e-6).
+    has_v_norm: Whether to apply unscaled RMSNorm to V (e.g. Gemma 4).
+    proportion: Fraction of head_dim to apply RoPE to (default 1.0).
 
   Returns:
     q_out: Transformed, normed, and roped query states [B, num_heads, T, head_dim].
@@ -54,8 +58,9 @@ def apply_qkv_norm_rope(
       "head_dim": int(head_dim),
       "min_timescale": 1.0,
       "max_timescale": float(base),
-      "proportion": 1.0,
+      "proportion": float(proportion),
       "epsilon": float(eps),
+      "has_v_norm": bool(has_v_norm),
   }
   builder = composite.StableHLOCompositeBuilder(
       name="odml.qkv_norm_rope", attr=attrs
@@ -77,18 +82,29 @@ def apply_qkv_norm_rope(
   k_reshaped = k.view(hidden_shape_kv)
   v_reshaped = v.view(hidden_shape_kv)
 
-  def _rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
+  def _rms_norm(
+      x: torch.Tensor, weight: torch.Tensor, epsilon: float
+  ) -> torch.Tensor:
     variance = x.pow(2).mean(-1, keepdim=True)
     return x * torch.rsqrt(variance + epsilon) * weight
 
   q_normed = _rms_norm(q_reshaped, q_weight, eps).transpose(1, 2)
   k_normed = _rms_norm(k_reshaped, k_weight, eps).transpose(1, 2)
+  if has_v_norm:
+    v_variance = v_reshaped.pow(2).mean(-1, keepdim=True)
+    v_reshaped = v_reshaped * torch.rsqrt(v_variance + eps)
   v_out = v_reshaped.transpose(1, 2)
 
   pos = position[0] if position.ndim > 1 else position
-  cos, sin = rotary_pos_emb.build_rope(
-      pos, n_elem=head_dim, base=int(base)
-  )
+  cos, sin = rotary_pos_emb.build_rope(pos, n_elem=head_dim, base=int(base))
+  if proportion < 1.0 and cos is not None:
+    rotary_dim = int(proportion * (head_dim // 2))
+    cos = torch.cat(
+        [cos[..., :rotary_dim], torch.ones_like(cos[..., rotary_dim:])], dim=-1
+    )
+    sin = torch.cat(
+        [sin[..., :rotary_dim], torch.zeros_like(sin[..., rotary_dim:])], dim=-1
+    )
   if cos is not None and cos.ndim == 3:
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
@@ -98,3 +114,70 @@ def apply_qkv_norm_rope(
 
   q_out, k_out, v_out = builder.mark_outputs(q_out, k_out, v_out)
   return q_out, k_out, v_out
+
+
+def apply_q_norm_rope(
+    q: torch.Tensor,
+    position: torch.Tensor,
+    q_weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    base: float = 1000000.0,
+    eps: float = 1e-6,
+    proportion: float = 1.0,
+) -> torch.Tensor:
+  """Computes fused Q reshape, RMSNorm on Q, and RoPE on Q for KV-shared layers.
+
+  Args:
+    q: Query tensor with shape [B, T, num_heads * head_dim].
+    position: 1D or 2D position tensor [B, T] or [T].
+    q_weight: Weight gamma tensor for Q RMSNorm.
+    num_heads: Number of query attention heads.
+    head_dim: Dimension of each attention head.
+    base: RoPE theta base value (default 1000000.0).
+    eps: Epsilon for RMSNorm (default 1e-6).
+    proportion: Fraction of head_dim to apply RoPE to (default 1.0).
+
+  Returns:
+    q_out: Transformed, normed, and roped query states [B, num_heads, T, head_dim].
+  """
+  attrs = {
+      "num_heads": int(num_heads),
+      "num_kv_heads": 0,
+      "head_dim": int(head_dim),
+      "min_timescale": 1.0,
+      "max_timescale": float(base),
+      "proportion": float(proportion),
+      "epsilon": float(eps),
+      "has_v_norm": False,
+  }
+  builder = composite.StableHLOCompositeBuilder(
+      name="odml.qkv_norm_rope", attr=attrs
+  )
+  q, position, q_weight = builder.mark_inputs(q, position, q_weight)
+
+  input_shape = q.shape[:-1]
+  q_reshaped = q.view(*input_shape, num_heads, head_dim)
+  variance = q_reshaped.pow(2).mean(-1, keepdim=True)
+  q_normed = (q_reshaped * torch.rsqrt(variance + eps) * q_weight).transpose(
+      1, 2
+  )
+
+  pos = position[0] if position.ndim > 1 else position
+  cos, sin = rotary_pos_emb.build_rope(pos, n_elem=head_dim, base=int(base))
+  if proportion < 1.0 and cos is not None:
+    rotary_dim = int(proportion * (head_dim // 2))
+    cos = torch.cat(
+        [cos[..., :rotary_dim], torch.ones_like(cos[..., rotary_dim:])], dim=-1
+    )
+    sin = torch.cat(
+        [sin[..., :rotary_dim], torch.zeros_like(sin[..., rotary_dim:])], dim=-1
+    )
+  if cos is not None and cos.ndim == 3:
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
+
+  q_out = rotary_pos_emb.apply_rope(q_normed, cos, sin)
+  q_out = builder.mark_outputs(q_out)
+  return q_out
+

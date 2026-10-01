@@ -24,6 +24,7 @@ def apply_mldrift_compatible_rope(
     position: torch.Tensor,
     base: float = 10000.0,
     head_dim: int | None = None,
+    proportion: float = 1.0,
 ) -> torch.Tensor:
   """Computes RoPE matching MLDrift's existing 2-input/1-output SplitRoPEConcat format.
 
@@ -33,6 +34,7 @@ def apply_mldrift_compatible_rope(
     base: RoPE theta base value (e.g. 10000.0 for standard, 500000.0 for Gemma
       3/4).
     head_dim: Head dimension size (defaults to x.shape[-1]).
+    proportion: Fraction of head_dim to apply RoPE to (default 1.0).
 
   Returns:
     x_roped: Rotated output tensor of identical shape and dtype.
@@ -40,7 +42,7 @@ def apply_mldrift_compatible_rope(
   attrs = {
       "min_timescale": 1.0,
       "max_timescale": float(base),
-      "proportion": 1.0,
+      "proportion": float(proportion),
   }
   builder = composite.StableHLOCompositeBuilder(name="odml.rope", attr=attrs)
   x, position = builder.mark_inputs(x, position)
@@ -51,6 +53,14 @@ def apply_mldrift_compatible_rope(
   cos, sin = rotary_pos_emb.build_rope(
       pos, n_elem=head_dim_size, base=int(base)
   )
+  if proportion < 1.0 and cos is not None:
+    rotary_dim = int(proportion * (head_dim_size // 2))
+    cos = torch.cat(
+        [cos[..., :rotary_dim], torch.ones_like(cos[..., rotary_dim:])], dim=-1
+    )
+    sin = torch.cat(
+        [sin[..., :rotary_dim], torch.zeros_like(sin[..., rotary_dim:])], dim=-1
+    )
   if cos is not None and cos.ndim == 3:
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
@@ -65,9 +75,14 @@ def apply_rope_composite(
     position: torch.Tensor,
     base: float = 10000.0,
     head_dim: int | None = None,
+    proportion: float = 1.0,
     **kwargs,
 ) -> torch.Tensor:
   """Computes rotary positional embedding inline using MLDrift 'rope' Composite."""
   return apply_mldrift_compatible_rope(
-      x=x, position=position, base=base, head_dim=head_dim
+      x=x,
+      position=position,
+      base=base,
+      head_dim=head_dim,
+      proportion=proportion,
   )

@@ -16,6 +16,7 @@
 
 import contextlib
 from litert_torch.backend import optimization_barrier as optimization_barrier_lib
+from litert_torch.generative.export_hf.experimental.composites import qkv_norm_rope
 from litert_torch.generative.export_hf.experimental.composites import rope as rope_composite
 from litert_torch.generative.export_hf.model_ext import patches as patches_lib
 from litert_torch.generative.layers import normalization
@@ -110,6 +111,7 @@ try:
         original_attn: modeling_gemma4.Gemma4TextAttention,
         fuse_qkv: bool = False,
         use_rope_composite: bool = False,
+        use_qkv_norm_rope_composite: bool = False,
     ):
       super().__init__()
       self.o_proj = original_attn.o_proj
@@ -129,7 +131,10 @@ try:
       self.store_full_length_kv = original_attn.store_full_length_kv
       self.layer_type = original_attn.layer_type
 
-      self.fuse_qkv = fuse_qkv and not self.is_kv_shared_layer
+      self.use_qkv_norm_rope_composite = use_qkv_norm_rope_composite
+      self.fuse_qkv = (
+          fuse_qkv or use_qkv_norm_rope_composite
+      ) and not self.is_kv_shared_layer
       self.use_rope_composite = use_rope_composite
 
       self.q_proj = original_attn.q_proj
@@ -174,6 +179,16 @@ try:
       rope_base = 500000.0
       if hasattr(self.config, "rope_parameters") and self.config.rope_parameters:
         if isinstance(self.config.rope_parameters, dict):
+          if (
+              hasattr(self, "layer_type")
+              and self.layer_type in self.config.rope_parameters
+              and isinstance(self.config.rope_parameters[self.layer_type], dict)
+          ):
+            return float(
+                self.config.rope_parameters[self.layer_type].get(
+                    "rope_theta", rope_base
+                )
+            )
           rope_base = float(
               self.config.rope_parameters.get("rope_theta", rope_base)
           )
@@ -205,6 +220,18 @@ try:
         )
       return rope_base
 
+    def _get_rope_proportion(self) -> float:
+      if hasattr(self.config, "rope_parameters") and isinstance(
+          self.config.rope_parameters, dict
+      ):
+        layer_params = self.config.rope_parameters.get(
+            getattr(self, "layer_type", ""), self.config.rope_parameters
+        )
+        if isinstance(layer_params, dict):
+          if layer_params.get("rope_type") == "proportional":
+            return float(layer_params.get("partial_rotary_factor", 1.0))
+      return 1.0
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -217,82 +244,168 @@ try:
       input_shape = hidden_states.shape[:-1]
       hidden_shape = (*input_shape, -1, self.head_dim)
       cos, sin = position_embeddings
+      rope_base = self._get_rope_base()
+      rope_proportion = self._get_rope_proportion()
+      norm_eps = float(
+          getattr(
+              self.q_norm,
+              "variance_epsilon",
+              getattr(
+                  self.q_norm,
+                  "eps",
+                  getattr(self.config, "rms_norm_eps", 1e-6),
+              ),
+          )
+      )
 
       if self.is_kv_shared_layer:
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        query_states = self.q_norm(query_states)
-        if kwargs.get("apply_gpu_composites", False) or getattr(
-            self, "use_rope_composite", False
-        ):
+        if getattr(self, "use_qkv_norm_rope_composite", False):
           position_ids = kwargs.get("position_ids", None)
           if position_ids is None:
-            seq_len = query_states.shape[1]
+            seq_len = hidden_states.shape[1]
             position_ids = torch.arange(
-                seq_len, device=query_states.device
+                seq_len, device=hidden_states.device
             ).unsqueeze(0)
-
-          rope_base = self._get_rope_base()
-          query_states = query_states.transpose(1, 2)
-          query_states = rope_composite.apply_mldrift_compatible_rope(
-              query_states, position_ids, base=rope_base, head_dim=self.head_dim
+          q = self.q_proj(hidden_states)
+          query_states = qkv_norm_rope.apply_q_norm_rope(
+              q,
+              position_ids,
+              self.q_norm.weight,
+              num_heads=self.config.num_attention_heads,
+              head_dim=self.head_dim,
+              base=rope_base,
+              eps=norm_eps,
+              proportion=rope_proportion,
           )
         else:
-          query_states = modeling_gemma4.apply_rotary_pos_emb(
-              query_states, cos, sin, unsqueeze_dim=2
-          )
-          query_states = query_states.transpose(1, 2)
+          query_states = self.q_proj(hidden_states).view(hidden_shape)
+          query_states = self.q_norm(query_states)
+          if kwargs.get("apply_gpu_composites", False) or getattr(
+              self, "use_rope_composite", False
+          ):
+            position_ids = kwargs.get("position_ids", None)
+            if position_ids is None:
+              seq_len = query_states.shape[1]
+              position_ids = torch.arange(
+                  seq_len, device=query_states.device
+              ).unsqueeze(0)
+
+            query_states = query_states.transpose(1, 2)
+            query_states = rope_composite.apply_mldrift_compatible_rope(
+                query_states,
+                position_ids,
+                base=rope_base,
+                head_dim=self.head_dim,
+                proportion=rope_proportion,
+            )
+          else:
+            query_states = modeling_gemma4.apply_rotary_pos_emb(
+                query_states, cos, sin, unsqueeze_dim=2
+            )
+            query_states = query_states.transpose(1, 2)
 
         key_states, value_states = shared_kv_states[self.layer_type]
         key_states = key_states.to(query_states.device)
         value_states = value_states.to(query_states.device)
       else:
-        if self.fuse_qkv:
-          qkv = self.qkv_proj(hidden_states)
-          if self.v_proj is not None:
-            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-          else:
-            q, k = qkv.split([self.q_size, self.k_size], dim=-1)
-            v = k
-        else:
-          q = self.q_proj(hidden_states)
-          k = self.k_proj(hidden_states)
-          v = self.v_proj(hidden_states) if self.v_proj is not None else k
-
-        query_states = q.view(hidden_shape)
-        query_states = self.q_norm(query_states)
-
-        key_states = k.view(hidden_shape)
-        key_states = self.k_norm(key_states)
-
-        if getattr(self, "use_rope_composite", False):
+        num_kv_shared = getattr(self.config, "num_kv_shared_layers", 0) or 0
+        # In prefill (seq_len > 1), the last non-KV-shared layer's query_states
+        # only feed into KV-shared layers that do not write to kv_cache, so
+        # MLIR DCE removes query_states when prefill only returns kv_cache.
+        # Keep that single layer unfused in prefill so DCE can eliminate its Q
+        # path and all subsequent KV-shared layers without leaving a partially
+        # live 3-output odml.qkv_norm_rope composite.
+        is_last_kv_donor_in_prefill = (
+            num_kv_shared > 0
+            and self.layer_idx
+            == self.config.num_hidden_layers - num_kv_shared - 1
+            and hidden_states.shape[1] > 1
+        )
+        if (
+            getattr(self, "use_qkv_norm_rope_composite", False)
+            and self.fuse_qkv
+            and self.v_proj is not None
+            and not is_last_kv_donor_in_prefill
+        ):
           position_ids = kwargs.get("position_ids", None)
           if position_ids is None:
-            seq_len = query_states.shape[1]
+            seq_len = hidden_states.shape[1]
             position_ids = torch.arange(
-                seq_len, device=query_states.device
+                seq_len, device=hidden_states.device
             ).unsqueeze(0)
-
-          rope_base = self._get_rope_base()
-          query_states = query_states.transpose(1, 2)
-          key_states = key_states.transpose(1, 2)
-          query_states = rope_composite.apply_mldrift_compatible_rope(
-              query_states, position_ids, base=rope_base, head_dim=self.head_dim
-          )
-          key_states = rope_composite.apply_mldrift_compatible_rope(
-              key_states, position_ids, base=rope_base, head_dim=self.head_dim
+          qkv = self.qkv_proj(hidden_states)
+          query_states, key_states, value_states = (
+              qkv_norm_rope.apply_qkv_norm_rope(
+                  qkv,
+                  position_ids,
+                  self.q_norm.weight,
+                  self.k_norm.weight,
+                  num_heads=self.config.num_attention_heads,
+                  num_kv_heads=self.config.num_key_value_heads,
+                  head_dim=self.head_dim,
+                  base=rope_base,
+                  eps=norm_eps,
+                  has_v_norm=True,
+                  proportion=rope_proportion,
+              )
           )
         else:
-          query_states = modeling_gemma4.apply_rotary_pos_emb(
-              query_states, cos, sin, unsqueeze_dim=2
-          )
-          query_states = query_states.transpose(1, 2)
-          key_states = modeling_gemma4.apply_rotary_pos_emb(
-              key_states, cos, sin, unsqueeze_dim=2
-          )
-          key_states = key_states.transpose(1, 2)
+          if self.fuse_qkv:
+            qkv = self.qkv_proj(hidden_states)
+            if self.v_proj is not None:
+              q, k, v = qkv.split(
+                  [self.q_size, self.k_size, self.v_size], dim=-1
+              )
+            else:
+              q, k = qkv.split([self.q_size, self.k_size], dim=-1)
+              v = k
+          else:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states) if self.v_proj is not None else k
 
-        value_states = self.v_norm(v.view(hidden_shape))
-        value_states = value_states.transpose(1, 2)
+          query_states = q.view(hidden_shape)
+          query_states = self.q_norm(query_states)
+
+          key_states = k.view(hidden_shape)
+          key_states = self.k_norm(key_states)
+
+          if getattr(self, "use_rope_composite", False):
+            position_ids = kwargs.get("position_ids", None)
+            if position_ids is None:
+              seq_len = query_states.shape[1]
+              position_ids = torch.arange(
+                  seq_len, device=query_states.device
+              ).unsqueeze(0)
+
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            query_states = rope_composite.apply_mldrift_compatible_rope(
+                query_states,
+                position_ids,
+                base=rope_base,
+                head_dim=self.head_dim,
+                proportion=rope_proportion,
+            )
+            key_states = rope_composite.apply_mldrift_compatible_rope(
+                key_states,
+                position_ids,
+                base=rope_base,
+                head_dim=self.head_dim,
+                proportion=rope_proportion,
+            )
+          else:
+            query_states = modeling_gemma4.apply_rotary_pos_emb(
+                query_states, cos, sin, unsqueeze_dim=2
+            )
+            query_states = query_states.transpose(1, 2)
+            key_states = modeling_gemma4.apply_rotary_pos_emb(
+                key_states, cos, sin, unsqueeze_dim=2
+            )
+            key_states = key_states.transpose(1, 2)
+
+          value_states = self.v_norm(v.view(hidden_shape))
+          value_states = value_states.transpose(1, 2)
 
       if past_key_values is not None and not self.is_kv_shared_layer:
         key_states, value_states = past_key_values.update(
@@ -388,10 +501,12 @@ try:
     fuse_gate_up = export_config.fuse_gate_up
     fuse_qkv = export_config.fuse_qkv
     use_rope = export_config.use_rope_composite
+    use_qkv_norm_rope = export_config.use_qkv_norm_rope_composite
     print(
         "Gemma4 model patch applied. "
         f"fuse_gate_up={fuse_gate_up}, fuse_qkv={fuse_qkv}, "
-        f"use_rope_composite={use_rope}"
+        f"use_rope_composite={use_rope}, "
+        f"use_qkv_norm_rope_composite={use_qkv_norm_rope}"
     )
 
     replaced_modules = []
@@ -404,15 +519,17 @@ try:
           setattr(module, child_name, fused)
           replaced_modules.append((module, child_name, child))
         elif isinstance(child, modeling_gemma4.Gemma4TextAttention):
-          if fuse_qkv or use_rope:
+          if fuse_qkv or use_rope or use_qkv_norm_rope:
             print(
                 f"Replacing Attention: {child_name} "
-                f"(fuse_qkv={fuse_qkv}, use_rope={use_rope})"
+                f"(fuse_qkv={fuse_qkv}, use_rope={use_rope}, "
+                f"use_qkv_norm_rope={use_qkv_norm_rope})"
             )
             fused = FusedGemma4TextAttention(
                 child,
                 fuse_qkv=fuse_qkv,
                 use_rope_composite=use_rope,
+                use_qkv_norm_rope_composite=use_qkv_norm_rope,
             )
             setattr(module, child_name, fused)
             replaced_modules.append((module, child_name, child))

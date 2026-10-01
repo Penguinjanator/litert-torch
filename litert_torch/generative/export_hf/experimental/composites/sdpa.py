@@ -61,6 +61,7 @@ def ring_buffer_sdpa(
     mask: Optional[torch.Tensor] = None,
     softcap: float | None = None,
     skip_cache_update: bool = False,
+    use_sdpa_composite: bool = False,
 ):
   """Ring buffer SDPA.
 
@@ -82,6 +83,8 @@ def ring_buffer_sdpa(
     softcap: Optional logit softcapping value.
     skip_cache_update: Whether to skip updating the KV cache (e.g. for shared
       KV layers that reuse keys/values from earlier donor layers).
+    use_sdpa_composite: Whether to wrap non-split (decode) attention in
+      odml.sdpa_transposed.
   """
   if layer is None and past_key_value is not None and layer_idx is not None:
     layer = past_key_value.layers[layer_idx]
@@ -282,29 +285,73 @@ def ring_buffer_sdpa(
       new_k = layer.keys
       new_v = layer.values
 
-    logits = bmm_fn_k(query, new_k)
-    g = gt // mask.size(2)
+    if mask.dtype != torch.bool:
+      mask: torch.Tensor = mask == 0
+
+    q_b, q_n, q_seq_len, q_h = query.shape
+    if use_sdpa_composite:
+      sdpa_attrs: dict[str, Any] = {
+          "k_ts_idx": k_ts_idx,
+          "v_ts_idx": v_ts_idx,
+          "from_cache_update": True,
+      }
+      if softcap is not None:
+        sdpa_attrs["softcap"] = softcap
+      sdpa_builder = composite.StableHLOCompositeBuilder(
+          name="odml.sdpa_transposed", attr=sdpa_attrs
+      )
+      query, new_k, new_v, mask, param_for_bmm = sdpa_builder.mark_inputs(
+          query, new_k, new_v, mask, param_for_bmm
+      )
+      g = q_n // bk_size
+      if g != 1:
+        query = query.reshape(1, q_b * bk_size, g * q_seq_len, q_h)
+        mask = _broadcast_mask_to_packed_query(mask, g, param_for_bmm)
+    else:
+      sdpa_builder = None
+      g = gt // mask.size(2)
+      if g != 1:
+        mask = torch.cat([mask] * g, dim=-2)
+
+    logits = runtime_batched_matmul.runtime_bmm(
+        query,
+        new_k,
+        param_for_bmm,
+        is_global=is_global,
+        is_src=False,
+        use_composite=not use_sdpa_composite,
+    )
 
     if softcap is not None:
       logits = torch.tanh(logits / softcap)
       logits = logits * softcap
 
-    if mask.dtype != torch.bool:
-      mask: torch.Tensor = mask == 0
-    if g != 1:
-      mask = torch.cat([mask] * g, dim=-2)
     padded_logits = torch.where(
         mask, logits, torch.tensor(MASK_FILL_VALUE, dtype=logits.dtype)
     )
-    attrs = {"axis": -1}
-    builder = composite.StableHLOCompositeBuilder(
-        name="odml.softmax", attr=attrs
-    )
-    padded_logits = builder.mark_inputs(padded_logits)
+    if not use_sdpa_composite:
+      attrs = {"axis": -1}
+      builder = composite.StableHLOCompositeBuilder(
+          name="odml.softmax", attr=attrs
+      )
+      padded_logits = builder.mark_inputs(padded_logits)
+    else:
+      builder = None
     probs = F.softmax(padded_logits, dim=-1)
-    probs = builder.mark_outputs(probs)
+    if builder is not None:
+      probs = builder.mark_outputs(probs)
     probs = probs.type_as(query)
-    encoded = bmm_fn_v(probs, new_v)
+    encoded = runtime_batched_matmul.runtime_bmm(
+        probs,
+        new_v,
+        param_for_bmm,
+        is_global=is_global,
+        is_src=True,
+        use_composite=not use_sdpa_composite,
+    )
+    if sdpa_builder is not None:
+      encoded = encoded.reshape(q_b, q_n, q_seq_len, q_h)
+      encoded = sdpa_builder.mark_outputs(encoded)
     return encoded
 
 
@@ -430,7 +477,9 @@ def scaled_dot_product_attention_transposed(
   # execute -- never materializes a broadcast copy of the KV cache.
   g_query_per_kv = n // key_past.shape[1]
   num_query_groups = n // g_query_per_kv
-  pack_outside_composite = is_ring_buffer_sdpa or not use_sdpa_composite
+  pack_outside_composite = (
+      is_ring_buffer_sdpa and not is_decode_composite
+  ) or not use_sdpa_composite
   if pack_outside_composite:
     query = query.reshape(1, b * num_query_groups, g_query_per_kv * seq_len, h)
 
@@ -466,9 +515,10 @@ def scaled_dot_product_attention_transposed(
         mask=mask,
         softcap=softcap,
         skip_cache_update=skip_cache_update,
+        use_sdpa_composite=is_decode_composite,
     )
     if is_decode_composite:
-      encoded = encoded.permute(0, 2, 1, 3).reshape(b, 1, -1)
+      encoded = encoded.reshape(b, 1, n * h)
     else:
       encoded = encoded.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
     return encoded
@@ -493,6 +543,8 @@ def scaled_dot_product_attention_transposed(
       "v_ts_idx": v_ts_idx,
       "is_causal": bool(is_causal),
   })
+  if param_tensor is not None:
+    attrs["from_cache_update"] = True
   if softcap is not None:
     attrs["softcap"] = softcap
   if use_sdpa_composite:

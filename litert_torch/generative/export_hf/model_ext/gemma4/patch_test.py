@@ -22,7 +22,6 @@ from litert_torch.generative.export_hf.core import exportable_module_config
 import litert_torch.generative.export_hf.model_ext as _
 from litert_torch.generative.export_hf.model_ext.gemma4 import patch
 from litert_torch.generative.layers import moe
-from litert_torch.generative.layers import rotary_position_embedding as rotary_pos_emb
 import torch
 from transformers.models.gemma4 import modeling_gemma4
 
@@ -153,13 +152,10 @@ class PatchTest(parameterized.TestCase):
     hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
     position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
 
-    rope_base = float(getattr(config, "rope_theta", 500000.0))
-    cos, sin = rotary_pos_emb.build_rope(
-        position_ids[0], n_elem=config.head_dim, base=int(rope_base)
+    rotary_emb = modeling_gemma4.Gemma4TextRotaryEmbedding(config)
+    position_embeddings = rotary_emb(
+        hidden_states, position_ids, layer_type="full_attention"
     )
-    cos = torch.cat([cos, cos], dim=-1)
-    sin = torch.cat([sin, sin], dim=-1)
-    position_embeddings = (cos, sin)
     attention_mask = torch.ones(
         (batch_size, 1, seq_len, seq_len), dtype=torch.bool
     )
@@ -183,6 +179,48 @@ class PatchTest(parameterized.TestCase):
     self.assertTrue(
         torch.allclose(expected_output, actual_output, rtol=1e-5, atol=1e-5),
         "RoPE Composite Attention Output Mismatch.\n"
+        f"Expected: {expected_output}\nActual: {actual_output}",
+    )
+
+  def test_fused_gemma4_attention_qkv_norm_rope_composite(self):
+    config = _get_dummy_gemma4_text_config()
+    original_attn = modeling_gemma4.Gemma4TextAttention(config, layer_idx=0)
+    fused_attn = patch.FusedGemma4TextAttention(
+        original_attn, use_qkv_norm_rope_composite=True
+    )
+
+    batch_size = 2
+    seq_len = 4
+    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
+
+    rotary_emb = modeling_gemma4.Gemma4TextRotaryEmbedding(config)
+    position_embeddings = rotary_emb(
+        hidden_states, position_ids, layer_type="full_attention"
+    )
+    attention_mask = torch.ones(
+        (batch_size, 1, seq_len, seq_len), dtype=torch.bool
+    )
+    shared_kv_states = {}
+
+    with torch.no_grad():
+      expected_output, _ = original_attn(
+          hidden_states=hidden_states,
+          position_embeddings=position_embeddings,
+          attention_mask=attention_mask,
+          shared_kv_states=shared_kv_states,
+      )
+      actual_output, _ = fused_attn(
+          hidden_states=hidden_states,
+          position_embeddings=position_embeddings,
+          attention_mask=attention_mask,
+          shared_kv_states=shared_kv_states,
+          position_ids=position_ids,
+      )
+
+    self.assertTrue(
+        torch.allclose(expected_output, actual_output, rtol=1e-5, atol=1e-5),
+        "QKV Norm RoPE Composite Attention Output Mismatch.\n"
         f"Expected: {expected_output}\nActual: {actual_output}",
     )
 
