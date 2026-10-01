@@ -18,6 +18,7 @@ import contextlib
 from litert_torch.backend import optimization_barrier as optimization_barrier_lib
 from litert_torch.generative.export_hf.experimental.composites import qkv_norm_rope
 from litert_torch.generative.export_hf.experimental.composites import rope as rope_composite
+from litert_torch.generative.export_hf.experimental.composites import swiglu as swiglu_composite
 from litert_torch.generative.export_hf.model_ext import patches as patches_lib
 from litert_torch.generative.layers import normalization
 import torch
@@ -64,15 +65,37 @@ try:
   Gemma4AudioAttention = modeling_gemma4.Gemma4AudioAttention
   Gemma4AudioModel = modeling_gemma4.Gemma4AudioModel
 
+  def _glu_activation_name(act_fn) -> str | None:
+    """Maps a HF activation module to an odml.swiglu activation name."""
+    name = type(act_fn).__name__
+    if name in ("PytorchGELUTanh", "GELUTanh", "NewGELUActivation",
+                "GELUPytorchTanh"):
+      return "gelu_tanh"
+    if isinstance(act_fn, torch.nn.GELU) and act_fn.approximate == "tanh":
+      return "gelu_tanh"
+    if isinstance(act_fn, torch.nn.SiLU) or name == "SiLUActivation":
+      return "silu"
+    return None
+
   class FusedGemma4TextMLP(torch.nn.Module):
     """Fused Gate + Up MLP layer for Gemma4."""
 
-    def __init__(self, original_mlp: modeling_gemma4.Gemma4TextMLP):
+    def __init__(
+        self,
+        original_mlp: modeling_gemma4.Gemma4TextMLP,
+        use_swiglu_composite: bool = False,
+    ):
       super().__init__()
       self.gate_proj = original_mlp.gate_proj
       self.up_proj = original_mlp.up_proj
       self.down_proj = original_mlp.down_proj
       self.act_fn = original_mlp.act_fn
+
+      # Gemma uses GeGLU (gelu_pytorch_tanh); only use the composite when the
+      # activation maps to one the GPU kernel implements.
+      self.glu_activation = (
+          _glu_activation_name(self.act_fn) if use_swiglu_composite else None
+      )
 
       # Fuse gate and up projections
       gate_out_features = self.gate_proj.out_features
@@ -98,6 +121,14 @@ try:
 
     def forward(self, x):
       gate_up = self.gate_up_proj(x)
+      if self.glu_activation is not None:
+        return self.down_proj(
+            swiglu_composite.apply_swiglu(
+                gate_up,
+                gate_size=self.gate_size,
+                activation=self.glu_activation,
+            )
+        )
       gate, up = gate_up.split(
           [self.gate_size, gate_up.shape[-1] - self.gate_size], dim=-1
       )
@@ -502,20 +533,24 @@ try:
     fuse_qkv = export_config.fuse_qkv
     use_rope = export_config.use_rope_composite
     use_qkv_norm_rope = export_config.use_qkv_norm_rope_composite
+    use_swiglu = getattr(export_config, "use_swiglu_composite", False)
     print(
         "Gemma4 model patch applied. "
         f"fuse_gate_up={fuse_gate_up}, fuse_qkv={fuse_qkv}, "
         f"use_rope_composite={use_rope}, "
-        f"use_qkv_norm_rope_composite={use_qkv_norm_rope}"
+        f"use_qkv_norm_rope_composite={use_qkv_norm_rope}, "
+        f"use_swiglu_composite={use_swiglu}"
     )
 
     replaced_modules = []
 
     def replace_modules(module):
       for child_name, child in module.named_children():
-        if fuse_gate_up and isinstance(child, modeling_gemma4.Gemma4TextMLP):
-          print(f"Fusing MLP: {child_name}")
-          fused = FusedGemma4TextMLP(child)
+        if (fuse_gate_up or use_swiglu) and isinstance(
+            child, modeling_gemma4.Gemma4TextMLP
+        ):
+          print(f"Fusing MLP: {child_name} (use_swiglu={use_swiglu})")
+          fused = FusedGemma4TextMLP(child, use_swiglu_composite=use_swiglu)
           setattr(module, child_name, fused)
           replaced_modules.append((module, child_name, child))
         elif isinstance(child, modeling_gemma4.Gemma4TextAttention):

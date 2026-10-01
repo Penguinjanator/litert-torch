@@ -36,6 +36,23 @@ class SwiGLUTest(parameterized.TestCase):
 
     self.assertTrue(torch.allclose(expected, actual, atol=1e-5, rtol=1e-5))
 
+  def test_apply_swiglu_gelu_tanh(self):
+    hidden_size = 32
+    gate_up = torch.randn(2, 4, hidden_size * 2)
+
+    gate, up = gate_up.split([hidden_size, hidden_size], dim=-1)
+    expected = F.gelu(gate, approximate="tanh") * up
+    actual = swiglu.apply_swiglu(
+        gate_up, gate_size=hidden_size, activation="gelu_tanh"
+    )
+
+    self.assertTrue(torch.allclose(expected, actual, atol=1e-5, rtol=1e-5))
+
+  def test_apply_swiglu_rejects_unknown_activation(self):
+    gate_up = torch.randn(1, 1, 8)
+    with self.assertRaises(ValueError):
+      swiglu.apply_swiglu(gate_up, activation="relu")
+
 
 if __name__ == "__main__":
   googletest.main()

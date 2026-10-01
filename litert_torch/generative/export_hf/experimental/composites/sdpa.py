@@ -294,6 +294,10 @@ def ring_buffer_sdpa(
           "k_ts_idx": k_ts_idx,
           "v_ts_idx": v_ts_idx,
           "from_cache_update": True,
+          # Single-token decode with a causal mask: the visible keys are
+          # exactly [0, active_tokens) of the (ring) cache, so the GPU kernel
+          # can drop the boolean mask input.
+          "is_causal": True,
       }
       if softcap is not None:
         sdpa_attrs["softcap"] = softcap
@@ -545,6 +549,10 @@ def scaled_dot_product_attention_transposed(
   })
   if param_tensor is not None:
     attrs["from_cache_update"] = True
+    if is_decode_composite and not is_sliding:
+      # Single-token causal decode on a full (non-sliding) dynamic cache:
+      # visible keys are [0, active_tokens).
+      attrs["is_causal"] = True
   if softcap is not None:
     attrs["softcap"] = softcap
   if use_sdpa_composite:

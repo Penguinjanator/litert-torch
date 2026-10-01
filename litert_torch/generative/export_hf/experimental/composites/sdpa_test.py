@@ -173,16 +173,18 @@ class ScaledDotProductAttentionTransposedTest(parameterized.TestCase):
     )
 
   @parameterized.named_parameters(
-      ("default_global_non_causal", True, None, False),
-      ("default_sliding_non_causal", False, None, False),
-      ("explicit_non_causal", True, False, False),
-      ("explicit_causal", True, True, True),
+      ("prefill_default_global_non_causal", 6, True, None, False),
+      ("prefill_default_sliding_non_causal", 6, False, None, False),
+      ("prefill_explicit_non_causal", 6, True, False, False),
+      ("prefill_explicit_causal", 6, True, True, True),
+      ("decode_global_causal", 1, True, False, True),
+      ("decode_non_ring_sliding_non_causal", 1, False, False, False),
   )
   def test_composite_emits_is_causal_attribute(
-      self, is_global, is_causal, expected_is_causal
+      self, seq_len, is_global, is_causal, expected_is_causal
   ):
     """The odml.sdpa_transposed composite must record `is_causal` in attrs."""
-    inputs = _make_inputs(8, 2, 6, 16, 8)
+    inputs = _make_inputs(8, 2, seq_len, 16, 8)
 
     class Wrapper(torch.nn.Module):
 

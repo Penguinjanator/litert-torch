@@ -19,30 +19,48 @@ import torch
 import torch.nn.functional as F
 
 
+_SUPPORTED_ACTIVATIONS = ("silu", "gelu_tanh")
+
+
 def apply_swiglu(
     gate_up: torch.Tensor,
     gate_size: int | None = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
-  """Computes SwiGLU activation: silu(gate) * up.
+  """Computes a gated linear unit: act(gate) * up.
 
   Args:
     gate_up: Input tensor containing concatenated gate and up projections.
     gate_size: Dimension size of the gate projection (defaults to half of the last dim).
+    activation: Gate activation. "silu" (SwiGLU) or "gelu_tanh" (GeGLU with
+      the tanh-approximated GELU, as used by Gemma).
 
   Returns:
-    out: SwiGLU activated output tensor.
+    out: Activated output tensor.
   """
+  if activation not in _SUPPORTED_ACTIVATIONS:
+    raise ValueError(
+        f"Unsupported activation {activation!r}; expected one of"
+        f" {_SUPPORTED_ACTIVATIONS}."
+    )
   if gate_size is None:
     gate_size = gate_up.shape[-1] // 2
 
-  attrs = {
+  attrs: dict[str, int | str] = {
       "gate_size": int(gate_size),
   }
+  # Only emit the attribute for non-default activations so SwiGLU exports stay
+  # unchanged.
+  if activation != "silu":
+    attrs["activation"] = activation
   builder = composite.StableHLOCompositeBuilder(name="odml.swiglu", attr=attrs)
   gate_up = builder.mark_inputs(gate_up)
 
   # Fallback PyTorch execution during export tracing:
   gate, up = gate_up.split([gate_size, gate_up.shape[-1] - gate_size], dim=-1)
-  out = F.silu(gate) * up
+  if activation == "gelu_tanh":
+    out = F.gelu(gate, approximate="tanh") * up
+  else:
+    out = F.silu(gate) * up
   out = builder.mark_outputs(out)
   return out
