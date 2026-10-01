@@ -27,6 +27,28 @@ import torch
 
 ExportableModuleConfig = exportable_module_config.ExportableModuleConfig
 
+# Model keys (`config.model_type` or `export_config.model` substrings) whose
+# text-generation global attention mask is guaranteed to be purely causal.
+# TODO(b/552147487): Gate this via model-specific export configs/extensions
+# rather than an explicit model key allowlist.
+_CAUSAL_TEXT_MODEL_KEYS = frozenset({
+    "gemma2",
+    "gemma3_text",
+    "gemma4",
+    "gemma4_text",
+    "gemma4_tiny",
+    "lfm2",
+    "llama",
+    "mistral",
+    "qwen2",
+    "qwen3",
+    "qwen3_text",
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+})
+
 
 class ExportableModuleBase(torch.nn.Module, abc.ABC):
   """Base class for exportable modules."""
@@ -42,7 +64,37 @@ class ExportableModuleBase(torch.nn.Module, abc.ABC):
   def attention_kwargs(self):
     k_ts_idx = self.export_config.k_ts_idx
     v_ts_idx = self.export_config.v_ts_idx
-    return {"k_ts_idx": k_ts_idx, "v_ts_idx": v_ts_idx}
+    return {
+        "k_ts_idx": k_ts_idx,
+        "v_ts_idx": v_ts_idx,
+        "sdpa_is_causal": self._is_text_only_causal_export(),
+    }
+
+  def _is_text_only_causal_export(self) -> bool:
+    """Whether the global attention mask is guaranteed to be purely causal.
+
+    Only text-only exports of known causal model keys qualify. Multimodal
+    exports (e.g. image tokens interleaved with text) or text generation models
+    with non-causal attention patterns may attend bidirectionally, so the mask
+    cannot be replaced by an implicit causal bound.
+    """
+    task = self.export_config.task
+    try:
+      task = exportable_module_config.ExportTask(task)
+    except ValueError:
+      return False
+    if task != exportable_module_config.ExportTask.TEXT_GENERATION:
+      return False
+    model = getattr(self, "model", None)
+    model_cfg = getattr(model, "config", None)
+    text_cfg = getattr(model_cfg, "text_config", model_cfg)
+    model_type = getattr(
+        text_cfg, "model_type", getattr(model_cfg, "model_type", None)
+    )
+    if isinstance(model_type, str) and model_type:
+      return model_type.lower() in _CAUSAL_TEXT_MODEL_KEYS
+    model_id = (self.export_config.model or "").lower()
+    return any(key in model_id for key in _CAUSAL_TEXT_MODEL_KEYS)
 
   @abc.abstractmethod
   def get_sample_inputs(

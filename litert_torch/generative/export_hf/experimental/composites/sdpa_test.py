@@ -172,6 +172,47 @@ class ScaledDotProductAttentionTransposedTest(parameterized.TestCase):
         tuple(out_val.shape), (1, num_query_heads, seq_len, head_dim)
     )
 
+  @parameterized.named_parameters(
+      ("default_global_non_causal", True, None, False),
+      ("default_sliding_non_causal", False, None, False),
+      ("explicit_non_causal", True, False, False),
+      ("explicit_causal", True, True, True),
+  )
+  def test_composite_emits_is_causal_attribute(
+      self, is_global, is_causal, expected_is_causal
+  ):
+    """The odml.sdpa_transposed composite must record `is_causal` in attrs."""
+    inputs = _make_inputs(8, 2, 6, 16, 8)
+
+    class Wrapper(torch.nn.Module):
+
+      def forward(self, query, key, value, mask, param_tensor):
+        return sdpa.scaled_dot_product_attention_transposed(
+            query=query,
+            key=key,
+            value=value,
+            head_size=query.shape[-1],
+            k_ts_idx=_K_TS_IDX,
+            v_ts_idx=_V_TS_IDX,
+            mask=mask,
+            param_tensor=param_tensor,
+            is_global=is_global,
+            use_sdpa_composite=True,
+            **({} if is_causal is None else {"is_causal": is_causal}),
+        )
+
+    exported = torch.export.export(Wrapper(), inputs)
+    sdpa_marks = [
+        node
+        for node in exported.graph.nodes
+        if node.op == "call_function"
+        and "mark_tensor" in str(node.target)
+        and "odml.sdpa_transposed" in (str(node.args) + str(node.kwargs))
+    ]
+    self.assertNotEmpty(sdpa_marks)
+    mark_str = str(sdpa_marks[-1].args) + str(sdpa_marks[-1].kwargs)
+    self.assertIn(f"('is_causal', {expected_is_causal})", mark_str)
+
 
 if __name__ == "__main__":
   googletest.main()

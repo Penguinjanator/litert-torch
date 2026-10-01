@@ -177,6 +177,15 @@ def transposed_attention(
         is_sliding = getattr(module, "layer_type", "") == "sliding_attention"
       is_global = not is_sliding
     is_global = bool(is_global)
+    # Only mark attention as purely causal when the export guarantees it
+    # (text-only models). The GPU delegate then drops the global mask and
+    # enforces causality itself, so a false positive would break e.g.
+    # bidirectional attention over interleaved image tokens.
+    is_causal = (
+        is_global
+        and bool(kwargs.get("sdpa_is_causal", False))
+        and bool(getattr(module, "is_causal", True))
+    )
     past_key_value = kwargs.get("past_key_value", None)
     enable_ring_buffer = bool(kwargs.get("enable_ring_buffer", False))
     layer_idx = getattr(module, "layer_idx", None)
@@ -199,6 +208,7 @@ def transposed_attention(
         softcap=softcap,
         param_tensor=kwargs.get("param_tensor", None),
         is_global=is_global,
+        is_causal=is_causal,
         use_sdpa_composite=use_sdpa_composite,
         enable_ring_buffer=enable_ring_buffer,
         past_key_value=past_key_value,

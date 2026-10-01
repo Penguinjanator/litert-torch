@@ -15,10 +15,14 @@
 """Tests for attention layers."""
 
 import itertools
+from unittest import mock
 
 from absl.testing import parameterized
 # Not directly used but to register the attention implementation.
 import litert_torch.generative.export_hf.core.attention  # pylint: disable=unused-import
+from litert_torch.generative.export_hf.core import attention as attention_lib
+from litert_torch.generative.export_hf.core import exportable_module
+from litert_torch.generative.export_hf.core import exportable_module_config
 import numpy as np
 import torch
 from transformers import modeling_utils
@@ -152,6 +156,100 @@ class AttentionTest(parameterized.TestCase):
             ),
             f'Expected: {expected},  Actual: {actual}',
         )
+
+
+class TransposedAttentionIsCausalTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ('text_only_global', True, True, True, True),
+      ('not_opted_in', None, True, True, False),
+      ('multimodal_export', False, True, True, False),
+      ('sliding_layer', True, False, True, False),
+      ('non_causal_module', True, True, False, False),
+  )
+  def test_is_causal_requires_opt_in(
+      self, sdpa_is_causal, is_global, module_is_causal, expected
+  ):
+    module = torch.nn.Module()
+    module.is_causal = module_is_causal
+    query = torch.zeros(1, 2, 1, 8)
+    kwargs = {
+        'k_ts_idx': 2,
+        'v_ts_idx': 3,
+        'apply_gpu_composites': True,
+        'is_global': is_global,
+    }
+    if sdpa_is_causal is not None:
+      kwargs['sdpa_is_causal'] = sdpa_is_causal
+    with mock.patch.object(
+        attention_lib.gpu_sdpa,
+        'scaled_dot_product_attention_transposed',
+        return_value=query,
+    ) as mock_sdpa:
+      attention_lib.transposed_attention(
+          module, query, query, query, None, 1.0, None, **kwargs
+      )
+    self.assertEqual(mock_sdpa.call_args.kwargs['is_causal'], expected)
+
+  @parameterized.named_parameters(
+      (
+          'qwen3_text_generation',
+          'qwen3',
+          'dummy',
+          exportable_module_config.ExportTask.TEXT_GENERATION,
+          True,
+      ),
+      (
+          'lfm2_text_generation',
+          'lfm2',
+          'dummy',
+          exportable_module_config.ExportTask.TEXT_GENERATION,
+          True,
+      ),
+      (
+          'model_id_fallback_qwen3',
+          None,
+          'Qwen/Qwen3-0.6B',
+          exportable_module_config.ExportTask.TEXT_GENERATION,
+          True,
+      ),
+      (
+          'unknown_model_type_text_generation',
+          'bert',
+          'Qwen/Qwen3-0.6B',
+          exportable_module_config.ExportTask.TEXT_GENERATION,
+          False,
+      ),
+      (
+          'unknown_model_id_text_generation',
+          None,
+          'dummy_non_causal_model',
+          exportable_module_config.ExportTask.TEXT_GENERATION,
+          False,
+      ),
+      (
+          'qwen3_multimodal_task',
+          'qwen3',
+          'Qwen/Qwen3-0.6B',
+          exportable_module_config.ExportTask.IMAGE_TEXT_TO_TEXT,
+          False,
+      ),
+  )
+  def test_attention_kwargs_gates_on_task_and_model_key(
+      self, model_type, model_id, task, expected
+  ):
+    model = torch.nn.Module()
+    if model_type is not None:
+      model.config = mock.MagicMock(model_type=model_type, text_config=None)
+    config = exportable_module_config.ExportableModuleConfig(
+        model=model_id,
+        task=task,
+    )
+    exportable = exportable_module.LiteRTExportableModuleForDecoderOnlyLMPrefill(
+        model=model,
+        export_config=config,
+    )
+    self.assertEqual(exportable.attention_kwargs()['sdpa_is_causal'], expected)
 
 
 if __name__ == '__main__':

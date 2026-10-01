@@ -353,6 +353,7 @@ def scaled_dot_product_attention_transposed(
     alibi_bias: Optional[torch.Tensor] = None,
     param_tensor: Optional[torch.Tensor] = None,
     is_global: bool = False,
+    is_causal: bool = False,
     use_sdpa_composite: bool = True,
     enable_ring_buffer: bool = False,
     past_key_value: Optional[Any] = None,
@@ -374,6 +375,11 @@ def scaled_dot_product_attention_transposed(
     alibi_bias (torch.Tensor): optional alibi bias tensor.
     param_tensor (torch.Tensor): optional param tensor for runtime bmm.
     is_global (bool): whether the attention is global.
+    is_causal (bool): whether `mask` is guaranteed to be purely causal. Emitted
+      as an attribute on `odml.sdpa_transposed`; when true the GPU delegate may
+      drop the mask and enforce causality from `param_tensor`. Defaults to
+      False because the mask may encode non-causal patterns (e.g.
+      bidirectional attention over image tokens).
     use_sdpa_composite (bool): whether to use composite for SDPA.
     enable_ring_buffer (bool): whether to enable ring buffer.
     past_key_value (Any): past key value cache.
@@ -485,6 +491,7 @@ def scaled_dot_product_attention_transposed(
   attrs.update({
       "k_ts_idx": k_ts_idx,
       "v_ts_idx": v_ts_idx,
+      "is_causal": bool(is_causal),
   })
   if softcap is not None:
     attrs["softcap"] = softcap
