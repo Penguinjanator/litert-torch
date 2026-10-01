@@ -196,7 +196,11 @@ def _moe_custom_options(
           "num_active_experts": num_active_experts,
           "model_dim": model_dim,
           "hidden_dim": hidden_dim,
-          "activation": "gelu",
+          # The reference math is `F.gelu(gate, approximate="tanh")`, so the
+          # label must be "gelu_tanh". The older "gelu" spelling made the
+          # XNNPACK CPU kernel select exact GELU while the GPU kernel used the
+          # tanh approximation.
+          "activation": "gelu_tanh",
           "weight_type": weight_type,
           "renormalized_top_weights": True,
       })
