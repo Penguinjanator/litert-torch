@@ -231,12 +231,10 @@ class FusedGemma3Attention(torch.nn.Module):
           key_states, value_states, self.layer_idx
       )
 
-    # pytype: disable=attribute-error
     attention_interface = modeling_gemma3.ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation,  # pylint: disable=protected-access
         modeling_gemma3.eager_attention_forward,
     )
-    # pytype: enable=attribute-error
 
     attn_output, attn_weights = attention_interface(
         self,

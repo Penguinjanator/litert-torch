@@ -461,7 +461,7 @@ def package_model(
   )
   executor_metadata_builder = (
       metadata_builder_lib.get_executor_metadata_builder(
-          model_cfg  # pyrefly: ignore[bad-argument-type]
+          model_cfg
       )
   )
   if executor_metadata_builder:

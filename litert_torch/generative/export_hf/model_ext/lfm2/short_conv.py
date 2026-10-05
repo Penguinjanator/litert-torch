@@ -41,7 +41,7 @@ class Lfm2ShortConv(modeling_lfm2.Lfm2ShortConv):
         padding=0,  # Padding is done in forward as part of state management.
     )
 
-  def forward(  # pyrefly: ignore[bad-override]
+  def forward(
       self,
       hidden_states: torch.Tensor,
       past_key_values=None,

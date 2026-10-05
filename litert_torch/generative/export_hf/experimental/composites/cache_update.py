@@ -111,7 +111,7 @@ def cache_update(
       "is_ring_buffer": is_ring_buffer,
   }
   builder = composite.StableHLOCompositeBuilder(
-      name="odml.cache_update", attr=attrs  # pyrefly: ignore[bad-argument-type]
+      name="odml.cache_update", attr=attrs
   )
   (
       key_proj,

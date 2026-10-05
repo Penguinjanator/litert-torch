@@ -376,13 +376,13 @@ def compile_litertlm(
             try:
               sdk_libs_path = None
               if backend == 'qualcomm':
-                import ai_edge_litert_sdk_qualcomm  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+                import ai_edge_litert_sdk_qualcomm  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-import]
 
                 sdk_libs_path = str(
                     ai_edge_litert_sdk_qualcomm.path_to_sdk_libs()
                 )
               elif backend == 'mediatek':
-                import ai_edge_litert_sdk_mediatek  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+                import ai_edge_litert_sdk_mediatek  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-import]
 
                 sdk_libs_path = str(
                     ai_edge_litert_sdk_mediatek.path_to_sdk_libs()

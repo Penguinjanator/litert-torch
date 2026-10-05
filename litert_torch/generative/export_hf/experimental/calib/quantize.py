@@ -197,7 +197,7 @@ def _apply_mlir_passes(
     mu.passes.MlirPass('builtin.module(tfl-fuse-qdq)')(module)
     fuse_q.FuseQuantizedBmmPass()(module)
     module.cleanup()
-    quantization_result = dataclasses.replace(  # pytype: disable=wrong-arg-types
+    quantization_result = dataclasses.replace(
         quantization_result, quantized_model=mu.write_flatbuffer(module)
     )
   return quantization_result

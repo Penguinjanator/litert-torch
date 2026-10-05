@@ -176,7 +176,7 @@ class Qwen3_5ExportableMixin:
       qwen3_5_patch.apply_qwen3_5_model_patches(
           model.static_model, export_config
       )
-    super().__init__(model, export_config, source_model_artifacts)  # pytype: disable=wrong-arg-count
+    super().__init__(model, export_config, source_model_artifacts)  # pyrefly: ignore[bad-argument-count]
     if (
         getattr(export_config, "split_cache", False)
         or getattr(export_config, "cache_implementation", None) == "SplitCache"

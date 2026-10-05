@@ -463,11 +463,9 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     return cls(
         keys,
         values,
-        # pytype: disable=bad-argument-type
-        k_ts_idx=export_config.k_ts_idx,
-        v_ts_idx=export_config.v_ts_idx,
+        k_ts_idx=export_config.k_ts_idx,  # pyrefly: ignore[bad-argument-type]
+        v_ts_idx=export_config.v_ts_idx,  # pyrefly: ignore[bad-argument-type]
         layer_type=layer_type,
-        # pytype: enable=bad-argument-type
         **kwargs,
     )
 

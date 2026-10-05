@@ -53,13 +53,12 @@ class Gemma4UnifiedRMSNorm(torch.nn.Module):
     return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-# pytype: disable=import-error
 @patches_lib.register_patch(["gemma4_unified"])
 @contextlib.contextmanager
 def gemma4_litert_patch():
   """Gemma4 unified patch."""
   print("Gemma4 unified patch applied.")
-  from transformers.models.gemma4_unified import modeling_gemma4_unified  # pylint: disable=g-import-not-at-top
+  from transformers.models.gemma4_unified import modeling_gemma4_unified  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-import]
 
   original_norm = modeling_gemma4_unified.Gemma4UnifiedRMSNorm
   modeling_gemma4_unified.Gemma4UnifiedRMSNorm = Gemma4UnifiedRMSNorm
@@ -68,4 +67,3 @@ def gemma4_litert_patch():
     yield
   finally:
     modeling_gemma4_unified.Gemma4UnifiedRMSNorm = original_norm
-# pytype: enable=import-error

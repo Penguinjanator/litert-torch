@@ -411,7 +411,7 @@ def main(argv: Sequence[str]) -> None:
       model=hf_model,
       model_config=hf_model.config,
       text_model_config=hf_model.config,
-      tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
+      tokenizer=tokenizer,
   )
   prefill_mod = LiteRTExportableModuleForQwen3_5Prefill(hf_model, export_config, source_model_artifacts).eval()
   decode_mod = LiteRTExportableModuleForQwen3_5Generate(hf_model, export_config, source_model_artifacts).eval()

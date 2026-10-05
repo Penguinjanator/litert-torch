@@ -207,7 +207,7 @@ class Tokenizer:
     if self.spm:
       input_ids = self.spm.EncodeAsIds(input_string)
     elif self.tx_tokenizer:
-      input_ids = self.tx_tokenizer.encode(  # pytype: disable=attribute-error
+      input_ids = self.tx_tokenizer.encode(
           input_string, add_special_tokens=False
       )
     else:
@@ -281,7 +281,7 @@ class Tokenizer:
     if self.spm:
       return self.spm.DecodeIds(input_ids)
     elif self.tx_tokenizer:
-      return self.tx_tokenizer.decode(  # pytype: disable=attribute-error
+      return self.tx_tokenizer.decode(
           input_ids,
           skip_special_tokens=False,
       )
@@ -440,8 +440,8 @@ class LFM2VLImagePreprocessor:
         transformers_model_path
     )
     self.special_tokens = {
-        'soi': tx_tokenizer.convert_tokens_to_ids('<|image_start|>'),  # pyrefly: ignore[missing-attribute]
-        'eoi': tx_tokenizer.convert_tokens_to_ids('<|image_end|>'),  # pyrefly: ignore[missing-attribute]
+        'soi': tx_tokenizer.convert_tokens_to_ids('<|image_start|>'),
+        'eoi': tx_tokenizer.convert_tokens_to_ids('<|image_end|>'),
     }
 
   def __call__(self, image_bytes: bytes) -> dict[str, np.ndarray]:
