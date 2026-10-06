@@ -18,6 +18,7 @@ import warnings
 
 from absl.testing import parameterized
 from litert_torch.generative.export_hf.core import exportable_module_config
+import torch
 from absl.testing import absltest as googletest
 
 ExportableModuleConfig = exportable_module_config.ExportableModuleConfig
@@ -107,6 +108,38 @@ class ExtraKwargsValidationTest(parameterized.TestCase):
     )
     self.assertEqual(config.t2i_output_image_size, 256)
     self.assertEqual(config.extra_kwargs["max_seq_len"], 128)
+
+
+class ModelDtypeTest(parameterized.TestCase):
+
+  def test_default_is_float32(self):
+    config = _config()
+    self.assertEqual(config.get_torch_dtype(), torch.float32)
+    self.assertEqual(config.get_cache_dtype(), torch.float32)
+
+  @parameterized.parameters("bfloat16", "bf16", "BF16")
+  def test_bfloat16(self, model_dtype):
+    config = _config(model_dtype=model_dtype)
+    self.assertEqual(config.get_torch_dtype(), torch.bfloat16)
+    self.assertEqual(config.get_cache_dtype(), torch.bfloat16)
+
+  @parameterized.parameters("float16", "fp16", "int8")
+  def test_unsupported_raises(self, model_dtype):
+    with self.assertRaisesRegex(ValueError, "Unsupported dtype"):
+      _config(model_dtype=model_dtype)
+
+  def test_fp16_flag_keeps_model_float32(self):
+    config = _config(experimental_use_fp16=True)
+    self.assertEqual(config.get_torch_dtype(), torch.float32)
+    self.assertEqual(config.get_cache_dtype(), torch.float16)
+
+  def test_fp16_flag_allows_explicit_float32(self):
+    config = _config(model_dtype="float32", experimental_use_fp16=True)
+    self.assertEqual(config.get_cache_dtype(), torch.float16)
+
+  def test_fp16_flag_rejects_bfloat16(self):
+    with self.assertRaisesRegex(ValueError, "requires `model_dtype` float32"):
+      _config(model_dtype="bfloat16", experimental_use_fp16=True)
 
 
 if __name__ == "__main__":

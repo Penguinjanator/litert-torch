@@ -122,6 +122,11 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
       self.mtp_verifier_step = 0
     self.source_model_artifacts = source_model_artifacts
 
+  @property
+  def device(self) -> torch.device:
+    """Device of the wrapped model's parameters (`meta` for V2 export)."""
+    return next(self.model.parameters(), torch.empty(0)).device
+
   def adapt_inputs(
       self,
       tokens,
@@ -260,10 +265,7 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
 
     ret = {}
     if embeddings is not None:
-      if self.export_config.experimental_use_fp16:
-        ret["inputs_embeds"] = embeddings.half()
-      else:
-        ret["inputs_embeds"] = embeddings
+      ret["inputs_embeds"] = embeddings.to(self.export_config.get_cache_dtype())
     else:
       ret["input_ids"] = tokens
 
@@ -348,6 +350,8 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
         batch_size=export_config.batch_size,
         cache_length=export_config.cache_length,
     )
+    # Sample cache must live on the model's device (`meta` for V2 export).
+    kv_cache = kv_cache.to(self.device)
     inputs = {"kv_cache": kv_cache}
     if export_config.cache_length_dim is not None:
       flat_shapes = []
@@ -415,15 +419,18 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
     output = self.model(**inputs)
     outputs = {"kv_cache": output.past_key_values}
     if emit_logits:
-      outputs["logits"] = output.logits
+      outputs["logits"] = output.logits.to(torch.float32)
     return outputs
 
   def _get_input(
       self, batch_size, prefill_length, prefill_length_dim, model_config
   ):
     del model_config  # Unused.
+    device = self.device
     tokens = {
-        "tokens": torch.ones((batch_size, prefill_length), dtype=torch.int32)
+        "tokens": torch.ones(
+            (batch_size, prefill_length), dtype=torch.int32, device=device
+        )
     }
     tokens_dynamic_shape = (
         {"tokens": {1: prefill_length_dim}} if prefill_length_dim else {}
@@ -433,6 +440,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
   def get_sample_inputs(self, model_config, **kwargs):
     export_config = self.export_config
     use_bool_mask = export_config.extra_kwargs.get("use_bool_mask", False)
+    device = self.device
     kv_cache_inputs, kv_cache_dynamic_shapes = self.get_sample_kv_cache(
         model_config
     )
@@ -459,19 +467,25 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
       )
       inputs = {
           **tokens,
-          "input_pos": torch.ones((prefill_length), dtype=torch.int32),
+          "input_pos": torch.ones(
+              (prefill_length), dtype=torch.int32, device=device
+          ),
           "mask": torch.ones(
               (1, 1, prefill_length, cache_length),
               dtype=torch.bool if use_bool_mask else torch.float32,
+              device=device,
           ),
       }
       if ring_buffer_size is not None and has_sliding:
         inputs["local_mask"] = torch.ones(
             (1, 1, prefill_length, ring_buffer_size + prefill_length),
             dtype=torch.bool if use_bool_mask else torch.float32,
+            device=device,
         )
       if export_config.apply_gpu_composites:
-        inputs["param_tensor"] = torch.ones((1, 1, 1, 7), dtype=torch.int32)
+        inputs["param_tensor"] = torch.ones(
+            (1, 1, 1, 7), dtype=torch.int32, device=device
+        )
 
       inputs.update(kv_cache_inputs)
       if export_config.prefill_length_dim is not None:
@@ -533,7 +547,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
 
     return {
         "kv_cache": output.past_key_values,
-        "logits": output.logits,
+        "logits": output.logits.to(torch.float32),
         **extra_outputs,
     }
 
@@ -541,8 +555,11 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       self, batch_size, decode_length, decode_length_dim, model_config
   ):
     del model_config  # Unused.
+    device = self.device
     tokens = {
-        "tokens": torch.ones((batch_size, decode_length), dtype=torch.int32)
+        "tokens": torch.ones(
+            (batch_size, decode_length), dtype=torch.int32, device=device
+        )
     }
     tokens_dynamic_shape = {"tokens": None} if decode_length_dim else {}
     return tokens, tokens_dynamic_shape
@@ -550,6 +567,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
   def get_sample_inputs(self, model_config):  # pyrefly: ignore[bad-override]
     export_config = self.export_config
     use_bool_mask = export_config.extra_kwargs.get("use_bool_mask", False)
+    device = self.device
     kv_cache_inputs, kv_cache_dynamic_shapes = self.get_sample_kv_cache(
         model_config
     )
@@ -563,10 +581,11 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
     )
     inputs = {
         **tokens,
-        "input_pos": torch.ones((1), dtype=torch.int32),
+        "input_pos": torch.ones((1), dtype=torch.int32, device=device),
         "mask": torch.ones(
             (1, 1, 1, cache_length),
             dtype=torch.bool if use_bool_mask else torch.float32,
+            device=device,
         ),
     }
     text_cfg = getattr(model_config, "text_config", model_config)
@@ -584,9 +603,12 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       inputs["local_mask"] = torch.ones(
           (1, 1, 1, ring_buffer_size),
           dtype=torch.bool if use_bool_mask else torch.float32,
+          device=device,
       )
     if export_config.apply_gpu_composites:
-      inputs["param_tensor"] = torch.ones((1, 1, 1, 7), dtype=torch.int32)
+      inputs["param_tensor"] = torch.ones(
+          (1, 1, 1, 7), dtype=torch.int32, device=device
+      )
 
     inputs.update(kv_cache_inputs)
     if export_config.cache_length_dim is not None:
@@ -611,15 +633,20 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       )
       inputs = {
           **tokens,
-          "input_pos": torch.ones((verify_length), dtype=torch.int32),
+          "input_pos": torch.ones(
+              (verify_length), dtype=torch.int32, device=device
+          ),
           "mask": torch.ones(
-              (1, 1, verify_length, cache_length), dtype=torch.bool
+              (1, 1, verify_length, cache_length),
+              dtype=torch.bool,
+              device=device,
           ),
       }
       if ring_buffer_size is not None and has_sliding:
         inputs["local_mask"] = torch.ones(
             (1, 1, verify_length, ring_buffer_size + verify_length),
             dtype=torch.bool if use_bool_mask else torch.float32,
+            device=device,
         )
       inputs.update(kv_cache_inputs)
       if export_config.cache_length_dim is not None:

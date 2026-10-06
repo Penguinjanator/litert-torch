@@ -140,6 +140,9 @@ def export(
     enable_min_max_calibration_update: bool = True,
     ema_smoothing_factor: float = 0.1,
     static_quantization_recipe: str | None = None,
+    model_dtype: str | None = None,
+    use_v2: bool = False,
+    delete_in_memory_params: bool = False,
     # pylint: enable=unused-argument
     **kwargs,
 ):
@@ -245,6 +248,13 @@ def export(
     ema_smoothing_factor: Exponential moving average smoothing factor.
     static_quantization_recipe: Quantization recipe for static quantization
       stage.
+    model_dtype: Dtype the model is loaded and traced in (weights and graph):
+      'float32' (default) or 'bfloat16'. Not the deployment activation dtype;
+      see `experimental_use_fp16`. Mutually exclusive with it.
+    use_v2: Whether to use Converter V2. Only supports `text_generation`.
+    delete_in_memory_params: With `use_v2`, loads the model on the meta device
+      and streams weights from the checkpoint during serialization instead of
+      keeping them in memory.
     **kwargs: Additional keyword arguments to pass to the exportable module
       config.
 
@@ -321,6 +331,10 @@ def export(
     if export_config.bundle_litert_lm:
       export_tasks.append(litert_lm_builder.package_model)
   else:
+    # Must run before prefill/decode: with Converter V2 and
+    # `delete_in_memory_params`, that export frees the model's parameters.
+    if export_config.externalize_embedder:
+      export_tasks.append(export_lib.export_embedder_model)
     export_tasks.append(export_lib.export_text_prefill_decode_model)
     if (
         export_config.aot_backend is not None
@@ -328,8 +342,6 @@ def export(
     ):
       export_tasks.append(export_lib.aot_compile_model)
       legacy_compile_triggered = True
-    if export_config.externalize_embedder:
-      export_tasks.append(export_lib.export_embedder_model)
     if export_config.split_cache:
       export_tasks.append(export_lib.export_auxiliary_model)
     export_tasks.append(export_lib.export_additional_models)

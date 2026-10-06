@@ -71,7 +71,7 @@ def _get_slice_indices(
   assert ts_idx < cache_dim, "ts_idx must be less than cache_dim."
   assert ts_idx >= 0, "ts_idx must be greater than or equal to 0."
 
-  zeros = torch.zeros((1,), dtype=positions.dtype)
+  zeros = torch.zeros((1,), dtype=positions.dtype, device=positions.device)
   indices = []
   for i in range(cache_dim):
     if i == ts_idx:
@@ -450,14 +450,7 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
             model_config, layer_index, export_config
         )
     )
-    if hasattr(export_config, "get_torch_dtype"):
-      cache_dtype = export_config.get_torch_dtype()
-    else:
-      cache_dtype = (
-          torch.float16
-          if getattr(export_config, "experimental_use_fp16", False)
-          else torch.float32
-      )
+    cache_dtype = export_config.get_cache_dtype()
     keys = torch.zeros(k_cache_shape, dtype=cache_dtype)
     values = torch.zeros(v_cache_shape, dtype=cache_dtype)
     return cls(
@@ -468,6 +461,13 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
         layer_type=layer_type,
         **kwargs,
     )
+
+  def to(self, *args, **kwargs) -> "LiteRTLMCacheLayer":
+    """Moves the key/value tensors, e.g. to the model's device."""
+    assert self.keys is not None and self.values is not None
+    self.keys = self.keys.to(*args, **kwargs)
+    self.values = self.values.to(*args, **kwargs)
+    return self
 
 
 class LiteRTLMConvCacheLayer(
@@ -545,12 +545,15 @@ class LiteRTLMConvCacheLayer(
       if valid_mask is not None:
         l_state = self.conv_kernel_size
         total_len = l_state + seq_len
-        num_real = valid_mask.to(padded_input.dtype).sum()
+        # Index math stays in float32: 16-bit floats cannot represent all
+        # integer positions exactly (bf16 only up to 256).
+        index_dtype = torch.float32
+        num_real = valid_mask.to(index_dtype).sum()
         row_idx = torch.arange(
-            total_len, device=padded_input.device, dtype=padded_input.dtype
+            total_len, device=padded_input.device, dtype=index_dtype
         ).unsqueeze(1)
         col_target = num_real + torch.arange(
-            l_state, device=padded_input.device, dtype=padded_input.dtype
+            l_state, device=padded_input.device, dtype=index_dtype
         ).unsqueeze(0)
         selector = (row_idx == col_target).to(padded_input.dtype)
         next_state = padded_input @ selector
@@ -601,14 +604,9 @@ class LiteRTLMConvCacheLayer(
         "linear_attention",
     ), f"Unsupported layer type: {layer_type}"
     batch_size = kwargs.pop("batch_size", export_config.batch_size)
-    if hasattr(export_config, "get_torch_dtype"):
-      cache_dtype = export_config.get_torch_dtype()
-    else:
-      cache_dtype = (
-          torch.float16
-          if getattr(export_config, "experimental_use_fp16", False)
-          else torch.float32
-      )
+    # Conv state follows the KV cache dtype (float16 with
+    # `experimental_use_fp16`, else the model dtype).
+    cache_dtype = export_config.get_cache_dtype()
     if layer_type == "conv":
       c_state_shape = (
           batch_size,
@@ -640,6 +638,8 @@ class LiteRTLMConvCacheLayer(
           model_config.linear_value_head_dim,
       )
       c_state = torch.zeros(c_state_shape, dtype=cache_dtype)
+      # The recurrent state is always float32: the gated delta update
+      # accumulates across the whole sequence and is computed in float32.
       r_state = torch.zeros(r_state_shape, dtype=torch.float32)
       return cls(
           conv_states=c_state,
@@ -669,6 +669,7 @@ class LiteRTLMConvCacheLayer(
       else:
         self.recurrent_states = self.recurrent_states.to(dtype=torch.float32)
     return self
+
 
 LAYER_TYPE_TO_CLASS = {
     "full_attention": LiteRTLMCacheLayer,
