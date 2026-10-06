@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for litert_lm_builder."""
 
+import os
 import types
 from absl.testing import absltest
 from absl.testing import parameterized

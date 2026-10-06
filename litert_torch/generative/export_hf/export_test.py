@@ -148,6 +148,74 @@ class ExportNpuCompilationPipelineTest(absltest.TestCase):
         overwrite=True,
     )
 
+  @mock.patch("litert_torch.generative.export_hf.export.run_export_tasks")
+  def test_text_to_image_export_orchestration(self, mock_run_export):
+    mock_run_export.return_value = mock.MagicMock(
+        litert_lm_model_path="/tmp/fake_image_gen.litertlm"
+    )
+    export.export(
+        model="/tmp/fake_bonsai_flux2",
+        output_dir="/tmp/fake_output",
+        task="text_to_image",
+        t2i_output_image_size=256,
+        bundle_litert_lm=True,
+    )
+    mock_run_export.assert_called_once()
+    passed_tasks = mock_run_export.call_args[0][0]
+    passed_config = mock_run_export.call_args[0][1]
+    self.assertEqual(
+        passed_config.task,
+        export.ExportTask.TEXT_TO_IMAGE,
+    )
+    self.assertEqual(passed_config.t2i_output_image_size, 256)
+    self.assertEqual(
+        passed_tasks,
+        [
+            export_lib.export_image_gen_models,
+            export_lib.export_tokenizer,
+            litert_lm_builder.package_model,
+        ],
+    )
+
+  @mock.patch("transformers.AutoTokenizer.from_pretrained")
+  @mock.patch(
+      "litert_torch.generative.export_hf.model_ext.exportables.get_image_gen_model_cls"
+  )
+  @mock.patch("huggingface_hub.snapshot_download")
+  def test_load_model_text_to_image_remote_hf_repo(
+      self, mock_snapshot_download, mock_get_cls, mock_tokenizer
+  ):
+    import json  # pylint: disable=g-import-not-at-top
+    import os  # pylint: disable=g-import-not-at-top
+    import tempfile  # pylint: disable=g-import-not-at-top
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      with open(os.path.join(tmp_dir, "model_index.json"), "w") as f:
+        json.dump({"_class_name": "Flux2KleinPipeline"}, f)
+      mock_snapshot_download.return_value = tmp_dir
+      fake_model_instance = mock.MagicMock()
+      fake_model_instance.model_dir = tmp_dir
+      mock_model_cls = mock.MagicMock(return_value=fake_model_instance)
+      mock_get_cls.return_value = mock_model_cls
+      mock_tokenizer.return_value = mock.MagicMock()
+
+      config = export.exportable_module_config.ExportableModuleConfig(
+          model="prism-ml/bonsai-image-ternary-4B-unpacked",
+          output_dir=tmp_dir,
+          task=export.ExportTask.TEXT_TO_IMAGE,
+      )
+      export_lib.load_model(
+          "prism-ml/bonsai-image-ternary-4B-unpacked",
+          export_config=config,
+          task=export.ExportTask.TEXT_TO_IMAGE,
+      )
+
+      mock_snapshot_download.assert_called_once_with(
+          "prism-ml/bonsai-image-ternary-4B-unpacked"
+      )
+      mock_get_cls.assert_called_once_with("Flux2KleinPipeline")
+      mock_model_cls.assert_called_once_with(tmp_dir, export_config=config)
+
 
 if __name__ == "__main__":
   absltest.main()
