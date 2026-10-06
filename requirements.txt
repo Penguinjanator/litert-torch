@@ -20,4 +20,4 @@ fire
 rich
 sentencepiece
 litert-lm
-litert-lm-builder
+litert-lm-builder>=0.18.0
