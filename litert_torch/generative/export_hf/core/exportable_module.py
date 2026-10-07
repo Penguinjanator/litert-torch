@@ -96,6 +96,20 @@ class ExportableModuleBase(torch.nn.Module, abc.ABC):
     model_id = (self.export_config.model or "").lower()
     return any(key in model_id for key in _CAUSAL_TEXT_MODEL_KEYS)
 
+  def composite_flags(self) -> dict[str, bool]:
+    """Returns the attention composite kwargs selected by the export config.
+
+    Modules that override `forward` must merge these into the kwargs passed to
+    `adapt_inputs`; otherwise flags such as `use_sdpa_composite` are silently
+    dropped for that model.
+    """
+    flags = {}
+    if self.export_config.apply_gpu_composites:
+      flags["apply_gpu_composites"] = True
+    if self.export_config.use_sdpa_composite:
+      flags["use_sdpa_composite"] = True
+    return flags
+
   @abc.abstractmethod
   def get_sample_inputs(
       self, model_config, **kwargs
@@ -308,9 +322,24 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
         or kwargs.get("use_sdpa_composite", False)
     ):
       param_tensor = kwargs.get("param_tensor", None)
+      if (
+          self.export_config.use_fused_sdpa_cache_update
+          and param_tensor is not None
+      ):
+        if self.export_config.sliding_window_ring_buffer_size is None:
+          raise ValueError(
+              "use_fused_sdpa_cache_update requires"
+              " sliding_window_ring_buffer_size."
+          )
+        # The fused op reads start/end from the raw signature input: a param
+        # tensor rewritten in-graph is not visible to backends at runtime.
+        ret["use_fused_sdpa_cache_update"] = True
+        ret["runtime_param_tensor"] = param_tensor
       if param_tensor is not None:
         # Local attn ring buffer uses param_tensor[3] to store update length.
         # TODO(sulemanshahid): We can move the param tensor as in-graph now.
+        # TODO(weiyiw): Drop this rewrite so `param_tensor` stays the signature
+        # input and `runtime_param_tensor` is no longer needed.
         update_length = param_tensor[..., 1:2] - param_tensor[..., 0:1]
         param_tensor = torch.cat(
             [param_tensor[..., :3], update_length, param_tensor[..., 4:]],
@@ -392,10 +421,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
       local_mask=None,
       **kwargs,
   ):
-    if self.export_config.apply_gpu_composites:
-      kwargs["apply_gpu_composites"] = True
-    if self.export_config.use_sdpa_composite:
-      kwargs["use_sdpa_composite"] = True
+    kwargs.update(self.composite_flags())
     inputs = self.adapt_inputs(
         tokens,
         None,
@@ -416,6 +442,9 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
     emit_logits = bool(self.export_config.prefill_logits)
     if emit_logits:
       inputs["logits_to_keep"] = 1
+    # Tells the attention layers whether the final hidden states are live;
+    # see `core/attention.py:transposed_attention`.
+    inputs["prefill_logits"] = emit_logits
     output = self.model(**inputs)
     outputs = {"kv_cache": output.past_key_values}
     if emit_logits:
@@ -522,10 +551,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       local_mask=None,
       **kwargs,
   ):
-    if self.export_config.apply_gpu_composites:
-      kwargs["apply_gpu_composites"] = True
-    if self.export_config.use_sdpa_composite:
-      kwargs["use_sdpa_composite"] = True
+    kwargs.update(self.composite_flags())
     inputs = self.adapt_inputs(
         tokens,
         None,

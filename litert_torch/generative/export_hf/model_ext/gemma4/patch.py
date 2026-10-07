@@ -64,6 +64,84 @@ class Gemma4RMSNorm(torch.nn.Module):
     return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+def get_prefill_skip_cache_update_override(
+    config, layer_idx: int
+) -> bool | None:
+  """Returns who writes a shared ring buffer during prefill.
+
+  With KV sharing, layers >= first_kv_shared_layer_idx reuse the cache of the
+  last non-shared layer of the same type (the donor). In the prefill split
+  path every reader attends over the *old* ring buffer, and the runtimes alias
+  the cache input and output, so the single write must come after the last
+  read: the donor skips its write and the last reader of the same type writes
+  the donor's new tokens instead.
+
+  Args:
+    config: The Gemma4 text config.
+    layer_idx: Index of the attention layer.
+
+  Returns:
+    True for the donor (defers its write), False for the last reader (writes
+    the donor's cache), None for every other layer (no override).
+  """
+  layer_types = list(getattr(config, "layer_types", None) or [])
+  num_layers = config.num_hidden_layers
+  first_shared = num_layers - (getattr(config, "num_kv_shared_layers", 0) or 0)
+  if not layer_types or first_shared >= num_layers:
+    return None
+  layer_type = layer_types[layer_idx]
+  readers = [
+      i for i in range(first_shared, num_layers) if layer_types[i] == layer_type
+  ]
+  donors = [i for i in range(first_shared) if layer_types[i] == layer_type]
+  if not readers or not donors:
+    return None
+  if layer_idx == donors[-1]:
+    return True
+  if layer_idx == readers[-1]:
+    return False
+  return None
+
+
+def resolve_skip_cache_update(
+    is_kv_shared_layer: bool,
+    prefill_override: bool | None,
+    *,
+    is_sliding_prefill: bool,
+    shared_kv_readers_live: bool,
+) -> bool:
+  """Returns the `skip_cache_update` to trace a layer with.
+
+  By default KV-shared layers skip the write and the donor writes first. The
+  prefill override applies only where it matters and is affordable:
+    * Sliding-window prefill: its split path reads the old ring buffer. Decode
+      keeps write-then-attend, since the evicted slot lies outside every
+      reader's window.
+    * Live readers: moving the write to the last reader makes it depend on
+      that reader's attention output, which keeps every KV-shared layer alive.
+      When their outputs are unused the donor writes directly and the readers
+      stay dead code.
+
+  Args:
+    is_kv_shared_layer: Whether the layer reuses a donor's KV cache.
+    prefill_override: From `get_prefill_skip_cache_update_override`.
+    is_sliding_prefill: Whether this is a sliding-window layer traced with more
+      than one token.
+    shared_kv_readers_live: Whether the KV-shared layers' outputs are used by
+      the traced signature.
+
+  Returns:
+    Whether the layer skips its KV cache write.
+  """
+  if (
+      prefill_override is not None
+      and is_sliding_prefill
+      and shared_kv_readers_live
+  ):
+    return prefill_override
+  return is_kv_shared_layer
+
+
 try:
   from transformers.models.gemma4 import modeling_gemma4  # pylint: disable=g-import-not-at-top
 
@@ -170,6 +248,9 @@ try:
       self.is_kv_shared_layer = original_attn.is_kv_shared_layer
       self.store_full_length_kv = original_attn.store_full_length_kv
       self.layer_type = original_attn.layer_type
+      self.prefill_skip_cache_update_override = (
+          get_prefill_skip_cache_update_override(self.config, self.layer_idx)
+      )
 
       self.use_qkv_norm_rope_composite = use_qkv_norm_rope_composite
       self.fuse_qkv = (
@@ -461,8 +542,18 @@ try:
           )
       )
       # Signal SDPA to skip cache update when this layer shares KV cache with a
-      # donor layer to avoid redundant or duplicate cache updates.
-      kwargs["skip_cache_update"] = self.is_kv_shared_layer
+      # donor layer to avoid redundant or duplicate cache updates. With the
+      # fused op the donor's shared ring buffer prefill write moves to the last
+      # reader, so no reader sees partially overwritten history.
+      kwargs["skip_cache_update"] = resolve_skip_cache_update(
+          self.is_kv_shared_layer,
+          self.prefill_skip_cache_update_override
+          if kwargs.get("use_fused_sdpa_cache_update", False)
+          else None,
+          is_sliding_prefill=bool(self.is_sliding) and input_shape[-1] > 1,
+          # The readers' outputs only reach the signature through the logits.
+          shared_kv_readers_live=kwargs.get("prefill_logits", True),
+      )
       attn_output, attn_weights = attention_interface(
           self,
           query_states,

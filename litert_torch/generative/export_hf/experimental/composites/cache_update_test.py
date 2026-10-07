@@ -216,6 +216,185 @@ class CacheUpdateTest(parameterized.TestCase):
     graph_str = str(exported.graph)
     self.assertIn("odml.cache_update", graph_str)
 
+  @parameterized.product(
+      is_ring_buffer=(True, False),
+      k_update_ts_idx=(2, 3),
+      v_update_ts_idx=(2, 3),
+  )
+  def test_update_layouts_write_the_same_cache(
+      self, is_ring_buffer, k_update_ts_idx, v_update_ts_idx
+  ):
+    heads, cache_len, head_size, new_len, start = 2, 8, 4, 3, 6
+    if not is_ring_buffer:
+      start = 2  # A linear cache does not wrap.
+    cache_k = torch.randn((1, heads, cache_len, head_size))
+    cache_v = torch.randn((1, heads, head_size, cache_len))
+    # New tokens in the cache layout, i.e. K [1, H, T, D] and V [1, H, D, T].
+    k_new = torch.randn((1, heads, new_len, head_size))
+    v_new = torch.randn((1, heads, head_size, new_len))
+    param = torch.zeros((1, 1, 1, 7), dtype=torch.int32)
+    param[..., 0] = start
+    param[..., 3] = new_len
+    indices_k = torch.zeros(4, dtype=torch.int32)
+    indices_k[2] = start
+    indices_v = torch.zeros(4, dtype=torch.int32)
+    indices_v[3] = start
+
+    def run(k_ts, v_ts):
+      return cache_update.cache_update(
+          key_proj=k_new if k_ts == 2 else k_new.transpose(-2, -1),
+          value_proj=v_new if v_ts == 3 else v_new.transpose(-2, -1),
+          runtime_param_tensor=param,
+          cache_k=cache_k,
+          cache_v=cache_v,
+          indices_k=indices_k,
+          indices_v=indices_v,
+          kv_heads=heads,
+          kv_batch_size=1,
+          cache_len=cache_len,
+          head_size=head_size,
+          is_ring_buffer=is_ring_buffer,
+          k_update_ts_idx=k_ts,
+          v_update_ts_idx=v_ts,
+      )
+
+    new_k, new_v = run(k_update_ts_idx, v_update_ts_idx)
+    # Every layout must write what the historical K [T, D], V [T, D] one does.
+    want_k, want_v = run(2, 2)
+    torch.testing.assert_close(new_k, want_k)
+    torch.testing.assert_close(new_v, want_v)
+    slots = [(start + i) % cache_len for i in range(new_len)]
+    torch.testing.assert_close(new_k[:, :, slots, :], k_new)
+    torch.testing.assert_close(new_v[:, :, :, slots], v_new)
+
+  def test_defaults_match_historical_layout(self):
+    cache_k = torch.zeros((1, 1, 8, 4))
+    cache_v = torch.zeros((1, 1, 4, 8))
+    k_new = torch.randn((1, 1, 2, 4))
+    v_new_td = torch.randn((1, 1, 2, 4))  # [T, D], the historical V layout.
+    param = torch.zeros((1, 1, 1, 7), dtype=torch.int32)
+    param[..., 3] = 2
+    args = dict(
+        runtime_param_tensor=param,
+        cache_k=cache_k,
+        cache_v=cache_v,
+        indices_k=torch.zeros(4, dtype=torch.int32),
+        indices_v=torch.zeros(4, dtype=torch.int32),
+        kv_heads=1,
+        kv_batch_size=1,
+        cache_len=8,
+        head_size=4,
+        is_ring_buffer=True,
+    )
+    _, new_v = cache_update.cache_update(
+        key_proj=k_new, value_proj=v_new_td, **args
+    )
+    torch.testing.assert_close(new_v[:, :, :, 0:2], v_new_td.transpose(-2, -1))
+
+  @parameterized.named_parameters(
+      ("default", None, None),
+      ("v_cache_layout", 3, {"k_update_ts_idx": 2, "v_update_ts_idx": 3}),
+  )
+  def test_export_emits_layout_attributes(self, v_update_ts_idx, expected):
+    """Layout attributes appear only for non-historical update layouts."""
+    class UpdateModule(torch.nn.Module):
+
+      def forward(self, kp, vp, param, ck, cv, ik, iv):
+        return cache_update.cache_update(
+            key_proj=kp,
+            value_proj=vp,
+            runtime_param_tensor=param,
+            cache_k=ck,
+            cache_v=cv,
+            indices_k=ik,
+            indices_v=iv,
+            kv_heads=2,
+            kv_batch_size=1,
+            cache_len=8,
+            head_size=16,
+            is_ring_buffer=True,
+            v_update_ts_idx=v_update_ts_idx,
+        )
+
+    value_shape = (1, 2, 3, 16) if v_update_ts_idx != 3 else (1, 2, 16, 3)
+    exported = torch.export.export(
+        UpdateModule(),
+        (
+            torch.randn((1, 2, 3, 16)),
+            torch.randn(value_shape),
+            torch.zeros((1, 1, 1, 7), dtype=torch.int32),
+            torch.randn((1, 2, 8, 16)),
+            torch.randn((1, 2, 16, 8)),
+            torch.zeros(4, dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+        ),
+    )
+    marks = "".join(
+        str(n.args) + str(n.kwargs)
+        for n in exported.graph.nodes
+        if n.op == "call_function"
+        and "mark_tensor" in str(n.target)
+        and "odml.cache_update" in (str(n.args) + str(n.kwargs))
+    )
+    self.assertNotEmpty(marks)
+    if expected is None:
+      # Existing exports keep their exact attributes.
+      self.assertNotIn("ts_idx", marks)
+      return
+    expected = {"k_cache_ts_idx": 2, "v_cache_ts_idx": 3, **expected}
+    for name, value in expected.items():
+      self.assertIn(f"('{name}', {value})", marks)
+
+  @parameterized.product(
+      offset=[0, 3, 7, 8, 13],
+      v_update_ts_idx=[2, 3],
+      write_single_token_in_place=[False, True],
+  )
+  def test_ring_buffer_decode_matches_one_hot(
+      self, offset, v_update_ts_idx, write_single_token_in_place
+  ):
+    torch.manual_seed(offset)
+    cache_k = torch.randn((1, 2, 8, 16))
+    cache_v = torch.randn((1, 2, 16, 8))
+    key_proj = torch.randn((1, 2, 1, 16))
+    value_proj = torch.randn(
+        (1, 2, 1, 16) if v_update_ts_idx == 2 else (1, 2, 16, 1)
+    )
+    param_tensor = torch.zeros((1, 1, 1, 7), dtype=torch.int32)
+    param_tensor[..., 0] = offset
+    param_tensor[..., 3] = 1
+
+    new_k, new_v = cache_update.cache_update(
+        key_proj=key_proj,
+        value_proj=value_proj,
+        runtime_param_tensor=param_tensor,
+        cache_k=cache_k,
+        cache_v=cache_v,
+        indices_k=torch.zeros(4, dtype=torch.int32),
+        indices_v=torch.zeros(4, dtype=torch.int32),
+        kv_heads=2,
+        kv_batch_size=1,
+        cache_len=8,
+        head_size=16,
+        is_ring_buffer=True,
+        v_update_ts_idx=v_update_ts_idx,
+        write_single_token_in_place=write_single_token_in_place,
+    )
+
+    positions = torch.tensor([offset], dtype=torch.int32)
+    valid = torch.tensor([True])
+    v_update = value_proj if v_update_ts_idx == 3 else value_proj.transpose(
+        -2, -1
+    )
+    ref_k = cache_update.update_kv_cache_with_sliding(
+        cache_k, key_proj, positions, valid, ts_idx=2
+    )
+    ref_v = cache_update.update_kv_cache_with_sliding(
+        cache_v, v_update, positions, valid, ts_idx=3
+    )
+    torch.testing.assert_close(new_k, ref_k, rtol=0, atol=0)
+    torch.testing.assert_close(new_v, ref_v, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
   googletest.main()

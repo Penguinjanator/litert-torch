@@ -49,10 +49,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder(
       mask,
       **kwargs,
   ):
-    if self.export_config.apply_gpu_composites:
-      kwargs["apply_gpu_composites"] = True
-    if self.export_config.use_sdpa_composite:
-      kwargs["use_sdpa_composite"] = True
+    kwargs.update(self.composite_flags())
     inputs = self.adapt_inputs(
         None,
         embeddings,
@@ -69,6 +66,8 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder(
         "past_key_values"
     ].insert_dummy_cache_layers(self.model.config.text_config)
     inputs |= self.attention_kwargs()
+    # Only the KV cache is returned; see `core/attention.py`.
+    inputs["prefill_logits"] = False
     output = self.model.model.language_model(**inputs)
     kv_cache = output.past_key_values
     kv_cache = kv_cache.remove_dummy_cache_layers(self.model.config.text_config)
@@ -136,10 +135,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder(
       mask,
       **kwargs,
   ):
-    if self.export_config.apply_gpu_composites:
-      kwargs["apply_gpu_composites"] = True
-    if self.export_config.use_sdpa_composite:
-      kwargs["use_sdpa_composite"] = True
+    kwargs.update(self.composite_flags())
     inputs = self.adapt_inputs(
         None,
         embeddings,

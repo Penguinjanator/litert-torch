@@ -189,13 +189,33 @@ def transposed_attention(
     past_key_value = kwargs.get("past_key_value", None)
     enable_ring_buffer = bool(kwargs.get("enable_ring_buffer", False))
     layer_idx = getattr(module, "layer_idx", None)
-    # Check if the layer should skip cache updates (e.g. KV-shared layers in
-    # Gemma 4 that reuse key/value states from a preceding donor layer).
-    skip_cache_update = bool(
-        getattr(module, "is_kv_shared_layer", False)
-        or kwargs.get("skip_cache_update", False)
-        or kwargs.get("is_kv_shared_layer", False)
+    use_fused_sdpa_cache_update = bool(
+        kwargs.get("use_fused_sdpa_cache_update", False)
     )
+    # Whether this layer leaves the KV cache unwritten. By default KV-shared
+    # layers (e.g. Gemma 4) skip, since they reuse a preceding donor layer's
+    # cache. With the fused op a model can pass `skip_cache_update` explicitly
+    # to choose which layer writes a shared cache instead.
+    if use_fused_sdpa_cache_update and "skip_cache_update" in kwargs:
+      skip_cache_update = bool(kwargs["skip_cache_update"])
+    else:
+      skip_cache_update = bool(
+          getattr(module, "is_kv_shared_layer", False)
+          or kwargs.get("skip_cache_update", False)
+          or kwargs.get("is_kv_shared_layer", False)
+      )
+    if use_fused_sdpa_cache_update:
+      # Without prefill logits the last layer's attention output has no
+      # consumer. A fused composite whose output 0 is dead crashes the
+      # converter's `BuildStableHLOCompositePass`, so that layer stays
+      # unfused.
+      num_layers = getattr(
+          getattr(module, "config", None), "num_hidden_layers", 0
+      )
+      use_fused_sdpa_cache_update = not (
+          not kwargs.get("prefill_logits", True)
+          and layer_idx == num_layers - 1
+      )
     sdpa_out = gpu_sdpa.scaled_dot_product_attention_transposed(
         query=query,
         key=key,
@@ -214,6 +234,8 @@ def transposed_attention(
         past_key_value=past_key_value,
         layer_idx=layer_idx,
         skip_cache_update=skip_cache_update,
+        use_fused_sdpa_cache_update=use_fused_sdpa_cache_update,
+        runtime_param_tensor=kwargs.get("runtime_param_tensor", None),
     )
     return sdpa_out, None
 

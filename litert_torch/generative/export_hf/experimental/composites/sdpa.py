@@ -20,6 +20,7 @@ from litert_torch.backend import composite
 from litert_torch.generative.custom_ops import bmm_4d as bmm_lib
 from litert_torch.generative.export_hf.core.cache import _get_slice_indices
 from litert_torch.generative.export_hf.experimental.composites import cache_update as gpu_cache_update
+from litert_torch.generative.export_hf.experimental.composites import fused_sdpa_cache_update as fused_lib
 from litert_torch.generative.export_hf.experimental.composites import runtime_batched_matmul
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,33 @@ runtime_bmm = runtime_batched_matmul.runtime_bmm
 
 # Fill value for attention mask. -10000.0 matches MLDrift convention.
 MASK_FILL_VALUE = -10000.0
+
+
+def _rebind_layer_cache(past_key_value, layer, new_k, new_v):
+  """Points `layer` and every alias of its cache at the updated tensors.
+
+  This is keyed on the cache layer object rather than a layer index, so it is
+  also correct when the writer is a KV-shared layer: `layer` is then the
+  donor's cache layer (from the shared KV tuple), while the writer's own index
+  maps to an unrelated dummy cache layer.
+
+  Args:
+    past_key_value: The cache holding `layer` (may be None).
+    layer: The cache layer whose buffers were updated.
+    new_k: Updated key cache.
+    new_v: Updated value cache.
+  """
+  old_k = layer.keys
+  old_v = layer.values
+  layer.keys = new_k
+  layer.values = new_v
+  if past_key_value is None:
+    return
+  for l in past_key_value.layers:
+    if l.keys is old_k:
+      l.keys = new_k
+    if l.values is old_v:
+      l.values = new_v
 
 
 def _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v):
@@ -42,6 +70,30 @@ def _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v):
       l.keys = new_k
     if l.values is old_v:
       l.values = new_v
+
+
+def _commit_cache_update(
+    past_key_value, layer, layer_idx, new_k, new_v, rebind_by_layer
+):
+  """Points the cache at the tensors produced by `odml.cache_update`.
+
+  Args:
+    past_key_value: The cache holding `layer` (may be None).
+    layer: The cache layer whose buffers were updated.
+    layer_idx: The layer index (may be None).
+    new_k: Updated key cache.
+    new_v: Updated value cache.
+    rebind_by_layer: Use `_rebind_layer_cache`, which `fused_sdpa_cache_update`
+      exports rely on. Otherwise keep the historical rebinding so that exports
+      without that flag trace the same graph.
+  """
+  if rebind_by_layer:
+    _rebind_layer_cache(past_key_value, layer, new_k, new_v)
+    return
+  layer.keys = new_k
+  layer.values = new_v
+  if past_key_value is not None and layer_idx is not None:
+    _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v)
 
 
 def ring_buffer_sdpa(
@@ -61,6 +113,11 @@ def ring_buffer_sdpa(
     mask: Optional[torch.Tensor] = None,
     softcap: float | None = None,
     skip_cache_update: bool = False,
+    use_fused_sdpa_cache_update: bool = False,
+    # TODO(weiyiw): Take a single `param_tensor`: drop the in-graph `[3]`
+    # rewrite in `core/exportable_module.py`, compute the update length where
+    # it is used (`ring_buffer_sdpa`), and remove `runtime_param_tensor`.
+    runtime_param_tensor: Optional[torch.Tensor] = None,
     use_sdpa_composite: bool = False,
 ):
   """Ring buffer SDPA.
@@ -81,8 +138,18 @@ def ring_buffer_sdpa(
     layer_idx: The layer index.
     mask: Attention mask tensor.
     softcap: Optional logit softcapping value.
-    skip_cache_update: Whether to skip updating the KV cache (e.g. for shared
-      KV layers that reuse keys/values from earlier donor layers).
+    skip_cache_update: Whether this call leaves the KV cache unwritten. When
+      False, the new tokens are written into `layer`'s cache (and every alias of
+      it) after this call's reads of the old cache. The caller decides who
+      writes a cache several layers read, e.g. a KV-shared layer may write its
+      donor's cache.
+    use_fused_sdpa_cache_update: Emit `odml.fused_sdpa_cache_update` for the
+      prefill split path instead of runtime BMMs + `odml.cache_update`, and
+      write single-token (decode) ring buffer updates in place. When False the
+      traced graph is unchanged from before the fused op existed.
+    runtime_param_tensor: The runtime param signature input, before the
+      in-graph rewrite that produces `param_tensor`. The fused op reads it at
+      runtime; falls back to `param_tensor`.
     use_sdpa_composite: Whether to wrap non-split (decode) attention in
       odml.sdpa_transposed.
   """
@@ -166,6 +233,31 @@ def ring_buffer_sdpa(
 
   gt = query.shape[2]
   is_split = layer.is_sliding and (seq_len > 1)
+
+  if is_split and use_fused_sdpa_cache_update:
+    # Decode (T=1) keeps write-then-attend: the slot it overwrites holds a
+    # token outside the window, so only prefill needs the fused op.
+    assert (
+        k_ts_idx == 2 and v_ts_idx == 3
+    ), "odml.fused_sdpa_cache_update expects K [1,H,S,D] and V [1,H,D,S]."
+    encoded, new_k, new_v = fused_lib.fused_sdpa_cache_update(
+        query,
+        key_past,
+        value_past,
+        key_states,
+        value_states,
+        mask,
+        # The raw signature input: backends read it at runtime, which an
+        # in-graph rewrite of it would not allow (only [0] and [1] are used).
+        runtime_param_tensor
+        if runtime_param_tensor is not None
+        else param_tensor,
+        update_cache=not skip_cache_update,
+        softcap=softcap,
+    )
+    if not skip_cache_update:
+      _rebind_layer_cache(past_key_value, layer, new_k, new_v)
+    return encoded
 
   if is_split:
     # 1. BMM with old cache (uses runtime_bmm)
@@ -254,11 +346,16 @@ def ring_buffer_sdpa(
           cache_len=cache_size,
           head_size=v_head_size,
           is_ring_buffer=layer.is_sliding,
+          write_single_token_in_place=use_fused_sdpa_cache_update,
       )
-      layer.keys = new_k
-      layer.values = new_v
-      if past_key_value is not None and layer_idx is not None:
-        _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v)
+      _commit_cache_update(
+          past_key_value,
+          layer,
+          layer_idx,
+          new_k,
+          new_v,
+          rebind_by_layer=use_fused_sdpa_cache_update,
+      )
 
     return encoded
   else:
@@ -276,11 +373,16 @@ def ring_buffer_sdpa(
           cache_len=cache_size,
           head_size=v_head_size,
           is_ring_buffer=layer.is_sliding,
+          write_single_token_in_place=use_fused_sdpa_cache_update,
       )
-      layer.keys = new_k
-      layer.values = new_v
-      if past_key_value is not None and layer_idx is not None:
-        _sync_and_rebind_cache(past_key_value, layer_idx, new_k, new_v)
+      _commit_cache_update(
+          past_key_value,
+          layer,
+          layer_idx,
+          new_k,
+          new_v,
+          rebind_by_layer=use_fused_sdpa_cache_update,
+      )
     else:
       new_k = layer.keys
       new_v = layer.values
@@ -410,6 +512,11 @@ def scaled_dot_product_attention_transposed(
     past_key_value: Optional[Any] = None,
     layer_idx: Optional[int] = None,
     skip_cache_update: bool = False,
+    use_fused_sdpa_cache_update: bool = False,
+    # TODO(weiyiw): Take a single `param_tensor`: drop the in-graph `[3]`
+    # rewrite in `core/exportable_module.py`, compute the update length where
+    # it is used (`ring_buffer_sdpa`), and remove `runtime_param_tensor`.
+    runtime_param_tensor: Optional[torch.Tensor] = None,
 ):
   """Scaled dot product attention with transposed key and value.
 
@@ -437,6 +544,11 @@ def scaled_dot_product_attention_transposed(
     layer_idx (int): the index of the layer.
     skip_cache_update (bool): whether to skip updating the KV cache (e.g. for
       shared KV layers that reuse keys/values from earlier donor layers).
+    use_fused_sdpa_cache_update (bool): whether sliding-window prefill emits
+      `odml.fused_sdpa_cache_update`.
+    runtime_param_tensor (torch.Tensor): the runtime param signature input,
+      before the in-graph rewrite that produces `param_tensor`; read by the
+      fused op.
 
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
@@ -519,6 +631,8 @@ def scaled_dot_product_attention_transposed(
         mask=mask,
         softcap=softcap,
         skip_cache_update=skip_cache_update,
+        use_fused_sdpa_cache_update=use_fused_sdpa_cache_update,
+        runtime_param_tensor=runtime_param_tensor,
         use_sdpa_composite=is_decode_composite,
     )
     if is_decode_composite:

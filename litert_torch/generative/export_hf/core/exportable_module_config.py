@@ -124,6 +124,11 @@ class ExportableModuleConfig:
   apply_gpu_composites: bool = False
   # Use a boolean attention mask instead of materializing fp32 mask constants.
   use_bool_mask: bool = False
+  # Emit `odml.fused_sdpa_cache_update` for sliding-window (ring buffer)
+  # layers: attention over the old cache plus the new tokens and the ring
+  # buffer write in one op, so the backend orders the write after every read.
+  # Requires `apply_gpu_composites` and `sliding_window_ring_buffer_size`.
+  use_fused_sdpa_cache_update: bool = False
   # Whether the prefill signature returns logits for the final position.
   # The LiteRT-LM runtime samples from the decode signature and never reads
   # the prefill logits, so emitting them adds a vocabulary-sized `lm_head`

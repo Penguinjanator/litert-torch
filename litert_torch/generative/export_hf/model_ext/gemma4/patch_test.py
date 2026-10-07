@@ -15,6 +15,7 @@
 """Tests for Gemma4 model export patches."""
 
 import copy
+import types
 
 from absl.testing import parameterized
 from litert_torch.generative.export_hf.core import export_lib
@@ -83,6 +84,70 @@ def _get_dummy_position_embeddings(batch_size, seq_len, head_dim):
 
 
 class PatchTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ("first_sliding_layer", 0, None),
+      ("first_full_layer", 4, None),
+      ("sliding_donor", 13, True),
+      ("full_donor", 14, True),
+      ("first_shared_sliding_layer", 15, None),
+      ("first_shared_full_layer", 19, None),
+      ("last_sliding_reader", 33, False),
+      ("last_full_reader", 34, False),
+  )
+  def test_get_prefill_skip_cache_update_override_gemma4_e2b(
+      self, layer_idx, expected
+  ):
+    # Gemma4-E2B: 35 layers, the last 20 share KV, every 5th is full attention.
+    config = types.SimpleNamespace(
+        num_hidden_layers=35,
+        num_kv_shared_layers=20,
+        layer_types=[
+            "full_attention" if i % 5 == 4 else "sliding_attention"
+            for i in range(35)
+        ],
+    )
+    self.assertEqual(
+        patch.get_prefill_skip_cache_update_override(config, layer_idx),
+        expected,
+    )
+
+  def test_get_prefill_skip_cache_update_override_without_kv_sharing(self):
+    config = types.SimpleNamespace(
+        num_hidden_layers=2,
+        num_kv_shared_layers=0,
+        layer_types=["sliding_attention", "full_attention"],
+    )
+    for layer_idx in range(2):
+      self.assertIsNone(
+          patch.get_prefill_skip_cache_update_override(config, layer_idx)
+      )
+
+  @parameterized.named_parameters(
+      # (is_kv_shared_layer, override, sliding_prefill, readers_live, skip)
+      ("owner", False, None, True, True, False),
+      ("shared_reader", True, None, True, True, True),
+      ("donor_defers", False, True, True, True, True),
+      ("last_reader_writes", True, False, True, True, False),
+      ("donor_decode", False, True, False, True, False),
+      ("last_reader_decode", True, False, False, True, True),
+      ("donor_dead_readers", False, True, True, False, False),
+      ("last_reader_dead_readers", True, False, True, False, True),
+  )
+  def test_resolve_skip_cache_update(
+      self, is_kv_shared_layer, override, sliding_prefill, readers_live, skip
+  ):
+    # The override applies only to sliding-window prefill with live readers;
+    # otherwise the donor writes first and KV-shared layers skip.
+    self.assertEqual(
+        patch.resolve_skip_cache_update(
+            is_kv_shared_layer,
+            override,
+            is_sliding_prefill=sliding_prefill,
+            shared_kv_readers_live=readers_live,
+        ),
+        skip,
+    )
 
   def test_fused_gemma4_attention_qkv(self):
     config = _get_dummy_gemma4_text_config()

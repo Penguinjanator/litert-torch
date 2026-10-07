@@ -14,7 +14,11 @@
 # ==============================================================================
 """Tests for the transposed SDPA composite."""
 
+import types
+from unittest import mock
+
 from absl.testing import parameterized
+from litert_torch.generative.export_hf.core.sliding_window import attention_mask
 from litert_torch.generative.export_hf.experimental.composites import sdpa
 import torch
 from absl.testing import absltest as googletest
@@ -214,6 +218,229 @@ class ScaledDotProductAttentionTransposedTest(parameterized.TestCase):
     self.assertNotEmpty(sdpa_marks)
     mark_str = str(sdpa_marks[-1].args) + str(sdpa_marks[-1].kwargs)
     self.assertIn(f"('is_causal', {expected_is_causal})", mark_str)
+
+
+_WINDOW = 8
+_PAST_LEN = 6
+_NEW_LEN = 4  # _PAST_LEN + _NEW_LEN > _WINDOW, so the write wraps the ring.
+_HEAD_DIM = 4
+
+
+class _RingCacheLayer:
+  """Minimal sliding-window cache layer as seen by `ring_buffer_sdpa`."""
+
+  def __init__(self, keys, values):
+    self.keys = keys
+    self.values = values
+    self.is_sliding = True
+    self.max_cache_len = _WINDOW
+    self.k_ts_idx = _K_TS_IDX
+    self.v_ts_idx = _V_TS_IDX
+
+
+_ORIGINAL_CACHE_UPDATE = sdpa.gpu_cache_update.cache_update
+
+
+def _in_place_cache_update(*args, **kwargs):
+  """`cache_update` that also writes into its cache inputs.
+
+  The runtimes alias the KV cache input and output buffers, so the update is
+  visible to every later reader of the *input* tensor. Eager PyTorch is
+  functional and hides this; writing back in place reproduces it.
+
+  Args:
+    *args: Forwarded to `cache_update`.
+    **kwargs: Forwarded to `cache_update`.
+
+  Returns:
+    The (aliased) key and value caches.
+  """
+  cache_k, cache_v = args[3], args[4]
+  new_k, new_v = _ORIGINAL_CACHE_UPDATE(*args, **kwargs)
+  cache_k.copy_(new_k)
+  cache_v.copy_(new_v)
+  return cache_k, cache_v
+
+
+class SharedRingBufferWriteTest(parameterized.TestCase):
+  """KV-shared layers must all read the ring buffer before it is written."""
+
+  def setUp(self):
+    super().setUp()
+    generator = torch.Generator().manual_seed(42)
+
+    def randn(*shape):
+      return torch.randn(*shape, generator=generator)
+
+    # Slots [0, _PAST_LEN) hold positions [0, _PAST_LEN); the rest is empty.
+    self.cache_k = randn(1, 1, _WINDOW, _HEAD_DIM)
+    self.cache_v = randn(1, 1, _HEAD_DIM, _WINDOW)
+    # The donor's new K/V, which every sharing layer attends to.
+    self.key_states = randn(1, 1, _NEW_LEN, _HEAD_DIM)
+    self.value_states = randn(1, 1, _NEW_LEN, _HEAD_DIM)
+    self.queries = [randn(1, 1, _NEW_LEN, _HEAD_DIM) for _ in range(3)]
+    self.cache_position = torch.arange(
+        _PAST_LEN, _PAST_LEN + _NEW_LEN, dtype=torch.int32
+    )
+    total = _PAST_LEN + _NEW_LEN
+    self.param_tensor = torch.tensor(
+        [[[[_PAST_LEN, total, total, _NEW_LEN, 0, 0, 0]]]], dtype=torch.int32
+    )
+    past_mask = torch.zeros(1, 1, _NEW_LEN, _WINDOW, dtype=torch.bool)
+    past_mask[..., :_PAST_LEN] = True
+    new_mask = torch.tril(torch.ones(_NEW_LEN, _NEW_LEN, dtype=torch.bool))
+    self.mask = torch.cat([past_mask, new_mask.view(1, 1, _NEW_LEN, -1)], -1)
+
+  def _attend(self, layer, query, skip_cache_update):
+    return sdpa.ring_buffer_sdpa(
+        query=query,
+        key_past=layer.keys,
+        value_past=layer.values,
+        k_ts_idx=_K_TS_IDX,
+        v_ts_idx=_V_TS_IDX,
+        param_tensor=self.param_tensor,
+        is_global=False,
+        key_states=self.key_states,
+        value_states=self.value_states,
+        layer=layer,
+        cache_position=self.cache_position,
+        mask=self.mask,
+        skip_cache_update=skip_cache_update,
+    )
+
+  def _run_donor_and_readers(self, skips):
+    """Runs donor, reader, last reader over one shared, aliased cache.
+
+    Args:
+      skips: `skip_cache_update` for the donor, a reader and the last reader.
+
+    Returns:
+      The three attention outputs and the shared cache layer.
+    """
+    layer = _RingCacheLayer(self.cache_k.clone(), self.cache_v.clone())
+    outputs = []
+    with mock.patch.object(
+        sdpa.gpu_cache_update, "cache_update", _in_place_cache_update
+    ):
+      for query, skip in zip(self.queries, skips):
+        outputs.append(self._attend(layer, query, skip_cache_update=skip))
+    return outputs, layer
+
+  def _reference(self):
+    """Every layer reads the pre-update cache; the cache is written once."""
+    outputs = []
+    for query in self.queries:
+      layer = _RingCacheLayer(self.cache_k.clone(), self.cache_v.clone())
+      outputs.append(self._attend(layer, query, skip_cache_update=True))
+    layer = _RingCacheLayer(self.cache_k.clone(), self.cache_v.clone())
+    self._attend(layer, self.queries[0], skip_cache_update=False)
+    return outputs, layer
+
+  def test_donor_writing_first_corrupts_later_readers(self):
+    """Documents the hazard of the default ownership (the donor writes)."""
+    expected, _ = self._reference()
+    actual, _ = self._run_donor_and_readers([False, True, True])
+    torch.testing.assert_close(actual[0], expected[0])
+    self.assertFalse(torch.allclose(actual[1], expected[1]))
+    self.assertFalse(torch.allclose(actual[2], expected[2]))
+
+  def test_last_reader_writes_the_donor_cache(self):
+    expected, expected_layer = self._reference()
+    # The donor skips its write; the last reader writes the shared cache.
+    actual, layer = self._run_donor_and_readers([True, True, False])
+    for a, e in zip(actual, expected):
+      torch.testing.assert_close(a, e)
+    torch.testing.assert_close(layer.keys, expected_layer.keys)
+    torch.testing.assert_close(layer.values, expected_layer.values)
+    # The write wrapped the ring: slots 6, 7, 0, 1 hold the new tokens.
+    self.assertFalse(torch.equal(layer.keys, self.cache_k))
+
+  def test_rebind_updates_every_alias_of_the_donor_cache(self):
+    layer = _RingCacheLayer(self.cache_k, self.cache_v)
+    alias = _RingCacheLayer(self.cache_k, self.cache_v)
+    other = _RingCacheLayer(self.cache_k.clone(), self.cache_v.clone())
+    cache = types.SimpleNamespace(layers=[layer, alias, other])
+    new_k = torch.zeros_like(self.cache_k)
+    new_v = torch.zeros_like(self.cache_v)
+
+    sdpa._rebind_layer_cache(cache, layer, new_k, new_v)
+
+    self.assertIs(layer.keys, new_k)
+    self.assertIs(alias.keys, new_k)
+    self.assertIs(alias.values, new_v)
+    self.assertIsNot(other.keys, new_k)
+
+
+class RingBufferDecodeTest(parameterized.TestCase):
+  """Sliding-window decode as `odml.sdpa_transposed` vs the runtime BMM path."""
+
+  def _inputs(self, pos, window=6, groups=4):
+    generator = torch.Generator().manual_seed(pos)
+
+    def randn(*shape):
+      return torch.randn(*shape, generator=generator)
+
+    layer = _RingCacheLayer(
+        randn(1, 1, _WINDOW, _HEAD_DIM), randn(1, 1, _HEAD_DIM, _WINDOW)
+    )
+    input_pos = torch.tensor([pos], dtype=torch.int32)
+    return dict(
+        query=randn(1, 1, groups, _HEAD_DIM),
+        key_past=layer.keys,
+        value_past=layer.values,
+        param_tensor=torch.tensor(
+            [[[[pos % _WINDOW, pos + 1, pos + 1, 1, 0, 0, 0]]]],
+            dtype=torch.int32,
+        ),
+        key_states=randn(1, 1, 1, _HEAD_DIM),
+        value_states=randn(1, 1, 1, _HEAD_DIM),
+        layer=layer,
+        cache_position=input_pos,
+        mask=attention_mask.build_sliding_window_decode_mask(
+            window, _WINDOW, input_pos, use_bool_mask=True
+        ),
+    )
+
+  def _decode(self, inputs, use_sdpa_composite):
+    return sdpa.ring_buffer_sdpa(
+        k_ts_idx=_K_TS_IDX,
+        v_ts_idx=_V_TS_IDX,
+        is_global=False,
+        use_sdpa_composite=use_sdpa_composite,
+        **inputs,
+    )
+
+  @parameterized.product(pos=[0, 3, 7, 8, 13], groups=[1, 4])
+  def test_composite_matches_runtime_bmm(self, pos, groups):
+    expected = self._decode(
+        self._inputs(pos, groups=groups), use_sdpa_composite=False
+    )
+    actual = self._decode(
+        self._inputs(pos, groups=groups), use_sdpa_composite=True
+    )
+    self.assertEqual(actual.shape, expected.shape)
+    torch.testing.assert_close(actual, expected)
+
+  def test_emits_sdpa_transposed_with_param(self):
+    test = self
+    # Built outside `forward`: torch.export cannot trace a torch.Generator.
+    inputs = self._inputs(9)
+
+    class Decode(torch.nn.Module):
+
+      def forward(self, x):
+        return test._decode(inputs, use_sdpa_composite=True) + x
+
+    exported = torch.export.export(Decode(), (torch.zeros(1),))
+    marks = [
+        str(n.args)
+        for n in exported.graph.nodes
+        if n.op == "call_function" and "mark_tensor" in str(n.target)
+    ]
+    sdpa_marks = [m for m in marks if "odml.sdpa_transposed" in m]
+    # q, k, v, mask and param in, one output.
+    self.assertLen(sdpa_marks, 6, sdpa_marks)
+    self.assertFalse(any("odml.runtime_bmm" in m for m in marks))
 
 
 if __name__ == "__main__":
