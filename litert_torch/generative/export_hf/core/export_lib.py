@@ -617,9 +617,10 @@ def export_text_prefill_decode_model(
           model, iter_config, source_model_artifacts
       )
       for module in (prefill_module, decode_module):
-        for signature_name, (inputs, dynamic_shapes) in module.get_sample_inputs(
-            text_model_config
-        ).items():
+        for signature_name, (
+            inputs,
+            dynamic_shapes,
+        ) in module.get_sample_inputs(text_model_config).items():
           sig_name = signature_name
           if len(export_config.cache_lengths) > 1:
             sig_name = f'{signature_name}_cache_{cache_len}'
@@ -1291,20 +1292,39 @@ def export_additional_models_impl(
   text_model_config = source_model_artifacts.text_model_config
   quantization_recipe = export_config.quantization_recipe
   work_dir = export_config.work_dir
+  assert work_dir is not None
   embedder_module = exportable_module_cls(model)
-  converter = converter_utils.Converter()
-  sample_inputs = embedder_module.get_sample_inputs(
-      text_model_config, export_config
-  )
-  for signature_name, (sample_inputs, _) in sample_inputs.items():
-    converter.add_signature(
-        signature_name,
-        embedder_module.eval(),
-        sample_kwargs=sample_inputs,
+  model_path = os.path.join(work_dir, f'{name}.tflite')
+  weights_loader = source_model_artifacts.weights_loader
+  with contextlib.ExitStack() as stack:
+    if weights_loader is not None:
+      # Parameters are on meta (Converter V2): trace on meta and serve real
+      # buffer values to the converter, as for the prefill/decode model.
+      buffer_values = stack.enter_context(
+          weights_loader_lib.buffers_on_meta(embedder_module)
+      )
+      weights_loader = weights_loader_lib.with_tensors(
+          weights_loader, buffer_values
+      )
+    device = next(embedder_module.parameters(), torch.empty(0)).device
+    converter = converter_utils.Converter()
+    sample_inputs = embedder_module.get_sample_inputs(
+        text_model_config, export_config
     )
-  lrt_model = converter.convert(strict_export=False)
-  model_path = os.path.join(work_dir, f'{name}.tflite')  # pyrefly: ignore[no-matching-overload]
-  lrt_model.export(model_path)
+    for signature_name, (sample_inputs, _) in sample_inputs.items():
+      if weights_loader is not None:
+        sample_inputs = {k: v.to(device) for k, v in sample_inputs.items()}
+      converter.add_signature(
+          signature_name,
+          embedder_module.eval(),
+          sample_kwargs=sample_inputs,
+      )
+    lrt_model = converter.convert(
+        strict_export=False,
+        **_v2_convert_kwargs(export_config, weights_loader, model_path),
+    )
+  if not export_config.use_v2:
+    lrt_model.export(model_path)
   quantization_recipe_list = (
       quantization_recipe.split(',') if quantization_recipe else [None]
   )
@@ -1328,11 +1348,6 @@ def export_additional_models(
   exportable_model_cls_dict = model_ext_exportables.get_additional_exportables(
       source_model_artifacts.model_config
   )
-  if exportable_model_cls_dict and export_config.use_v2:
-    raise NotImplementedError(
-        'Additional models are not supported with use_v2=True:'
-        f' {sorted(exportable_model_cls_dict)}.'
-    )
   for name, exportable_module_cls in exportable_model_cls_dict.items():
     with progress.task(f'Export {name} model'):
       exported_model_artifacts = export_additional_models_impl(
