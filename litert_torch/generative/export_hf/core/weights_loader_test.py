@@ -14,7 +14,9 @@
 # ==============================================================================
 """Tests for weights_loader."""
 
+import json
 import os
+from unittest import mock
 
 from absl.testing import absltest
 from litert_torch.generative.export_hf.core import weights_loader as weights_loader_lib
@@ -241,6 +243,73 @@ class HFCheckpointWeightsLoaderTest(absltest.TestCase):
       weights_loader_lib.HFCheckpointWeightsLoader(
           self.create_tempdir().full_path
       )
+
+
+class ResolveCheckpointDirTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.cached_dir = self.create_tempdir().full_path
+    self.downloaded_dir = self.create_tempdir().full_path
+    safetensors.torch.save_file(
+        {"w": torch.zeros(1)},
+        os.path.join(self.downloaded_dir, "model.safetensors"),
+    )
+
+  def _fake_snapshot_download(self, repo_id, allow_patterns, **kwargs):
+    del repo_id, allow_patterns  # Unused.
+    if kwargs.get("local_files_only"):
+      return self.cached_dir
+    return self.downloaded_dir
+
+  def _resolve(self) -> tuple[str, mock.MagicMock]:
+    with mock.patch.object(
+        weights_loader_lib.huggingface_hub,
+        "snapshot_download",
+        autospec=True,
+        side_effect=self._fake_snapshot_download,
+    ) as snapshot_download:
+      resolved = weights_loader_lib.HFCheckpointWeightsLoader(
+          "org/model"
+      )._checkpoint_dir  # pylint: disable=protected-access
+    return resolved, snapshot_download
+
+  def test_uses_complete_cached_snapshot(self):
+    safetensors.torch.save_file(
+        {"w": torch.zeros(1)},
+        os.path.join(self.cached_dir, "model.safetensors"),
+    )
+    resolved, snapshot_download = self._resolve()
+    self.assertEqual(resolved, self.cached_dir)
+    snapshot_download.assert_called_once()
+
+  def test_downloads_if_cached_snapshot_has_no_weights(self):
+    # E.g. only `config.json` was cached by `from_config`.
+    with open(os.path.join(self.cached_dir, "config.json"), "w") as f:
+      f.write("{}")
+    resolved, snapshot_download = self._resolve()
+    self.assertEqual(resolved, self.downloaded_dir)
+    self.assertEqual(snapshot_download.call_count, 2)
+
+  def test_downloads_if_cached_snapshot_misses_shards(self):
+    with open(
+        os.path.join(self.cached_dir, "model.safetensors.index.json"), "w"
+    ) as f:
+      json.dump(
+          {
+              "weight_map": {
+                  "a": "model-00001-of-00002.safetensors",
+                  "b": "model-00002-of-00002.safetensors",
+              }
+          },
+          f,
+      )
+    safetensors.torch.save_file(
+        {"a": torch.zeros(1)},
+        os.path.join(self.cached_dir, "model-00001-of-00002.safetensors"),
+    )
+    resolved, _ = self._resolve()
+    self.assertEqual(resolved, self.downloaded_dir)
 
 
 if __name__ == "__main__":

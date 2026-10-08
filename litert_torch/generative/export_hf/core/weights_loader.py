@@ -249,6 +249,18 @@ def submodule_weights_loader(
   return load
 
 
+def _has_all_weights(checkpoint_dir: str) -> bool:
+  """Returns whether `checkpoint_dir` holds all of its safetensors files."""
+  index_path = os.path.join(checkpoint_dir, _INDEX_FILE)
+  if os.path.exists(index_path):
+    with open(index_path, "r") as f:
+      files = set(json.load(f).get("weight_map", {}).values())
+    return bool(files) and all(
+        os.path.exists(os.path.join(checkpoint_dir, name)) for name in files
+    )
+  return bool(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+
+
 class HFCheckpointWeightsLoader:
   """Streams weights on demand from a HuggingFace safetensors checkpoint.
 
@@ -288,15 +300,20 @@ class HFCheckpointWeightsLoader:
     if os.path.isdir(model_path):
       return model_path
     try:
-      return huggingface_hub.snapshot_download(
+      local_dir = huggingface_hub.snapshot_download(
           model_path,
           allow_patterns=list(_SNAPSHOT_PATTERNS),
           local_files_only=True,
       )
+      # The cached snapshot may hold only config / tokenizer files (e.g. after
+      # loading the model `from_config`); download the weights in that case.
+      if _has_all_weights(local_dir):
+        return local_dir
     except hf_errors.LocalEntryNotFoundError:
-      return huggingface_hub.snapshot_download(
-          model_path, allow_patterns=list(_SNAPSHOT_PATTERNS)
-      )
+      pass
+    return huggingface_hub.snapshot_download(
+        model_path, allow_patterns=list(_SNAPSHOT_PATTERNS)
+    )
 
   def _load_weight_map(self) -> dict[str, str]:
     """Maps tensor names to the safetensors file (relative) that holds them."""
