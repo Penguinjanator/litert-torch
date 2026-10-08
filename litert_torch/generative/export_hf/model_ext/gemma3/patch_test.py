@@ -146,13 +146,10 @@ class PatchTest(parameterized.TestCase):
     hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
     position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
 
-    rope_base = float(getattr(config, "rope_theta", 500000.0))
-    cos, sin = rotary_pos_emb.build_rope(
-        position_ids[0], n_elem=config.head_dim, base=int(rope_base)
+    rotary_emb = modeling_gemma3.Gemma3RotaryEmbedding(config)
+    position_embeddings = rotary_emb(
+        hidden_states, position_ids, layer_type="full_attention"
     )
-    cos = torch.cat([cos, cos], dim=-1)
-    sin = torch.cat([sin, sin], dim=-1)
-    position_embeddings = (cos, sin)
 
     with torch.no_grad():
       expected_output, _ = original_attn(
