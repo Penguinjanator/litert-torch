@@ -24,8 +24,9 @@ class RoPEEmbedder(torch.nn.Module):
 
   def __init__(self, model):
     super().__init__()
-    self.model = model
-
+    # Only the rotary embedding is registered, not `model`: otherwise all of
+    # the model's (unused) parameters would be part of the exported program,
+    # and they have no values when the model is on `meta` (Converter V2).
     try:
       self.rotary_emb = model.model.original_rotary_emb
     except AttributeError:

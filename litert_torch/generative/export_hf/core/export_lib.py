@@ -1271,9 +1271,15 @@ def export_auxiliary_model(
             module.eval(),
             sample_kwargs=sample_input,
         )
-  lrt_model = converter.convert(strict_export=False)
   model_path = os.path.join(work_dir, 'auxiliary.tflite')  # pyrefly: ignore[no-matching-overload]
-  lrt_model.export(model_path)
+  # The auxiliary modules hold no model parameters, only small real buffers
+  # (e.g. RoPE `inv_freq`), so Converter V2 needs no weights loader here.
+  lrt_model = converter.convert(
+      strict_export=False,
+      **_v2_convert_kwargs(export_config, None, model_path),
+  )
+  if not export_config.use_v2:
+    lrt_model.export(model_path)
   return dataclasses.replace(
       exported_model_artifacts,
       auxiliary_model_path=model_path,
