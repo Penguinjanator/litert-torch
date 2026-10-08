@@ -30,7 +30,9 @@ def create_sliding_mask(
   """Creates mask for sliding window attention (PyTorch)."""
   # Use torch.arange to create a tensor with a range of integers in a
   # Dynamo-friendly way.
-  cache_positions = torch.arange(cache_len, dtype=torch.int32)
+  cache_positions = torch.arange(
+      cache_len, dtype=torch.int32, device=segment_pos.device
+  )
   cache_positions = cache_positions.view(1, 1, -1)  # [1, 1, cache_len]
   segment_pos_expanded = segment_pos.clone().unsqueeze(-1)  # [B, seq_len, 1]
 
@@ -156,4 +158,3 @@ def get_magic_number_for(org_number: int) -> int:
   while not is_magic_number_(org_number):
     org_number += 1
   return org_number
-

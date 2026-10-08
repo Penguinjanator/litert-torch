@@ -76,10 +76,12 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder(
   def _get_input(
       self, batch_size, prefill_length, prefill_length_dim, model_config
   ):
+    device = self.device
     embeddings = {
         "embeddings": torch.ones(
             (batch_size, prefill_length, model_config.hidden_size),
             dtype=torch.float32,
+            device=device,
         )
     }
     embeddings_dynamic_shape = (
@@ -94,6 +96,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder(
                 model_config.hidden_size_per_layer_input,
             ),
             dtype=torch.float32,
+            device=device,
         )
     }
     embeddings_dynamic_shape |= (
@@ -162,10 +165,12 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder(
   def _get_input(
       self, batch_size, decode_length, decode_length_dim, model_config
   ):
+    device = self.device
     embeddings = {
         "embeddings": torch.ones(
             (batch_size, decode_length, model_config.hidden_size),
             dtype=torch.float32,
+            device=device,
         )
     }
     embeddings_dynamic_shape = {"embeddings": None} if decode_length_dim else {}
@@ -178,6 +183,7 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder(
                 model_config.hidden_size_per_layer_input,
             ),
             dtype=torch.float32,
+            device=device,
         )
     }
     embeddings_dynamic_shape |= (
