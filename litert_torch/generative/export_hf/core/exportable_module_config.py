@@ -414,9 +414,9 @@ class ExportableModuleConfig:
     unsupported = []
     if self.task != ExportTask.TEXT_GENERATION:
       unsupported.append(f"task={self.task}")
-    if self.split_cache:
-      unsupported.append("split_cache")
-    if self.moe_exports_implementation:
+    # `split_cache` always sets `litert_moe_sequential`, which only affects
+    # models with experts; those are rejected when the model is loaded.
+    if self.moe_exports_implementation and not self.split_cache:
       unsupported.append("moe_exports_implementation")
     if self.experimental_use_mixed_precision:
       unsupported.append("experimental_use_mixed_precision")

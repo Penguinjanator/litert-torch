@@ -142,5 +142,40 @@ class ModelDtypeTest(parameterized.TestCase):
       _config(model_dtype="bfloat16", experimental_use_fp16=True)
 
 
+class ConverterV2OptionsTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      dict(split_cache=False),
+      dict(split_cache=True),
+      dict(split_cache=True, experimental_use_fp16=True),
+  )
+  def test_supported(self, **kwargs):
+    config = _config(use_v2=True, delete_in_memory_params=True, **kwargs)
+    self.assertTrue(config.use_v2)
+
+  def test_delete_in_memory_params_requires_v2(self):
+    with self.assertRaisesRegex(ValueError, "requires `use_v2=True`"):
+      _config(delete_in_memory_params=True)
+
+  @parameterized.named_parameters(
+      ("task", dict(task="text_to_image"), "task="),
+      (
+          "moe",
+          dict(moe_exports_implementation="litert_moe_sequential"),
+          "moe_exports_implementation",
+      ),
+      (
+          "mixed_precision",
+          dict(experimental_use_mixed_precision=True),
+          "experimental_use_mixed_precision",
+      ),
+  )
+  def test_unsupported_raises(self, kwargs, expected_option):
+    with self.assertRaisesRegex(
+        ValueError, f"`use_v2=True` does not support: .*{expected_option}"
+    ):
+      _config(use_v2=True, **kwargs)
+
+
 if __name__ == "__main__":
   googletest.main()

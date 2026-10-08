@@ -163,6 +163,13 @@ def patch_builtin_tuple_for_export():
       del tuple_dict['to']
 
 
+def _is_moe_experts(module: nn.Module) -> bool:
+  """Returns whether `module` holds MoE expert weights rewritten for export."""
+  return getattr(module, 'num_experts', None) is not None and (
+      hasattr(module, 'gate_up_proj') or hasattr(module, 'gate_proj')
+  )
+
+
 def pre_split_model_experts(model: nn.Module) -> nn.Module:
   """Splits 3D expert weight tensors into separate parameters to bypass LiteRT constant folding."""
   for module in model.modules():
@@ -468,6 +475,12 @@ def load_model(
     except Exception as e:  # pylint: disable=broad-exception-caught
       print(f'Failed to load chat template: {e}')
 
+  if export_config.moe_exports_implementation and export_config.use_v2:
+    if any(_is_moe_experts(m) for m in model.modules()):
+      raise NotImplementedError(
+          '`moe_exports_implementation` (implied by `split_cache`) is not'
+          ' supported for models with experts when `use_v2=True`.'
+      )
   if export_config.moe_exports_implementation == 'litert_moe_sequential':
     model = pre_split_model_experts(model)
   elif export_config.moe_exports_implementation == 'litert_moe':
