@@ -104,6 +104,58 @@ def cast_params_(model: nn.Module, dtype: torch.dtype) -> nn.Module:
   return model
 
 
+def load_persistent_buffers_(
+    model: nn.Module, weights_loader: WeightsLoader
+) -> nn.Module:
+  """Loads persistent buffers stored in the checkpoint, in place.
+
+  `init_params_on_meta` keeps buffers on CPU with their init values. That is
+  right for non-persistent buffers (e.g. RoPE `inv_freq`), but persistent
+  buffers saved in the checkpoint (e.g. Gemma-4 `layer_scalar`) must be loaded,
+  as `from_pretrained` does. Buffers missing from the checkpoint keep their
+  init values.
+
+  Args:
+    model: The model whose buffers to load.
+    weights_loader: Resolves FQNs relative to `model`, as for its parameters.
+
+  Returns:
+    The same model.
+
+  Raises:
+    ValueError: If a checkpoint tensor's shape does not match its buffer.
+  """
+  missing = []
+  with torch.no_grad():
+    for prefix, module in model.named_modules():
+      for name, buf in module._buffers.items():  # pylint: disable=protected-access
+        if (
+            buf is None
+            or buf.is_meta
+            or name in module._non_persistent_buffers_set  # pylint: disable=protected-access
+        ):
+          continue
+        fqn = f"{prefix}.{name}" if prefix else name
+        try:
+          value = weights_loader(fqn)
+        except KeyError:
+          missing.append(fqn)
+          continue
+        if value.shape != buf.shape:
+          raise ValueError(
+              f"Checkpoint tensor for buffer '{fqn}' has shape"
+              f" {tuple(value.shape)}, expected {tuple(buf.shape)}."
+          )
+        buf.copy_(value)
+  if missing:
+    logging.warning(
+        "Persistent buffers not found in the checkpoint keep their init"
+        " values: %s",
+        missing,
+    )
+  return model
+
+
 @contextlib.contextmanager
 def buffers_on_meta(
     *roots: nn.Module,

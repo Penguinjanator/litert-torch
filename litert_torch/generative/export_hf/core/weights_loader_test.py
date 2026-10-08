@@ -50,6 +50,33 @@ class _Wrapper(nn.Module):
     self.model = model
 
 
+class _Layer(nn.Module):
+  """Decoder layer with Gemma-4 style buffers."""
+
+  def __init__(self):
+    super().__init__()
+    self.proj = nn.Linear(4, 4)
+    self.rotary = _Rotary()
+    self.register_buffer("layer_scalar", torch.ones(1))
+    self.register_buffer("not_in_checkpoint", torch.zeros(2))
+
+
+class _LanguageModel(nn.Module):
+
+  def __init__(self):
+    super().__init__()
+    self.layers = nn.ModuleList([_Layer()])
+
+
+class _Multimodal(nn.Module):
+  """Holds the text model at `model.language_model`, as Gemma-4 does."""
+
+  def __init__(self):
+    super().__init__()
+    self.model = nn.Module()
+    self.model.language_model = _LanguageModel()
+
+
 class InitAndCastTest(absltest.TestCase):
 
   def test_init_params_on_meta_keeps_buffers_real(self):
@@ -122,6 +149,7 @@ class HFCheckpointWeightsLoaderTest(absltest.TestCase):
         ),
         "model.language_model.layers.0.mlp.gate_proj.weight": torch.randn(6, 4),
         "model.language_model.layers.0.mlp.up_proj.weight": torch.randn(6, 4),
+        "model.language_model.layers.0.layer_scalar": torch.tensor([0.5]),
     }
     safetensors.torch.save_file(
         self.tensors, os.path.join(self.ckpt_dir, "model.safetensors")
@@ -179,6 +207,34 @@ class HFCheckpointWeightsLoaderTest(absltest.TestCase):
     self.assertIsNotNone(
         self.loader("model.language_model.embed_tokens.weight")
     )
+
+  def test_load_persistent_buffers(self):
+    with weights_loader_lib.init_params_on_meta():
+      model = _Multimodal()
+    layer = model.model.language_model.layers[0]
+    with self.assertLogs(level="WARNING") as logs:
+      weights_loader_lib.load_persistent_buffers_(model, self.loader)
+    # Resolved by the same lookup as `model.language_model.layers.0.*` params.
+    torch.testing.assert_close(
+        layer.layer_scalar,
+        self.tensors["model.language_model.layers.0.layer_scalar"],
+    )
+    # Non-persistent and missing buffers keep their init values.
+    torch.testing.assert_close(
+        layer.rotary.inv_freq, torch.arange(4, dtype=torch.float32)
+    )
+    torch.testing.assert_close(layer.not_in_checkpoint, torch.zeros(2))
+    self.assertIn(
+        "model.language_model.layers.0.not_in_checkpoint", logs.output[0]
+    )
+    self.assertTrue(layer.proj.weight.is_meta)
+
+  def test_load_persistent_buffers_shape_mismatch_raises(self):
+    model = _Multimodal()
+    layer = model.model.language_model.layers[0]
+    layer.layer_scalar = torch.ones(2)
+    with self.assertRaisesRegex(ValueError, "layer_scalar"):
+      weights_loader_lib.load_persistent_buffers_(model, self.loader)
 
   def test_empty_checkpoint_raises(self):
     with self.assertRaises(ValueError):

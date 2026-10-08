@@ -399,6 +399,7 @@ def load_model(
               and output_emb.weight is input_emb.weight
           ),
       )
+      weights_loader_lib.load_persistent_buffers_(model, weights_loader)
     elif export_config.use_random_weights:
       model = auto_model_cls.from_config(
           config=config,
