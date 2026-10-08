@@ -70,13 +70,18 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
     ret = {}
     ret['inputs_embeds'] = embeddings
 
-    cache_runtime_args = {'cache_position': torch.arange(embeddings.shape[1])}
+    # Positions follow the inputs' device (`meta` for V2 export).
+    seq_len = embeddings.shape[1]
+    device = embeddings.device
+    cache_runtime_args = {
+        'cache_position': torch.arange(seq_len, device=device)
+    }
     kv_cache.set_cache_runtime_args(cache_runtime_args)
 
     ret.update({
-        'position_ids': torch.arange(embeddings.shape[1])[None, :],
+        'position_ids': torch.arange(seq_len, device=device)[None, :],
         'past_key_values': kv_cache,
-        'cache_position': torch.arange(embeddings.shape[1]),
+        'cache_position': torch.arange(seq_len, device=device),
         'attention_mask': masks,
         # Other common settings
         'use_cache': True,
@@ -161,36 +166,45 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
 
     global_embed_size_per_head = global_head_dim or embed_size_per_head
 
+    # Sample inputs must live on the model's device (`meta` for V2 export).
+    device = self.device
     sample_inputs = {
         'embeddings': torch.ones(  # pyrefly: ignore[no-matching-overload]
             (batch_size, input_length, model_config.hidden_size),
             dtype=torch.float32,
+            device=device,
         ),
     }
     pos_emb = {
         'cos': torch.ones(  # pyrefly: ignore[no-matching-overload]
             (1, input_length, 1, global_embed_size_per_head),
             dtype=torch.float32,
+            device=device,
         ),
         'sin': torch.ones(  # pyrefly: ignore[no-matching-overload]
             (1, input_length, 1, global_embed_size_per_head),
             dtype=torch.float32,
+            device=device,
         ),
     }
     if utils.has_local_rope(self.model):
       pos_emb.update({
           'local_cos': torch.ones(  # pyrefly: ignore[no-matching-overload]
-              (1, input_length, 1, embed_size_per_head), dtype=torch.float32
+              (1, input_length, 1, embed_size_per_head),
+              dtype=torch.float32,
+              device=device,
           ),
           'local_sin': torch.ones(  # pyrefly: ignore[no-matching-overload]
-              (1, input_length, 1, embed_size_per_head), dtype=torch.float32
+              (1, input_length, 1, embed_size_per_head),
+              dtype=torch.float32,
+              device=device,
           ),
       })
 
     mask_shape = (1, 1, input_length, cache_length + input_length)
 
     mask = {
-        'global': torch.ones(mask_shape, dtype=torch.float32),
+        'global': torch.ones(mask_shape, dtype=torch.float32, device=device),
     }
     if utils.has_sliding_attention(self.model):
       if export_config.sliding_window_ring_buffer_size is not None:
@@ -203,7 +217,9 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
       else:
         local_mask_shape = mask_shape
       mask.update({
-          'local': torch.ones(local_mask_shape, dtype=torch.float32),
+          'local': torch.ones(
+              local_mask_shape, dtype=torch.float32, device=device
+          ),
       })
     sample_inputs.update({
         'mask': mask,

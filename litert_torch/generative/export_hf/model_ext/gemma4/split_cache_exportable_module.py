@@ -45,6 +45,7 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLMPrefill(
             self.model.config.text_config.hidden_size_per_layer_input,
         ),
         dtype=torch.float32,
+        device=self.device,
     )
     return inputs
 
@@ -100,6 +101,7 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLMGenerate(
             self.model.config.text_config.hidden_size_per_layer_input,
         ),
         dtype=torch.float32,
+        device=self.device,
     )
     return inputs
 

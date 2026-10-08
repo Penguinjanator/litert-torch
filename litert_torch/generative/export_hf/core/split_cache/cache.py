@@ -187,6 +187,19 @@ class LiteRTLMSplitCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
 
     return SplitCacheTuple([self.keys, self.values])
 
+  def to(self, *args, **kwargs) -> "LiteRTLMSplitCacheLayer":
+    """Moves the cache and slice tensors, e.g. to the model's device."""
+
+    def _move(entry):
+      cache, cache_slice = entry
+      if cache_slice is not None:
+        cache_slice = cache_slice.to(*args, **kwargs)
+      return cache.to(*args, **kwargs), cache_slice
+
+    self.keys = _move(self.keys)
+    self.values = _move(self.values)
+    return self
+
   def get_mask_sizes(self, cache_position: torch.Tensor):
     """Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for."""
     kv_offset = 0

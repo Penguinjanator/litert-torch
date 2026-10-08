@@ -138,6 +138,21 @@ class SplitCacheTest(googletest.TestCase):
     kv_cache.remove_dummy_cache_layers(model_config)
     self.assertLen(kv_cache.layers, 3)
 
+  def test_to_moves_cache_and_slices(self):
+    kv_cache = split_cache_lib.LiteRTLMSplitCache(build_cache_data(2, 2, 16, 8))
+    layer = kv_cache.layers[1]
+    layer.update(torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8))
+
+    self.assertIs(kv_cache.to("meta"), kv_cache)
+
+    self.assertTrue(kv_cache.layers[0].keys[0].is_meta)
+    self.assertTrue(kv_cache.layers[0].values[0].is_meta)
+    self.assertIsNone(kv_cache.layers[0].keys[1])
+    self.assertIsNone(kv_cache.layers[0].values[1])
+    self.assertTrue(all(t.is_meta for t in layer.keys + layer.values))
+    self.assertEqual(layer.keys[0].shape, (1, 2, 16, 8))
+    self.assertEqual(layer.keys[1].shape, (1, 2, 4, 8))
+
 
 if __name__ == "__main__":
   googletest.main()
