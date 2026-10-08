@@ -51,11 +51,16 @@ def _scaled_dot_product_attention(
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
   """
-  key_past = key_cache[0]
-  key = key_cache[1]
-
-  value_past = value_cache[0]
-  value = value_cache[1]
+  # The KV cache may be stored in a narrower dtype than the graph (e.g. float16
+  # with `experimental_use_fp16`); attention is computed in the query dtype.
+  key_past, key = key_cache
+  value_past, value = value_cache
+  assert key is not None and value is not None
+  compute_dtype = query.dtype
+  key_past = key_past.to(compute_dtype)
+  key = key.to(compute_dtype)
+  value_past = value_past.to(compute_dtype)
+  value = value.to(compute_dtype)
 
   if scale is None:
     scale = 1.0 / math.sqrt(head_size)

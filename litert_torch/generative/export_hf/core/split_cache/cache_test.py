@@ -153,6 +153,36 @@ class SplitCacheTest(googletest.TestCase):
     self.assertEqual(layer.keys[0].shape, (1, 2, 16, 8))
     self.assertEqual(layer.keys[1].shape, (1, 2, 4, 8))
 
+  def test_create_from_config_uses_cache_dtype(self):
+    class MockConfig:
+      num_hidden_layers = 2
+      num_key_value_heads = 2
+      head_dim = 8
+      hidden_size = 32
+      num_attention_heads = 4
+
+    for use_fp16, expected_dtype in (
+        (False, torch.float32),
+        (True, torch.float16),
+    ):
+      with self.subTest(use_fp16=use_fp16):
+        export_config = split_cache_lib.ExportableModuleConfig(
+            model="dummy_model",
+            cache_length=16,
+            experimental_use_fp16=use_fp16,
+        )
+        kv_cache = split_cache_lib.LiteRTLMSplitCache.create_from_config(
+            MockConfig(), export_config
+        )
+        layer = kv_cache.layers[0]
+        self.assertEqual(layer.keys[0].dtype, expected_dtype)
+        self.assertEqual(layer.values[0].dtype, expected_dtype)
+
+        # Slices are stored in the cache dtype too.
+        layer.update(torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8))
+        self.assertEqual(layer.keys[1].dtype, expected_dtype)
+        self.assertEqual(layer.values[1].dtype, expected_dtype)
+
 
 if __name__ == "__main__":
   googletest.main()
