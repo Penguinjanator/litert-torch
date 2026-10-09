@@ -46,6 +46,7 @@ def _run_convert_passes(
   )
 
   passes = [
+      fx_passes.LowerTorchAOPass(),
       fx_passes.EliminateDeadCodePass(),
       fx_passes.OptimizeLayoutTransposesPass(),
       fx_passes.CanonicalizePass(),

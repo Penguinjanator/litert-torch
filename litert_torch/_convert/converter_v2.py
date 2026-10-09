@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 _REQUIRED_CONVERTER_FLAGS = (
     "enable_composite_direct_lowering",
     "fold_fp16_resource_casts",
+    "strict_qdq_mode",
     "enable_debug",
     "debug_dir",
 )
@@ -121,7 +122,7 @@ def _apply_tfl_converter_flags(
         and not hasattr(target_obj, attr_name)
     ):
       setattr(target_obj.debug_options, attr_name, val)
-    else:
+    elif hasattr(target_obj, attr_name):
       setattr(target_obj, attr_name, val)
 
   def _iterate_dict_tree(flags_dict: dict[str, Any], path: list[Any]):
@@ -623,6 +624,7 @@ def _build_tfl_converter_flags(
   flags = converter_flags_pb2.ConverterFlags()
   flags.model_origin_framework = converter_flags_pb2.ConverterFlags.PYTORCH
   flags.enable_composite_direct_lowering = True
+  flags.strict_qdq_mode = True
   flags.fold_fp16_resource_casts = fold_fp16_resource_casts
   if enable_debug:
     flags.enable_debug = True
