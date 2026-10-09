@@ -113,14 +113,23 @@ def apply_rotary_emb(
 ) -> torch.Tensor:
   """Applies rotary positional embeddings to query/key tensor."""
   cos, sin = freqs_cis
-  if sequence_dim == 2:
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
-  elif sequence_dim == 1:
-    cos = cos[None, :, None, :]
-    sin = sin[None, :, None, :]
+  if cos.ndim == 2:
+    if sequence_dim == 2:
+      cos = cos[None, None, :, :]
+      sin = sin[None, None, :, :]
+    elif sequence_dim == 1:
+      cos = cos[None, :, None, :]
+      sin = sin[None, :, None, :]
+    else:
+      raise ValueError(f"Unsupported sequence_dim={sequence_dim}")
+  elif cos.ndim == 4:
+    if sequence_dim == 2 and cos.shape[2] == 1 and cos.shape[1] != 1:
+      cos = cos.transpose(1, 2)
+      sin = sin.transpose(1, 2)
+    elif sequence_dim not in (1, 2):
+      raise ValueError(f"Unsupported sequence_dim={sequence_dim}")
   else:
-    raise ValueError(f"Unsupported sequence_dim={sequence_dim}")
+    raise ValueError(f"Unsupported rotary embedding ndim={cos.ndim}")
   cos, sin = cos.to(x.device), sin.to(x.device)
   x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
   x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)

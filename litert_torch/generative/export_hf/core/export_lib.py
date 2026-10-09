@@ -290,7 +290,12 @@ def load_model(
     if not model_type:
       model_index_path = os.path.join(local_model_dir, 'model_index.json')
       config_path = os.path.join(local_model_dir, 'config.json')
-      if os.path.exists(model_index_path):
+      # prism-ml/bonsai-image-ternary-4B-unpacked also sets
+      # "_class_name": "Flux2KleinPipeline" in its model_index.json, so check
+      # for "bonsai" in model_path before reading model_index.json.
+      if 'bonsai' in model_path.lower():
+        model_type = 'bonsai_flux2'
+      elif os.path.exists(model_index_path):
         with open(model_index_path, 'r') as f:
           model_type = json.load(f).get('_class_name', 'bonsai_flux2')
       elif os.path.exists(config_path):

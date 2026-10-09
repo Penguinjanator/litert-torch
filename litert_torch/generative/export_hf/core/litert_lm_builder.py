@@ -409,7 +409,18 @@ def build_llm_metadata(
 
 _IMAGE_GEN_TFLITE_MODEL_TYPES = {
     'text_encoder': 'tf_lite_text_encoder',
+    'text_encoder_0': 'tf_lite_text_encoder_0',
+    'text_encoder_1': 'tf_lite_text_encoder_1',
+    'text_encoder_2': 'tf_lite_text_encoder_2',
     'dit': 'tf_lite_image_denoiser',
+    'dit_initial': 'tf_lite_diffusion_transformer_initial',
+    'dit_double_block_0': 'tf_lite_diffusion_transformer_double_block_0',
+    'dit_double_block_1': 'tf_lite_diffusion_transformer_double_block_1',
+    'dit_single_block_0': 'tf_lite_diffusion_transformer_single_block_0',
+    'dit_single_block_1': 'tf_lite_diffusion_transformer_single_block_1',
+    'dit_single_block_2': 'tf_lite_diffusion_transformer_single_block_2',
+    'dit_single_block_3': 'tf_lite_diffusion_transformer_single_block_3',
+    'dit_final': 'tf_lite_diffusion_transformer_final',
     'vae_decoder': 'tf_lite_image_decoder',
     'vae_encoder': 'tf_lite_image_encoder',
 }
@@ -454,12 +465,24 @@ def package_image_gen_model(
         name,
         submodel_path,
     ) in exported_model_artifacts.additional_model_paths.items():
-      if name not in _IMAGE_GEN_TFLITE_MODEL_TYPES:
+      if name in _IMAGE_GEN_TFLITE_MODEL_TYPES:
+        builder.add_tflite_model(
+            submodel_path,
+            _IMAGE_GEN_TFLITE_MODEL_TYPES[name],
+        )
+      elif submodel_path.endswith('.bin'):
+        builder.add_generic_binary_data(
+            submodel_path,
+            additional_metadata=[
+                litertlm_builder.Metadata(
+                    key='name',
+                    value=name,
+                    dtype=litertlm_builder.DType.STRING,
+                )
+            ],
+        )
+      else:
         raise ValueError(f'Unsupported ImageGen model component: {name}')
-      builder.add_tflite_model(
-          submodel_path,
-          _IMAGE_GEN_TFLITE_MODEL_TYPES[name],
-      )
 
   model_path = os.path.join(output_dir, 'model.litertlm')  # pyrefly: ignore[no-matching-overload]
   with open(model_path, 'wb') as f:

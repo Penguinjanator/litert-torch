@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Bonsai-FLUX.2 / FLUX.2-klein image generation model export for LiteRT."""
+"""Bonsai-FLUX.2 image generation model export for LiteRT."""
 
 from __future__ import annotations
 
@@ -191,7 +191,7 @@ def fix_zero_block_scales(tflite_path: str) -> int:
   return patched_tensors
 
 
-def _quantize_text_encoder(fp32_path: str, out_path: str) -> str:
+def quantize_text_encoder(fp32_path: str, out_path: str) -> str:
   """Quantizes Qwen3 text encoder with int4 block128 FC and int8 channelwise embedding."""
   rm = recipe_manager_lib.RecipeManager()
   rm.add_dynamic_config(
@@ -212,7 +212,10 @@ def _quantize_text_encoder(fp32_path: str, out_path: str) -> str:
   return out_path
 
 
-def _quantize_dit(fp32_path: str, out_path: str) -> str:
+_quantize_text_encoder = quantize_text_encoder
+
+
+def quantize_dit(fp32_path: str, out_path: str) -> str:
   """Quantizes FLUX.2 DiT with int8 channelwise non-block FC and int4 block32 block FC."""
   rm = recipe_manager_lib.RecipeManager()
   rm.add_dynamic_config(
@@ -234,8 +237,11 @@ def _quantize_dit(fp32_path: str, out_path: str) -> str:
   return out_path
 
 
+_quantize_dit = quantize_dit
+
+
 class BonsaiFlux2(image_gen_model.ImageGenModel):
-  """Bonsai-FLUX.2 / FLUX.2-klein multi-stage text-to-image model."""
+  """Bonsai-FLUX.2 multi-stage text-to-image model."""
 
   def __init__(
       self,
@@ -304,13 +310,11 @@ class BonsaiFlux2(image_gen_model.ImageGenModel):
       return False
     return True
 
-  def export_text_encoder(
+  def _load_qwen_model(
       self,
-      output_dir: str,
       export_config: exportable_module_config.ExportableModuleConfig,
-  ) -> str:
-    """Exports the Qwen3 text encoder to TFLite."""
-    print("Exporting text encoder...")
+  ) -> nn.Module:
+    """Loads the Qwen3 text encoder base model."""
     text_enc_dir = os.path.join(self.model_dir, "text_encoder")
     if not os.path.exists(text_enc_dir):
       text_enc_dir = self.model_dir
@@ -343,6 +347,16 @@ class BonsaiFlux2(image_gen_model.ImageGenModel):
     causal_lm.eval()
     qwen_model = getattr(causal_lm, "model", causal_lm)
     assert isinstance(qwen_model, nn.Module)
+    return qwen_model
+
+  def export_text_encoder(
+      self,
+      output_dir: str,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ) -> str:
+    """Exports the Qwen3 text encoder to TFLite."""
+    print("Exporting text encoder...")
+    qwen_model = self._load_qwen_model(export_config)
 
     num_layers = getattr(qwen_model.config, "num_hidden_layers", 36)
     layers = tuple(k for k in self._text_encoder_layers if k <= num_layers)
@@ -523,6 +537,26 @@ class BonsaiFlux2(image_gen_model.ImageGenModel):
 
     return artifacts
 
+  def _build_flux2_params_proto(
+      self, export_config: exportable_module_config.ExportableModuleConfig
+  ) -> image_gen_model_type_pb2.Flux2Params:
+    """Builds the shared Flux2Params proto message."""
+    in_channels = int(self._dit_config.get("in_channels", 128))
+    joint_attention_dim = int(self._dit_config.get("joint_attention_dim", 7680))
+
+    bn_scale = self._latent_bn_scale or [1.0] * in_channels
+    bn_shift = self._latent_bn_shift or [0.0] * in_channels
+
+    return image_gen_model_type_pb2.Flux2Params(
+        seq_len=self._get_max_seq_len(export_config),
+        img_size=export_config.t2i_output_image_size,
+        packed_ch=in_channels,
+        prompt_dim=joint_attention_dim,
+        default_steps=4,
+        latent_bn_scale=bn_scale,
+        latent_bn_shift=bn_shift,
+    )
+
   def get_image_gen_metadata(
       self, export_config: exportable_module_config.ExportableModuleConfig
   ) -> image_gen_metadata_pb2.ImageGenMetadata:
@@ -532,22 +566,8 @@ class BonsaiFlux2(image_gen_model.ImageGenModel):
           "image_gen_metadata_pb2 and image_gen_model_type_pb2 are required to"
           " build ImageGenMetadata; please upgrade litert-lm-builder."
       )
-    in_channels = int(self._dit_config.get("in_channels", 128))
-    joint_attention_dim = int(self._dit_config.get("joint_attention_dim", 7680))
-
-    bn_scale = self._latent_bn_scale or [1.0] * in_channels
-    bn_shift = self._latent_bn_shift or [0.0] * in_channels
-
     bonsai_proto = image_gen_model_type_pb2.BonsaiFlux2(
-        flux2_params=image_gen_model_type_pb2.Flux2Params(
-            seq_len=self._get_max_seq_len(export_config),
-            img_size=export_config.t2i_output_image_size,
-            packed_ch=in_channels,
-            prompt_dim=joint_attention_dim,
-            default_steps=4,
-            latent_bn_scale=bn_scale,
-            latent_bn_shift=bn_shift,
-        ),
+        flux2_params=self._build_flux2_params_proto(export_config),
     )
     return image_gen_metadata_pb2.ImageGenMetadata(
         image_gen_model_type=image_gen_model_type_pb2.ImageGenModelType(
