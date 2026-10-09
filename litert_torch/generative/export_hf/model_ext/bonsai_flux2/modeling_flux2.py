@@ -101,8 +101,10 @@ def get_1d_rotary_pos_embed(
       ** (torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim)
   )
   freqs = torch.outer(pos.float(), freqs)
-  freqs_cos = freqs.cos().repeat_interleave(2, dim=1)
-  freqs_sin = freqs.sin().repeat_interleave(2, dim=1)
+  cos = freqs.cos()
+  sin = freqs.sin()
+  freqs_cos = torch.stack([cos, cos], dim=-1).reshape(cos.shape[0], -1)
+  freqs_sin = torch.stack([sin, sin], dim=-1).reshape(sin.shape[0], -1)
   return freqs_cos, freqs_sin
 
 
@@ -131,8 +133,11 @@ def apply_rotary_emb(
   else:
     raise ValueError(f"Unsupported rotary embedding ndim={cos.ndim}")
   cos, sin = cos.to(x.device), sin.to(x.device)
-  x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
-  x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+  b, s, h, d = x.shape
+  x_pairs = x.reshape(b, s, h * (d // 2), 2)
+  x_real = x_pairs[..., :1]
+  x_imag = x_pairs[..., 1:]
+  x_rotated = torch.cat([-x_imag, x_real], dim=-1).reshape(b, s, h, d)
   return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
 
 
@@ -849,6 +854,22 @@ class Flux2Transformer2DModel(nn.Module):
     return types.SimpleNamespace(sample=output)
 
 
+class Flux2GroupNorm(nn.GroupNorm):
+  """4D GroupNorm that avoids BROADCAST_TO even when weights are unit splats."""
+
+  def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
+    n, c, h, w = input.shape
+    g = self.num_groups
+    x_g = input.reshape(n, g, c // g, h * w)
+    mean = x_g.mean(dim=(2, 3), keepdim=True)
+    var = ((x_g - mean) ** 2).mean(dim=(2, 3), keepdim=True)
+    x_norm = (x_g - mean) * torch.rsqrt(var + self.eps)
+    out = x_norm.reshape(n, c, h, w)
+    if self.affine:
+      out = out * self.weight.view(1, c, 1, 1) + self.bias.view(1, c, 1, 1)
+    return out
+
+
 class ResnetBlock2D(nn.Module):
   """2D Residual block for VAE Encoder/Decoder."""
 
@@ -865,13 +886,13 @@ class ResnetBlock2D(nn.Module):
     self.in_channels = in_channels
     self.out_channels = out_channels
 
-    self.norm1 = nn.GroupNorm(
+    self.norm1 = Flux2GroupNorm(
         num_groups=groups, num_channels=in_channels, eps=eps, affine=True
     )
     self.conv1 = nn.Conv2d(
         in_channels, out_channels, kernel_size=3, stride=1, padding=1
     )
-    self.norm2 = nn.GroupNorm(
+    self.norm2 = Flux2GroupNorm(
         num_groups=groups, num_channels=out_channels, eps=eps, affine=True
     )
     self.dropout = nn.Dropout(dropout)
@@ -945,7 +966,7 @@ class VaeMidAttention(nn.Module):
     self.heads = heads
     self.head_dim = dim_head
     inner_dim = dim_head * heads
-    self.group_norm = nn.GroupNorm(
+    self.group_norm = Flux2GroupNorm(
         num_channels=query_dim, num_groups=norm_num_groups, eps=eps, affine=True
     )
     self.to_q = nn.Linear(query_dim, inner_dim, bias=True)
@@ -955,6 +976,14 @@ class VaeMidAttention(nn.Module):
         [nn.Linear(inner_dim, query_dim, bias=True), nn.Dropout(0.0)]
     )
 
+  @staticmethod
+  def _linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    assert isinstance(layer, nn.Linear)
+    out = F.linear(x.contiguous(), layer.weight)
+    if layer.bias is not None:
+      out = out + layer.bias
+    return out
+
   def forward(
       self, hidden_states: torch.Tensor, temb: torch.Tensor | None = None
   ) -> torch.Tensor:
@@ -962,22 +991,24 @@ class VaeMidAttention(nn.Module):
     residual = hidden_states
     batch, channel, height, width = hidden_states.shape
     hidden_states = self.group_norm(hidden_states)
-    hidden_states = hidden_states.view(
-        batch, channel, height * width
-    ).transpose(1, 2)
+    hidden_states = (
+        hidden_states.view(batch, channel, height * width)
+        .transpose(1, 2)
+        .contiguous()
+    )
 
     q = (
-        self.to_q(hidden_states)
+        self._linear(self.to_q, hidden_states)
         .view(batch, -1, self.heads, self.head_dim)
         .transpose(1, 2)
     )
     k = (
-        self.to_k(hidden_states)
+        self._linear(self.to_k, hidden_states)
         .view(batch, -1, self.heads, self.head_dim)
         .transpose(1, 2)
     )
     v = (
-        self.to_v(hidden_states)
+        self._linear(self.to_v, hidden_states)
         .view(batch, -1, self.heads, self.head_dim)
         .transpose(1, 2)
     )
@@ -986,7 +1017,7 @@ class VaeMidAttention(nn.Module):
         q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
     )
     out = out.transpose(1, 2).reshape(batch, -1, self.heads * self.head_dim)
-    out = self.to_out[1](self.to_out[0](out))
+    out = self.to_out[1](self._linear(self.to_out[0], out))
     out = out.transpose(-1, -2).reshape(batch, channel, height, width)
     return out + residual
 
@@ -1165,7 +1196,7 @@ class Encoder(nn.Module):
         attention_head_dim=block_out_channels[-1],
         add_attention=mid_block_add_attention,
     )
-    self.conv_norm_out = nn.GroupNorm(
+    self.conv_norm_out = Flux2GroupNorm(
         num_channels=block_out_channels[-1],
         num_groups=norm_num_groups,
         eps=1e-6,
@@ -1227,7 +1258,7 @@ class Decoder(nn.Module):
               add_upsample=not is_final_block,
           )
       )
-    self.conv_norm_out = nn.GroupNorm(
+    self.conv_norm_out = Flux2GroupNorm(
         num_channels=block_out_channels[0],
         num_groups=norm_num_groups,
         eps=1e-6,

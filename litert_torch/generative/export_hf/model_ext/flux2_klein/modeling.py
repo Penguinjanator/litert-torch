@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from litert_torch.generative.export_hf.model_ext.bonsai_flux2 import bonsai_flux2
 from litert_torch.generative.export_hf.model_ext.bonsai_flux2 import modeling_flux2
 import torch
 from torch import nn
@@ -29,6 +30,7 @@ class KleinTextEncoderShard(nn.Module):
 
   def __init__(self, layers: nn.ModuleList, norm: nn.Module | None = None):
     super().__init__()
+    bonsai_flux2.configure_qwen3_for_gpu_export(layers)
     self.layers = layers
     self.norm = norm
 

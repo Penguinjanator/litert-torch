@@ -66,6 +66,30 @@ _DEFAULT_QWEN3_CONFIG = {
 }
 
 
+def _repeat_kv_4d(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+  """Repeats KV heads along dim=1 using <=4D tensors without expand/broadcast_to."""
+  batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+  if n_rep == 1:
+    return hidden_states
+  return torch.cat([hidden_states] * n_rep, dim=2).reshape(
+      batch, num_key_value_heads * n_rep, slen, head_dim
+  )
+
+
+def configure_qwen3_for_gpu_export(module: nn.Module) -> None:
+  """Configures Qwen3 modules to use eager attention and 4D repeat_kv for GPU."""
+  qwen3_mod = getattr(getattr(transformers, "models", None), "qwen3", None)
+  modeling_qwen3 = getattr(qwen3_mod, "modeling_qwen3", None)
+  if modeling_qwen3 is not None and hasattr(modeling_qwen3, "repeat_kv"):
+    modeling_qwen3.repeat_kv = _repeat_kv_4d
+
+  if hasattr(module, "config") and module.config is not None:
+    setattr(module.config, "_attn_implementation", "eager")
+  for sub in module.modules():
+    if hasattr(sub, "config") and sub.config is not None:
+      setattr(sub.config, "_attn_implementation", "eager")
+
+
 class PromptEmbedder(nn.Module):
   """Extracts intermediate Qwen3 hidden states and stacks them along feature dim."""
 
@@ -73,15 +97,27 @@ class PromptEmbedder(nn.Module):
       self, qwen_model: nn.Module, layers: tuple[int, ...] = (9, 18, 27)
   ):
     super().__init__()
+    configure_qwen3_for_gpu_export(qwen_model)
     self.model = qwen_model
     self.layers = tuple(layers)
 
   def forward(
       self, input_ids: torch.Tensor, attention_mask: torch.Tensor
   ) -> torch.Tensor:
+    b, s = input_ids.shape
+    mask_val = -1e9
+    causal_np = np.triu(np.full((1, 1, s, s), mask_val, dtype=np.float32), k=1)
+    causal_mask = torch.from_numpy(causal_np).to(input_ids.device)
+    pad_mask = (1.0 - attention_mask.to(torch.float32)).reshape(
+        b, 1, 1, s
+    ) * mask_val
+    mask_4d = causal_mask + pad_mask
     out = self.model(
         input_ids=input_ids,
-        attention_mask=attention_mask,
+        attention_mask={
+            "full_attention": mask_4d,
+            "sliding_attention": mask_4d,
+        },
         output_hidden_states=True,
         use_cache=False,
     )
