@@ -27,11 +27,11 @@ import torch
 from torch import nn
 
 try:
-  from litert_lm_builder.runtime.proto import image_gen_metadata_pb2
   from litert_lm_builder.runtime.proto import image_gen_model_type_pb2
+  from litert_lm_builder.runtime.proto import text2image_metadata_pb2
 except ImportError:
-  image_gen_metadata_pb2 = None
   image_gen_model_type_pb2 = None
+  text2image_metadata_pb2 = None
 
 
 def _split_into_shards(
@@ -297,18 +297,18 @@ class Flux2Klein(bonsai_flux2.BonsaiFlux2):
 
   def get_image_gen_metadata(
       self, export_config: exportable_module_config.ExportableModuleConfig
-  ) -> image_gen_metadata_pb2.ImageGenMetadata:
-    """Builds ImageGenMetadata proto for the exported FLUX.2-klein model."""
-    if image_gen_metadata_pb2 is None or image_gen_model_type_pb2 is None:
+  ) -> text2image_metadata_pb2.Text2ImageMetadata:
+    """Builds Text2ImageMetadata proto for the exported FLUX.2-klein model."""
+    if text2image_metadata_pb2 is None or image_gen_model_type_pb2 is None:
       raise ImportError(
-          "image_gen_metadata_pb2 and image_gen_model_type_pb2 are required to"
-          " build ImageGenMetadata; please upgrade litert-lm-builder."
+          "text2image_metadata_pb2 and image_gen_model_type_pb2 are required to"
+          " build Text2ImageMetadata; please upgrade litert-lm-builder."
       )
     klein_proto = image_gen_model_type_pb2.Flux2Klein(
         flux2_params=self._build_flux2_params_proto(export_config),
         text_embed_table_key=self._TEXT_EMBED_FILENAME,
     )
-    return image_gen_metadata_pb2.ImageGenMetadata(
+    return text2image_metadata_pb2.Text2ImageMetadata(
         image_gen_model_type=image_gen_model_type_pb2.ImageGenModelType(
             flux2_klein=klein_proto
         ),

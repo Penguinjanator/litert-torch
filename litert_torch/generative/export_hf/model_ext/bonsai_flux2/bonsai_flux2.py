@@ -30,11 +30,11 @@ from torch import nn
 import transformers
 
 try:
-  from litert_lm_builder.runtime.proto import image_gen_metadata_pb2
   from litert_lm_builder.runtime.proto import image_gen_model_type_pb2
+  from litert_lm_builder.runtime.proto import text2image_metadata_pb2
 except ImportError:
-  image_gen_metadata_pb2 = None
   image_gen_model_type_pb2 = None
+  text2image_metadata_pb2 = None
 from ai_edge_quantizer import qtyping
 from ai_edge_quantizer import quantizer as quantizer_lib
 from ai_edge_quantizer import recipe_manager as recipe_manager_lib
@@ -559,17 +559,17 @@ class BonsaiFlux2(image_gen_model.ImageGenModel):
 
   def get_image_gen_metadata(
       self, export_config: exportable_module_config.ExportableModuleConfig
-  ) -> image_gen_metadata_pb2.ImageGenMetadata:
-    """Builds ImageGenMetadata proto for the exported Bonsai-FLUX.2 model."""
-    if image_gen_metadata_pb2 is None or image_gen_model_type_pb2 is None:
+  ) -> text2image_metadata_pb2.Text2ImageMetadata:
+    """Builds Text2ImageMetadata proto for the exported Bonsai-FLUX.2 model."""
+    if text2image_metadata_pb2 is None or image_gen_model_type_pb2 is None:
       raise ImportError(
-          "image_gen_metadata_pb2 and image_gen_model_type_pb2 are required to"
-          " build ImageGenMetadata; please upgrade litert-lm-builder."
+          "text2image_metadata_pb2 and image_gen_model_type_pb2 are required to"
+          " build Text2ImageMetadata; please upgrade litert-lm-builder."
       )
     bonsai_proto = image_gen_model_type_pb2.BonsaiFlux2(
         flux2_params=self._build_flux2_params_proto(export_config),
     )
-    return image_gen_metadata_pb2.ImageGenMetadata(
+    return text2image_metadata_pb2.Text2ImageMetadata(
         image_gen_model_type=image_gen_model_type_pb2.ImageGenModelType(
             bonsai_flux2=bonsai_proto
         ),

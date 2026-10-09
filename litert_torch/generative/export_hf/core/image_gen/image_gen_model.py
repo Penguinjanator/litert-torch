@@ -23,9 +23,9 @@ import huggingface_hub
 from litert_torch.generative.export_hf.core import exportable_module_config
 
 try:
-  from litert_lm_builder.runtime.proto import image_gen_metadata_pb2
+  from litert_lm_builder.runtime.proto import text2image_metadata_pb2
 except ImportError:
-  image_gen_metadata_pb2 = None
+  text2image_metadata_pb2 = None
 
 
 class ImageGenModel(abc.ABC):
@@ -56,6 +56,6 @@ class ImageGenModel(abc.ABC):
   @abc.abstractmethod
   def get_image_gen_metadata(
       self, export_config: exportable_module_config.ExportableModuleConfig
-  ) -> image_gen_metadata_pb2.ImageGenMetadata:
-    """Returns ImageGenMetadata proto populated from the model."""
+  ) -> text2image_metadata_pb2.Text2ImageMetadata:
+    """Returns Text2ImageMetadata proto populated from the model."""
     raise NotImplementedError

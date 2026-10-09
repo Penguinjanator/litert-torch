@@ -453,7 +453,7 @@ def package_image_gen_model(
           dtype=litertlm_builder.DType.STRING,
       )
   )
-  builder.add_image_gen_metadata(image_gen_metadata_path)
+  builder.add_text2image_metadata(image_gen_metadata_path)
   if tokenizer_model_path:
     if tokenizer_model_path.endswith('.json'):
       builder.add_hf_tokenizer(tokenizer_model_path)
