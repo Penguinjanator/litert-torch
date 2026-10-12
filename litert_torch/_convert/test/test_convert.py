@@ -15,6 +15,7 @@
 """Tests for litert_torch.convert."""
 
 import dataclasses
+import logging
 from typing import Tuple
 
 import litert_torch
@@ -538,6 +539,94 @@ class TestConvert(testing.V1V2TestCase):
     except Exception as err:
       self.fail(f"Conversion failed with int64 inputs: {err}")
     # pylint: enable=broad-except
+
+  def _io_dtypes(self, edge_model):
+    interpreter = tfl_interpreter.Interpreter(
+        model_content=edge_model.model_content()
+    )
+    runner = interpreter.get_signature_runner("serving_default")
+    inputs = {k: v["dtype"] for k, v in runner.get_input_details().items()}
+    outputs = {k: v["dtype"] for k, v in runner.get_output_details().items()}
+    return inputs, outputs
+
+  def test_convert_downcasts_x64_by_default(self):
+    """enable_x64 defaults to False: int64 inputs and outputs become int32."""
+    if self.use_v2:
+      self.skipTest("enable_x64 is not yet applied with use_v2.")
+
+    class SampleModel(nn.Module):
+
+      def forward(self, ids: torch.Tensor):
+        return ids + 1
+
+    model = SampleModel().eval()
+    args = (torch.randint(0, 100, (1, 8), dtype=torch.int64),)
+
+    with self.assertLogs(level="WARNING") as logs:
+      edge_model = litert_torch.convert(model, args)
+    downcast_logs = [m for m in logs.output if "downcasts 64-bit" in m]
+    self.assertLen(downcast_logs, 1)
+    self.assertIn("input 'args_0' (torch.int64)", downcast_logs[0])
+    self.assertIn("output 'output_0' (torch.int64)", downcast_logs[0])
+    inputs, outputs = self._io_dtypes(edge_model)
+    self.assertEqual(set(inputs.values()), {np.int32})
+    self.assertEqual(set(outputs.values()), {np.int32})
+    np.testing.assert_array_equal(
+        edge_model(args[0].to(torch.int32)), model(*args).numpy()
+    )
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger().addHandler(handler)
+    try:
+      edge_model = litert_torch.convert(model, args, enable_x64=True)
+    finally:
+      logging.getLogger().removeHandler(handler)
+    self.assertEmpty(
+        [r for r in records if "downcasts 64-bit" in r.getMessage()]
+    )
+    inputs, outputs = self._io_dtypes(edge_model)
+    self.assertEqual(set(inputs.values()), {np.int64})
+    self.assertEqual(set(outputs.values()), {np.int64})
+
+  def test_convert_x64_sentinel_constants_saturate(self):
+    """INT64_MAX/INT64_MIN sentinels keep their meaning under enable_x64=False.
+
+    The downcast pass saturates int64 constants to the int32 range rather than
+    truncating them, so framework sentinels like `iinfo(long).max` still act as
+    +inf/-inf for min/argmax after conversion.
+    """
+    if self.use_v2:
+      self.skipTest("enable_x64 is not yet applied with use_v2.")
+
+    int64_max = torch.iinfo(torch.int64).max
+    int64_min = torch.iinfo(torch.int64).min
+
+    class SampleModel(nn.Module):
+
+      def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        # aten.slice with end=INT64_MAX.
+        tail = x[:, 1:]
+        positions = torch.arange(x.shape[1])
+        # First set position: INT64_MAX fill must not become -1.
+        first = torch.where(mask, positions, int64_max).min()
+        # Last set position: INT64_MIN fill must not become 0.
+        last = positions.masked_fill(~mask, int64_min).argmax()
+        return tail, first, last
+
+    model = SampleModel().eval()
+    x = torch.randint(0, 100, (2, 8), dtype=torch.int64)
+    mask = torch.tensor([False, False, True, True, False, True, False, False])
+    expected = model(x, mask)
+    self.assertEqual(expected[1].item(), 2)
+    self.assertEqual(expected[2].item(), 5)
+
+    edge_model = litert_torch.convert(model, (x, mask))
+    actual = edge_model(x.to(torch.int32), mask)
+    self.assertLen(actual, 3)
+    for got, want in zip(actual, expected):
+      np.testing.assert_array_equal(got, want.numpy())
 
   def test_convert_model_with_torch_div_operation_6d_inputs(self):
     """Test converting a simple model with torch.div operation and 6d inputs."""
