@@ -18,6 +18,7 @@ from flatbuffers import flexbuffers
 from litert_torch.backend import lowerings
 from litert_torch.backend.experimental.torch_tfl import _ops as _
 from litert_torch.backend.lowerings import utils as lowering_utils
+from litert_torch.generative.export_hf.experimental.composites import short_conv
 from litert_converter.mlir import ir
 import torch
 import torch.nn.functional as F
@@ -193,10 +194,8 @@ def gated_delta_net(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Helper function to apply Gated Delta Net with conv1d outside and custom gated_delta_update op."""
   batch_size, seq_len, _ = mixed_qkv.shape
-  conv_dim = conv_weight.shape[0]
   key_dim = head_k_dim * num_k_heads
   value_dim = head_v_dim * num_v_heads
-  state_len = conv_state.shape[-1]
 
   mixed_qkv_t = mixed_qkv.transpose(1, 2)
   if valid_mask is not None and valid_mask.numel() > 0:
@@ -206,24 +205,16 @@ def gated_delta_net(
   else:
     mixed_qkv_masked = mixed_qkv_t
 
-  full_qkv = torch.cat([conv_state, mixed_qkv_masked], dim=-1)
-  conv_out = F.conv1d(
-      full_qkv,
+  num_valid_tokens = None
+  if seq_len > 1 and valid_mask is not None and valid_mask.numel() > 0:
+    num_valid_tokens = valid_mask[0].to(torch.float32).sum().to(torch.int32)
+  conv_out, new_conv_state = short_conv.causal_conv1d_with_state(
+      mixed_qkv_masked,
+      conv_state,
       conv_weight,
-      None,
-      padding=0,
-      groups=conv_dim,
+      num_valid_tokens=num_valid_tokens,
   )
   conv_out = F.silu(conv_out[:, :, -seq_len:]).transpose(1, 2)
-
-  if seq_len > 1 and valid_mask is not None and valid_mask.numel() > 0:
-    num_real = valid_mask[0].to(torch.float32).sum().to(torch.int32)
-    indices = num_real + torch.arange(
-        state_len, device=full_qkv.device, dtype=torch.int32
-    )
-    new_conv_state = torch.ops.tfl.gather(full_qkv, indices, 2)
-  else:
-    new_conv_state = full_qkv[:, :, -state_len:]
 
   query, key, value = torch.split(
       conv_out, [key_dim, key_dim, value_dim], dim=-1
