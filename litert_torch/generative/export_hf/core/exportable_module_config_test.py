@@ -35,6 +35,7 @@ class SdpaCompositeTest(parameterized.TestCase):
   def test_defaults_to_false(self):
     config = _config(cache_length=4096)
     self.assertFalse(config.apply_gpu_composites)
+    self.assertFalse(config.externalize_weights)
     for flag_name in exportable_module_config._GPU_OPTIMIZATION_FLAGS:
       self.assertFalse(getattr(config, flag_name), msg=flag_name)
     self.assertFalse(config.prefill_logits)

@@ -116,6 +116,9 @@ class ExportableModuleConfig:
   auto_model_override: str | None = None
   use_jinja_template: bool = True
   bundle_litert_lm: bool = True
+  # Moves eligible TFLite weight tensors into a separate `tflite_weights`
+  # section when packaging the `.litertlm` file.
+  externalize_weights: bool = False
   # Dtype the model is loaded and traced in (weights and graph): "float32"
   # (default when None) or "bfloat16". Not the deployment activation dtype.
   model_dtype: str | None = None
