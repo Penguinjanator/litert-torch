@@ -68,7 +68,16 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
       masks = mask_global
 
     ret = {}
-    ret['inputs_embeds'] = embeddings
+    # With experimental_use_fp16 the decoder computes in fp16 (as in the
+    # non-split CPU/GPU path); model-specific fp32 islands such as RMSNorm and
+    # softmax upcast internally. Model inputs stay fp32 so that the runtime
+    # interface is unchanged.
+    compute_dtype = (
+        torch.float16
+        if self.export_config.experimental_use_fp16
+        else embeddings.dtype
+    )
+    ret['inputs_embeds'] = embeddings.to(compute_dtype)
 
     # Positions follow the inputs' device (`meta` for V2 export).
     seq_len = embeddings.shape[1]
@@ -93,8 +102,8 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
 
     assert language_model.original_rotary_emb is not None
     language_model.rotary_emb.data = (  # pyrefly: ignore[missing-attribute]
-        pos_emb_cos.permute(0, 2, 1, 3).squeeze(0),
-        pos_emb_sin.permute(0, 2, 1, 3).squeeze(0),
+        pos_emb_cos.permute(0, 2, 1, 3).squeeze(0).to(compute_dtype),
+        pos_emb_sin.permute(0, 2, 1, 3).squeeze(0).to(compute_dtype),
     )
     if utils.has_local_rope(self.model):
       assert pos_emb_local_cos is not None
@@ -102,8 +111,12 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
       rope_data = {
           'full_attention': language_model.rotary_emb.data,
           'sliding_attention': (
-              pos_emb_local_cos.permute(0, 2, 1, 3).squeeze(0),
-              pos_emb_local_sin.permute(0, 2, 1, 3).squeeze(0),
+              pos_emb_local_cos.permute(0, 2, 1, 3)
+              .squeeze(0)
+              .to(compute_dtype),
+              pos_emb_local_sin.permute(0, 2, 1, 3)
+              .squeeze(0)
+              .to(compute_dtype),
           ),
       }
       language_model.rotary_emb.data = rope_data  # pyrefly: ignore[missing-attribute]
@@ -295,7 +308,8 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLMGenerate(
     output = self.model(**inputs)
     output_cache = output.past_key_values
     ret = self.post_process_kv_cache(output_cache)
-    ret['logits'] = output.logits
+    # Logits are always emitted in fp32: the runtime samplers expect fp32.
+    ret['logits'] = output.logits.to(torch.float32)
     return ret
 
   def get_sample_inputs(

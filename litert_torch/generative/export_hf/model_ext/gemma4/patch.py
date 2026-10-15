@@ -43,6 +43,10 @@ class Gemma4RMSNorm(torch.nn.Module):
     self.hidden_size = dim
 
   def forward(self, hidden_states):
+    # Compute RMSNorm in fp32 for mixed precision (fp16) exports. These casts
+    # are no-ops when the model computes in fp32.
+    original_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
     return normalization.rms_norm_with_hlfb(
         hidden_states,
         self.weight
@@ -58,7 +62,7 @@ class Gemma4RMSNorm(torch.nn.Module):
             dtype=torch.float32,
             device=hidden_states.device,
         ),
-    )
+    ).to(original_dtype)
 
   def extra_repr(self):
     return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"

@@ -32,7 +32,11 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLMPrefill(
       kv_cache,
   ):
     inputs = super().adapt_inputs(embeddings, pos_emb, mask, kv_cache)
-    inputs["per_layer_inputs"] = per_layer_embeddings
+    # Match the decoder compute dtype (fp16 with experimental_use_fp16) so that
+    # per-layer inputs do not promote the residual stream back to fp32.
+    inputs["per_layer_inputs"] = per_layer_embeddings.to(
+        inputs["inputs_embeds"].dtype
+    )
     return inputs
 
   def _get_input(self, batch_size, input_length, cache_length):
@@ -88,7 +92,11 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLMGenerate(
       kv_cache,
   ):
     inputs = super().adapt_inputs(embeddings, pos_emb, mask, kv_cache)
-    inputs["per_layer_inputs"] = per_layer_embeddings
+    # Match the decoder compute dtype (fp16 with experimental_use_fp16) so that
+    # per-layer inputs do not promote the residual stream back to fp32.
+    inputs["per_layer_inputs"] = per_layer_embeddings.to(
+        inputs["inputs_embeds"].dtype
+    )
     return inputs
 
   def _get_input(self, batch_size, input_length, cache_length):
@@ -126,7 +134,8 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLMGenerate(
     inputs |= self.attention_kwargs()
     output = self.model.model.language_model(**inputs)
     hidden_states = output.last_hidden_state
-    logits = self.model.lm_head(hidden_states)
+    # Logits are always emitted in fp32: the runtime samplers expect fp32.
+    logits = self.model.lm_head(hidden_states).to(torch.float32)
     kv_cache = output.past_key_values
     kv_cache = kv_cache.remove_dummy_cache_layers(self.model.config.text_config)
     return self.post_process_kv_cache(kv_cache) | {"logits": logits}

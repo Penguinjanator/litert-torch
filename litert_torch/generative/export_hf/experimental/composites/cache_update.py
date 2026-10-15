@@ -53,27 +53,45 @@ def update_kv_cache_with_sliding(
   indices = positions % cache_size
 
   # 2. One-Hot routing matrix: [T, S]
-  one_hot = int32_one_hot(indices, num_classes=cache_size, dtype=cache.dtype)
+  # Built in fp32 because the mask ops below (SUM, GREATER) have no fp16
+  # support in LiteRT. This tensor is only [T, S]; the cache itself and the
+  # cache-sized routed update stay in the cache dtype.
+  # TODO(b/573999030): Build the mask in the cache dtype once LiteRT supports
+  # fp16 GREATER/SUM.
+  one_hot = int32_one_hot(indices, num_classes=cache_size, dtype=torch.float32)
 
   # 3. Apply the valid_mask (Zero out padding rows)
-  valid_mask_float = valid_mask.to(cache.dtype).unsqueeze(1)
+  valid_mask_float = valid_mask.to(torch.float32).unsqueeze(1)
   one_hot = one_hot * valid_mask_float
+  routing = one_hot.to(cache.dtype)  # No-op for fp32 caches.
 
   # 4. Project and Route based on the sequence dimension
+  # For a single token (decode), the routing matmul degenerates into an outer
+  # product, which the converter lowers to a tfl.broadcast_to that has no fp16
+  # kernel when there are multiple KV heads. A broadcasting multiply computes
+  # the same result and avoids it.
   if ts_idx == 2:
     # cache: [B, H, S, D] | update: [B, H, T, D]
-    # Matmul: [1, 1, S, T] @ [B, H, T, D] -> [B, H, S, D]
-    routing_matrix = one_hot.transpose(0, 1).view(1, 1, cache_size, seq_len)
-    update_expanded = torch.matmul(routing_matrix, update)
+    if seq_len == 1:
+      # [B, H, 1, D] * [1, 1, S, 1] -> [B, H, S, D]
+      update_expanded = update * routing.view(1, 1, cache_size, 1)
+    else:
+      # Matmul: [1, 1, S, T] @ [B, H, T, D] -> [B, H, S, D]
+      routing_matrix = routing.transpose(0, 1).view(1, 1, cache_size, seq_len)
+      update_expanded = torch.matmul(routing_matrix, update)
 
     # Blend mask broadcasts across the D dimension
     update_mask = (one_hot.sum(dim=0) > 0).view(1, 1, cache_size, 1)
 
   elif ts_idx == 3:
     # cache: [B, H, D, S] | update: [B, H, D, T]
-    # Matmul: [B, H, D, T] @ [1, 1, T, S] -> [B, H, D, S]
-    routing_matrix = one_hot.view(1, 1, seq_len, cache_size)
-    update_expanded = torch.matmul(update, routing_matrix)
+    if seq_len == 1:
+      # [B, H, D, 1] * [1, 1, 1, S] -> [B, H, D, S]
+      update_expanded = update * routing.view(1, 1, 1, cache_size)
+    else:
+      # Matmul: [B, H, D, T] @ [1, 1, T, S] -> [B, H, D, S]
+      routing_matrix = routing.view(1, 1, seq_len, cache_size)
+      update_expanded = torch.matmul(update, routing_matrix)
 
     # Blend mask broadcasts across the D dimension
     update_mask = (one_hot.sum(dim=0) > 0).view(1, 1, 1, cache_size)
