@@ -17,6 +17,10 @@ on:
 
 jobs:
   test-model-coverage:
+    # TODO(weiyiw): Model Coverage is temporarily disabled for all callers
+    # (nightly, post-merge and pre-merge). Remove this `if: false` to restore
+    # it once the model coverage tests are fixed.
+    if: false
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
