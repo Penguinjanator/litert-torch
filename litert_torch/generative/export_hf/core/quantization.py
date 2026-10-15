@@ -23,6 +23,7 @@ from litert_torch import progress
 
 from ai_edge_quantizer import quantizer as quantizer_lib
 from ai_edge_quantizer import recipe as recipe_lib
+from ai_edge_quantizer import recipe_manager
 
 
 def _dynamic_wi8_emb4_afp32():
@@ -34,8 +35,27 @@ def _dynamic_wi8_emb4_afp32():
   )
 
 
+def _dynamic_fc_weight_only_conv_wi8_afp32():
+  """Local recipe with 8-bit dynamic FC and 8-bit weight-only Conv2D."""
+  rp_manager = recipe_manager.RecipeManager()
+  rp_manager.add_dynamic_config(
+      regex='.*',
+      operation_name=recipe_lib.TFLOperationName.FULLY_CONNECTED,
+      num_bits=8,
+  )
+  rp_manager.add_weight_only_config(
+      regex='.*',
+      operation_name=recipe_lib.TFLOperationName.CONV_2D,
+      num_bits=8,
+  )
+  return rp_manager.get_quantization_recipe()
+
+
 _LOCAL_QUANTIZATION_RECIPES = {
     'dynamic_wi8_emb4_afp32': _dynamic_wi8_emb4_afp32,
+    'dynamic_fc_weight_only_conv_wi8_afp32': (
+        _dynamic_fc_weight_only_conv_wi8_afp32
+    ),
 }
 
 

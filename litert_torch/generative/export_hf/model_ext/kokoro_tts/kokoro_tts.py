@@ -450,9 +450,21 @@ class KokoroTts(tts_model.TtsModel):
             "phoneme_length": torch.tensor([bucket_size], dtype=torch.int64),
         },
         enable_x64=True,
+        use_v2=export_config.use_v2,
+        output_file_path=ac_path if export_config.use_v2 else None,
+        delete_in_memory_params=export_config.delete_in_memory_params,
     )
-    conv_ac.export(ac_path)
-    self._apply_quantization(ac_path, quant_recipe)
+    if not export_config.use_v2:
+      conv_ac.export(ac_path)
+    # Keep the acoustic model on `dynamic_wi8_afp32` even when the caller
+    # requests `dynamic_fc_weight_only_conv_wi8_afp32` for the CPU+GPU vocoder,
+    # so the CPU acoustic stage never pays DEQUANTIZE memory overhead.
+    ac_quant_recipe = (
+        "dynamic_wi8_afp32"
+        if quant_recipe == "dynamic_fc_weight_only_conv_wi8_afp32"
+        else quant_recipe
+    )
+    self._apply_quantization(ac_path, ac_quant_recipe)
     _align_buffers_64(ac_path)
     artifacts["kokoro_acoustic"] = ac_path
 
@@ -477,10 +489,17 @@ class KokoroTts(tts_model.TtsModel):
                 [max_frames], dtype=torch.int32
             ),
         },
+        use_v2=export_config.use_v2,
+        output_file_path=voc_path if export_config.use_v2 else None,
+        delete_in_memory_params=export_config.delete_in_memory_params,
     )
-    conv_voc.export(voc_path)
-    # Vocoder is preserved in FP32 for audio fidelity and full GPU OpenCL
-    # delegation.
+    if not export_config.use_v2:
+      conv_voc.export(voc_path)
+    # Default `dynamic_wi8_afp32` produces the GPU-optimized INT8 vocoder
+    # (lowest memory and latency on GPU). Callers needing CPU XNNPACK + GPU
+    # vocoder support can pass `dynamic_fc_weight_only_conv_wi8_afp32` to avoid
+    # QD8 CONV_2D activation quantization distortion on CPU (b/481323182).
+    self._apply_quantization(voc_path, quant_recipe)
     artifacts["kokoro_vocoder"] = voc_path
 
     # 3. Export Voice Packs (.pt to binary .bin float32 format)

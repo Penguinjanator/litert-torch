@@ -232,6 +232,7 @@ class ConverterV2OptionsTest(parameterized.TestCase):
       dict(split_cache=False),
       dict(split_cache=True),
       dict(split_cache=True, experimental_use_fp16=True),
+      dict(task="text_to_speech"),
   )
   def test_supported(self, **kwargs):
     config = _config(use_v2=True, delete_in_memory_params=True, **kwargs)

@@ -449,7 +449,10 @@ class ExportableModuleConfig:
     if not self.use_v2:
       return
     unsupported = []
-    if self.task != ExportTask.TEXT_GENERATION:
+    if self.task not in (
+        ExportTask.TEXT_GENERATION,
+        ExportTask.TEXT_TO_SPEECH,
+    ):
       unsupported.append(f"task={self.task}")
     # `split_cache` always sets `litert_moe_sequential`, which only affects
     # models with experts; those are rejected when the model is loaded.
