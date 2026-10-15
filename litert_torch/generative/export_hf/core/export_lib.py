@@ -30,6 +30,7 @@ from litert_torch.generative.export_hf.core import attention as _
 from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import patches as _
+from litert_torch.generative.export_hf.core import quantization
 from litert_torch.generative.export_hf.core import utils
 from litert_torch.generative.export_hf.core import weights_loader as weights_loader_lib
 from litert_torch.generative.export_hf.core.external_emb import exportable_module as external_emb_module
@@ -53,8 +54,6 @@ import transformers
 from ai_edge_litert.aot import aot_compile
 from ai_edge_litert.aot.core import aot_types
 from ai_edge_litert.aot.vendors import import_vendor
-from ai_edge_quantizer import quantizer as quantizer_lib
-from ai_edge_quantizer import recipe as recipe_lib
 
 ExportTask = exportable_module_config.ExportTask
 
@@ -267,6 +266,50 @@ def pre_flatten_model_experts(model: nn.Module) -> nn.Module:
   return model
 
 
+def _load_tts_config(
+    model_path: str, trust_remote_code: bool
+) -> transformers.PretrainedConfig:
+  """Loads the config of a text-to-speech model.
+
+  TTS checkpoints are often not transformers architectures (e.g. Kokoro ships a
+  plain `config.json` without `model_type`), so this falls back to the raw
+  config dict and lets the model_ext registry infer the model type.
+
+  Args:
+    model_path: HF repo id or local checkpoint directory.
+    trust_remote_code: Whether to trust remote code.
+
+  Returns:
+    The model config, with `model_type` set.
+
+  Raises:
+    OSError: If no config can be loaded and the model type cannot be inferred.
+  """
+  try:
+    return transformers.AutoConfig.from_pretrained(
+        model_path,
+        dtype=torch.float32,
+        trust_remote_code=trust_remote_code,
+    )
+  except (KeyError, ValueError, OSError):
+    pass
+  try:
+    config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+        model_path, trust_remote_code=trust_remote_code
+    )
+  except OSError:
+    if model_ext_exportables.infer_tts_model_type({}, model_path) is None:
+      raise
+    config_dict = {}
+  if 'model_type' not in config_dict:
+    inferred = model_ext_exportables.infer_tts_model_type(
+        config_dict, model_path
+    )
+    if inferred is not None:
+      config_dict['model_type'] = inferred
+  return transformers.PretrainedConfig.from_dict(config_dict)
+
+
 @progress.task('Load source model')
 def load_model(
     model_path: str,
@@ -319,6 +362,23 @@ def load_model(
         tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
     )
 
+  if task == ExportTask.TEXT_TO_SPEECH:
+    config = _load_tts_config(model_path, trust_remote_code)
+    model_cls = model_ext_exportables.get_tts_model_cls(config.model_type)
+    model = model_cls(model_path, export_config=export_config)
+    try:
+      tokenizer = transformers.AutoTokenizer.from_pretrained(
+          model_path, trust_remote_code=trust_remote_code
+      )
+    except Exception:  # pylint: disable=broad-exception-caught
+      tokenizer = None
+    return SourceModelArtifacts(
+        model=model,
+        model_config=config,
+        text_model_config=config,
+        tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
+    )
+
   try:
     config = transformers.AutoConfig.from_pretrained(
         model_path,
@@ -349,22 +409,6 @@ def load_model(
         model=model,
         model_config=config,
         text_model_config=getattr(config, 'text_config', config),
-        tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
-    )
-
-  if task == ExportTask.TEXT_TO_SPEECH:
-    model_cls = model_ext_exportables.get_tts_model_cls(config.model_type)
-    model = model_cls(model_path, export_config=export_config)
-    try:
-      tokenizer = transformers.AutoTokenizer.from_pretrained(
-          model_path, trust_remote_code=trust_remote_code
-      )
-    except Exception:  # pylint: disable=broad-exception-caught
-      tokenizer = None
-    return SourceModelArtifacts(
-        model=model,
-        model_config=config,
-        text_model_config=config,
         tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
     )
 
@@ -726,61 +770,10 @@ def export_text_prefill_decode_model(
   )
 
 
-def maybe_quantize_model(
-    model_path: str,
-    quantization_recipe: str | None = None,
-):
-  """Quantizes model if recipe is provided."""
-  if not quantization_recipe or str(quantization_recipe).strip().lower() in (
-      'none',
-      'null',
-      'false',
-      '',
-  ):
-    return model_path
-  return quantize_model(model_path, quantization_recipe)
-
-
-def _dynamic_wi8_emb4_afp32():
-  """Local recipe with 4-bit embedding tables and 8-bit fully connected weights."""
-  return recipe_lib.dynamic_wi4c_afp32(
-      operation_name=recipe_lib.TFLOperationName.EMBEDDING_LOOKUP,
-  ) + recipe_lib.dynamic_wi8c_afp32(
-      operation_name=recipe_lib.TFLOperationName.FULLY_CONNECTED,
-  )
-
-
-_LOCAL_QUANTIZATION_RECIPES = {
-    'dynamic_wi8_emb4_afp32': _dynamic_wi8_emb4_afp32,
-}
-
-
-@progress.task('Quantize model')
-def quantize_model(
-    model_path: str,
-    quantization_recipe: str,
-):
-  """Quantizes model."""
-  quantized_model_path = (
-      model_path.removesuffix('.tflite').removesuffix('_quantized')
-      + '_quantized.tflite'
-  )
-  qt = quantizer_lib.Quantizer(model_path)
-  try:
-    if quantization_recipe.endswith('.json'):
-      recipe = quantization_recipe
-    elif quantization_recipe in _LOCAL_QUANTIZATION_RECIPES:
-      recipe = _LOCAL_QUANTIZATION_RECIPES[quantization_recipe]()
-    else:
-      recipe = recipe_lib.__dict__[quantization_recipe]()
-    qt.load_quantization_recipe(recipe)
-  except Exception as e:
-    raise ValueError(
-        f'Invalid quantization recipe: {quantization_recipe}. Please check'
-        ' the recipe name.'
-    ) from e
-  qt.quantize().export_model(quantized_model_path, overwrite=True)
-  return quantized_model_path
+# Re-exported for existing callers; implemented in `quantization` so model
+# extensions can share it without importing `export_lib`.
+maybe_quantize_model = quantization.maybe_quantize_model
+quantize_model = quantization.quantize_model
 
 
 @progress.task('Export embedder model')

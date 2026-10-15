@@ -14,6 +14,8 @@
 # ==============================================================================
 """Exportable modules for extended modules."""
 
+from typing import Any
+
 from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core.speech import exportables as speech_exportables
 from litert_torch.generative.export_hf.model_ext.bonsai_flux2 import bonsai_flux2 as bonsai_flux2_lib
@@ -26,6 +28,7 @@ from litert_torch.generative.export_hf.model_ext.gemma4 import exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_exportable_module as gemma4_split_cache_exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
+from litert_torch.generative.export_hf.model_ext.kokoro_tts import kokoro_tts as kokoro_tts_lib
 from litert_torch.generative.export_hf.model_ext.lfm2_vl import vision_exportable as lfm2_vl_vision_exportable
 from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as moonshine_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
@@ -210,8 +213,27 @@ def get_tts_model_cls(model_type: str):
   """Gets TTS model class by model type."""
   if model_type in ('qwen3_tts', 'qwen3_tts_talker', 'qwen3'):
     return qwen3_tts_lib.Qwen3Tts
+  elif model_type in ('kokoro', 'kokoro_tts', 'kokoro-82m', 'kokoro_82m'):
+    return kokoro_tts_lib.KokoroTts
   else:
     raise ValueError(f'Unsupported TTS model type: {model_type}')
+
+
+def infer_tts_model_type(
+    config_dict: dict[str, Any], model_path: str
+) -> str | None:
+  """Infers the TTS model type of a checkpoint that has no `model_type`.
+
+  Args:
+    config_dict: The raw `config.json` contents, or `{}` if there is none.
+    model_path: HF repo id or local checkpoint directory.
+
+  Returns:
+    A model type accepted by `get_tts_model_cls`, or None if unrecognized.
+  """
+  if kokoro_tts_lib.KokoroTts.is_kokoro_checkpoint(config_dict, model_path):
+    return 'kokoro'
+  return None
 
 
 def get_image_gen_model_cls(model_type: str):
