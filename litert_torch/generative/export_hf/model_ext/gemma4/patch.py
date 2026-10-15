@@ -16,7 +16,7 @@
 
 import contextlib
 from litert_torch.backend import optimization_barrier as optimization_barrier_lib
-from litert_torch.backend.experimental.torch_tfl import _ops as _  # Registers torch.ops.tfl.*
+from litert_torch.backend.torch_tfl import _ops as _  # Registers torch.ops.tfl.*
 from litert_torch.generative.export_hf.experimental.composites import qkv_norm_rope
 from litert_torch.generative.export_hf.experimental.composites import rope as rope_composite
 from litert_torch.generative.export_hf.experimental.composites import swiglu as swiglu_composite

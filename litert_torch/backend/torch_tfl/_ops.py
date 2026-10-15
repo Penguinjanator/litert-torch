@@ -17,7 +17,7 @@
 import re
 from typing import Any, Sequence
 
-from litert_torch.backend.experimental.torch_tfl import torch_library_utils
+from litert_torch.backend.torch_tfl import torch_library_utils
 import numpy as np
 import torch
 

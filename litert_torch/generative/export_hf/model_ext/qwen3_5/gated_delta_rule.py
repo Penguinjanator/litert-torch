@@ -16,7 +16,7 @@
 
 from flatbuffers import flexbuffers
 from litert_torch.backend import lowerings
-from litert_torch.backend.experimental.torch_tfl import _ops as _
+from litert_torch.backend.torch_tfl import _ops as _
 from litert_torch.backend.lowerings import utils as lowering_utils
 from litert_torch.generative.export_hf.experimental.composites import short_conv
 from litert_converter.mlir import ir

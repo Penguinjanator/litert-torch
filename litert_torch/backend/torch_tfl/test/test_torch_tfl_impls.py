@@ -18,7 +18,7 @@ from typing import Any, Dict, Sequence
 
 import litert_torch
 from litert_torch import testing
-from litert_torch.backend.experimental import torch_tfl
+from litert_torch.backend import torch_tfl
 import numpy as np
 import torch
 from torch.utils import _pytree as pytree

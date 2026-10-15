@@ -16,7 +16,7 @@
 
 from typing import Sequence
 
-from litert_torch.backend.experimental.torch_tfl import _ops
+from litert_torch.backend.torch_tfl import _ops
 from litert_torch.backend.lowerings import context
 from litert_torch.backend.lowerings import registry
 from litert_torch.backend.lowerings import utils as lowering_utils

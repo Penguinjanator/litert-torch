@@ -22,7 +22,7 @@ prefill and decode.
 
 from typing import Optional
 from litert_torch.backend import composite
-from litert_torch.backend.experimental.torch_tfl import _ops as _  # Registers torch.ops.tfl.*
+from litert_torch.backend.torch_tfl import _ops as _  # Registers torch.ops.tfl.*
 import torch
 import torch.nn.functional as F
 

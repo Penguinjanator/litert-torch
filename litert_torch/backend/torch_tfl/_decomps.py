@@ -14,7 +14,7 @@
 # ==============================================================================
 """Torch ops to Torch-TFL decompositions."""
 from typing import Sequence
-from litert_torch.backend.experimental.torch_tfl import _ops
+from litert_torch.backend.torch_tfl import _ops
 import torch
 
 decomps = {}

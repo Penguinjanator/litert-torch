@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Torch-TFL ops definitions, decompositions, and lowerings."""
-from litert_torch.backend.experimental.torch_tfl import _decomps
-from litert_torch.backend.experimental.torch_tfl import _lowerings
-from litert_torch.backend.experimental.torch_tfl import _ops
+"""Backward compatibility alias for litert_torch.backend.torch_tfl."""
+from litert_torch.backend import torch_tfl as _torch_tfl
+from litert_torch.backend.torch_tfl import *  # pylint: disable=wildcard-import
+from litert_torch.backend.torch_tfl import _decomps
+from litert_torch.backend.torch_tfl import _lowerings
+from litert_torch.backend.torch_tfl import _ops
+from litert_torch.backend.torch_tfl import torch_library_utils
 
-decomps = _decomps.decomps
+decomps = _torch_tfl.decomps
