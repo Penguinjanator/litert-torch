@@ -18,16 +18,8 @@ from flatbuffers import flexbuffers
 from litert_torch.backend import lowerings
 from litert_torch.backend.torch_tfl import _ops as _
 from litert_torch.backend.lowerings import utils as lowering_utils
-from litert_torch.generative.export_hf.experimental.composites import short_conv
 from litert_converter.mlir import ir
 import torch
-import torch.nn.functional as F
-
-
-def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-  """Aligns with l2norm in FLA / Qwen3.5 linear attention."""
-  inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-  return x * inv_norm
 
 
 def _gated_delta_update_custom_options(
@@ -95,29 +87,14 @@ def gated_delta_update(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Reference PyTorch implementation of Gated Delta Update."""
   del mode
-  _, num_v_heads, seq_len, _ = v_t.shape
+  _, num_v_heads, _, _ = v_t.shape
   num_k_heads = q_t.shape[1]
   if num_v_heads != num_k_heads:
     g_ratio = num_v_heads // num_k_heads
     q_t = q_t.repeat_interleave(g_ratio, dim=1)
     k_t = k_t.repeat_interleave(g_ratio, dim=1)
 
-  # Recurrent path
-  new_recurrent_state = recurrent_state.clone()
-  core_attn_out = torch.zeros_like(v_t)
-  for t in range(seq_len):
-    g_step = g_t[:, :, t].exp().unsqueeze(-1).unsqueeze(-1)
-    beta_step = beta_t[:, :, t].unsqueeze(-1)
-    new_recurrent_state = new_recurrent_state * g_step
-    kv_mem = (new_recurrent_state * k_t[:, :, t].unsqueeze(-1)).sum(dim=-2)
-    delta = (v_t[:, :, t] - kv_mem) * beta_step
-    new_recurrent_state = new_recurrent_state + k_t[:, :, t].unsqueeze(
-        -1
-    ) * delta.unsqueeze(-2)
-    core_attn_out[:, :, t] = (
-        new_recurrent_state * q_t[:, :, t].unsqueeze(-1)
-    ).sum(dim=-2)
-  return core_attn_out, new_recurrent_state
+  return recurrent_gated_delta_rule(q_t, k_t, v_t, beta_t, g_t, recurrent_state)
 
 
 @gated_delta_update.register_fake
@@ -172,105 +149,241 @@ def _gated_delta_update_lower(
   return tuple(op.results)
 
 
-def gated_delta_net(
-    mixed_qkv: torch.Tensor,
-    z: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
-    conv_state: torch.Tensor,
+def _gated_delta_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Single recurrent step for Gated Delta Net."""
+  old_state = state
+
+  # decay
+  decay = g.exp().unsqueeze(-1).unsqueeze(-1)
+  state = state * decay
+
+  # kv_mem = (state * k.unsqueeze(-1)).sum(dim=-2)
+  kv_mem = torch.sum(state * k.unsqueeze(-1), dim=-2)
+
+  # delta = (v - kv_mem) * beta.unsqueeze(-1)
+  delta = (v - kv_mem) * beta.unsqueeze(-1)
+
+  # state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
+  state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
+
+  # y = (state * q.unsqueeze(-1)).sum(dim=-2)
+  y = torch.sum(state * q.unsqueeze(-1), dim=-2)
+
+  if mask is not None:
+    mask_state = (mask > 0).view(-1, 1, 1, 1)
+    state = torch.where(mask_state, state, old_state)
+
+    mask_y = (mask > 0).view(-1, 1, 1)
+    y = torch.where(mask_y, y, torch.zeros_like(y))
+
+  return y, state
+
+
+def recurrent_gated_delta_rule(
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    beta_t: torch.Tensor,
+    g_t: torch.Tensor,
     recurrent_state: torch.Tensor,
-    conv_weight: torch.Tensor,
-    a_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    valid_mask: torch.Tensor,
-    head_k_dim: int = 128,
-    head_v_dim: int = 128,
-    num_k_heads: int = 16,
-    num_v_heads: int = 16,
-    rms_norm_eps: float = 1e-6,
-    mode: int = 0,
-    use_fp32: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Helper function to apply Gated Delta Net with conv1d outside and custom gated_delta_update op."""
-  batch_size, seq_len, _ = mixed_qkv.shape
-  key_dim = head_k_dim * num_k_heads
-  value_dim = head_v_dim * num_v_heads
+    valid_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Recurrent Gated Delta Rule implementation (single-token or unrolled loop)."""
+  seq_len = q_t.shape[2]
+  has_valid_mask = valid_mask is not None and valid_mask.numel() > 0
 
-  mixed_qkv_t = mixed_qkv.transpose(1, 2)
-  if valid_mask is not None and valid_mask.numel() > 0:
-    mixed_qkv_masked = mixed_qkv_t * valid_mask.view(batch_size, 1, seq_len).to(
-        mixed_qkv_t.dtype
+  if seq_len == 1 and not has_valid_mask:
+    g_step = g_t[:, :, 0].exp().unsqueeze(-1).unsqueeze(-1)
+    beta_step = beta_t[:, :, 0].unsqueeze(-1)
+    new_recurrent_state = recurrent_state.to(q_t.dtype) * g_step
+    kv_mem = (new_recurrent_state * k_t[:, :, 0].unsqueeze(-1)).sum(dim=-2)
+    delta = (v_t[:, :, 0] - kv_mem) * beta_step
+    new_recurrent_state = new_recurrent_state + k_t[:, :, 0].unsqueeze(
+        -1
+    ) * delta.unsqueeze(-2)
+    core_attn_out = (
+        (new_recurrent_state * q_t[:, :, 0].unsqueeze(-1))
+        .sum(dim=-2)
+        .unsqueeze(2)
     )
-  else:
-    mixed_qkv_masked = mixed_qkv_t
+    return core_attn_out.to(q_t.dtype), new_recurrent_state.to(torch.float32)
 
-  num_valid_tokens = None
-  if seq_len > 1 and valid_mask is not None and valid_mask.numel() > 0:
-    num_valid_tokens = valid_mask[0].to(torch.float32).sum().to(torch.int32)
-  conv_out, new_conv_state = short_conv.causal_conv1d_with_state(
-      mixed_qkv_masked,
-      conv_state,
-      conv_weight,
-      num_valid_tokens=num_valid_tokens,
+  new_recurrent_state = recurrent_state.to(q_t.dtype)
+  ys = []
+  for t in range(seq_len):
+    step_mask = None
+    if has_valid_mask:
+      assert valid_mask is not None
+      step_mask = valid_mask[:, t]
+
+    y_step, new_recurrent_state = _gated_delta_step(
+        q_t[:, :, t],
+        k_t[:, :, t],
+        v_t[:, :, t],
+        g_t[:, :, t],
+        beta_t[:, :, t],
+        new_recurrent_state,
+        step_mask,
+    )
+    ys.append(y_step)
+
+  core_attn_out = torch.stack(ys, dim=2)
+  return core_attn_out.to(q_t.dtype), new_recurrent_state.to(torch.float32)
+
+
+def chunk_gated_delta_rule(
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    beta_t: torch.Tensor,
+    g_t: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Chunked decomposed Gated Delta Rule prefill implementation."""
+  batch_size, num_v_heads, seq_len, _ = q_t.shape
+  head_v_dim = v_t.shape[-1]
+  num_chunks = seq_len // chunk_size
+
+  v_beta = v_t * beta_t.unsqueeze(-1)
+  k_beta = k_t * beta_t.unsqueeze(-1)
+
+  q_c, k_c, _, k_beta_c, v_beta_c = [
+      x.reshape(
+          batch_size,
+          num_v_heads,
+          num_chunks,
+          chunk_size,
+          x.shape[-1],
+      )
+      for x in (q_t, k_t, v_t, k_beta, v_beta)
+  ]
+  g_c = g_t.reshape(batch_size, num_v_heads, num_chunks, chunk_size)
+
+  idx = torch.arange(chunk_size, device=q_t.device, dtype=torch.int32)
+  mask_triu = idx.unsqueeze(1) <= idx.unsqueeze(0)
+  mask_tril = idx.unsqueeze(1) >= idx.unsqueeze(0)
+  eye_mask = idx.unsqueeze(1) == idx.unsqueeze(0)
+
+  g_cumsum = g_c.cumsum(dim=-1)
+  diff = g_cumsum.unsqueeze(-1) - g_cumsum.unsqueeze(-2)
+  decay_mask = torch.where(
+      mask_tril, torch.where(mask_tril, diff, 0.0).exp(), 0.0
   )
-  conv_out = F.silu(conv_out[:, :, -seq_len:]).transpose(1, 2)
 
-  query, key, value = torch.split(
-      conv_out, [key_dim, key_dim, value_dim], dim=-1
+  attn_in = -((k_beta_c @ k_c.transpose(-1, -2)) * decay_mask).masked_fill(
+      mask_triu, 0
   )
-  query = query.reshape(batch_size, seq_len, -1, head_k_dim)
-  key = key.reshape(batch_size, seq_len, -1, head_k_dim)
-  value = value.reshape(batch_size, seq_len, -1, head_v_dim)
 
-  beta = b.sigmoid()
-  act_dtype = torch.float32 if use_fp32 else b.dtype
-  a_val = (a.to(act_dtype) + dt_bias.to(act_dtype)).clamp(max=50.0)
-  g = -a_log.to(act_dtype).exp() * torch.log1p(torch.exp(a_val))
+  attn = attn_in.clone()
+  for i in range(1, chunk_size):
+    row = attn[..., i, :i]
+    sub = attn[..., :i, :i]
+    attn[..., i, :i] = row + (row.unsqueeze(-2) @ sub).squeeze(-2)
 
-  if valid_mask is not None and valid_mask.numel() > 0:
-    vm_4d = valid_mask.view(batch_size, seq_len, 1, 1).to(query.dtype)
-    vm_3d = valid_mask.view(batch_size, seq_len, 1).to(query.dtype)
-    query = query * vm_4d
-    key = key * vm_4d
-    value = value * vm_4d
-    beta = beta * vm_3d
-    g = g * vm_3d
+  attn = torch.where(eye_mask, attn + 1.0, attn)
+  v_local = attn @ v_beta_c
 
-  # Normalize query and key with l2norm and scale query
-  query = l2norm(query, dim=-1, eps=rms_norm_eps) * (1.0 / (head_k_dim**0.5))
-  key = l2norm(key, dim=-1, eps=rms_norm_eps)
+  k_beta_exp = k_beta_c * g_cumsum.exp().unsqueeze(-1)
+  k_cumdecay = attn @ k_beta_exp
 
-  initial_dtype = query.dtype
-  compute_dtype = torch.float32 if use_fp32 else initial_dtype
+  new_recurrent_state = recurrent_state.to(q_t.dtype)
+  core_attn_outs = []
+  for i in range(num_chunks):
+    q_i = q_c[:, :, i]
+    k_i = k_c[:, :, i]
+    v_i = v_local[:, :, i]
 
-  # Transpose and cast to compute_dtype for gated_delta_update
+    exp_g = g_cumsum[:, :, i].exp()
+    attn_inter = (q_i * exp_g.unsqueeze(-1)) @ new_recurrent_state
+
+    v_prime = k_cumdecay[:, :, i] @ new_recurrent_state
+    v_new = v_i - v_prime
+
+    attn_i = (q_i @ k_i.transpose(-1, -2)) * decay_mask[:, :, i]
+
+    core_attn_outs.append(attn_inter + attn_i @ v_new)
+
+    exp_last = g_cumsum[:, :, i, -1, None, None].exp()
+    exp_diff = (
+        (g_cumsum[:, :, i, -1, None] - g_cumsum[:, :, i]).exp().unsqueeze(-1)
+    )
+    k_scaled = k_i * exp_diff
+
+    new_recurrent_state = (
+        new_recurrent_state * exp_last + k_scaled.transpose(-1, -2) @ v_new
+    )
+
+  core_attn_out = torch.stack(core_attn_outs, dim=2)
+  core_attn_out = core_attn_out.reshape(
+      batch_size, num_v_heads, seq_len, head_v_dim
+  )
+  return core_attn_out, new_recurrent_state
+
+
+def apply_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    *,
+    use_fused_gdn: bool = True,
+    gdn_mode: int = 0,
+    use_fp32: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Dispatches Gated Delta Rule update to custom op or decomposed PyTorch implementation."""
+  if use_fused_gdn:
+    initial_dtype = query.dtype
+    compute_dtype = torch.float32 if use_fp32 else initial_dtype
+    q_t, k_t, v_t, beta_t, g_t = [
+        x.transpose(1, 2).contiguous().to(compute_dtype)
+        for x in (query, key, value, beta, g)
+    ]
+    return gated_delta_update(
+        q_t,
+        k_t,
+        v_t,
+        beta_t,
+        g_t,
+        recurrent_state.to(torch.float32),
+        mode=gdn_mode,
+    )
+
+  batch_size, seq_len, num_k_heads, head_k_dim = query.shape
+  num_v_heads = value.shape[2]
+  g_ratio = num_v_heads // num_k_heads
+  if g_ratio > 1:
+    query = (
+        query.reshape(batch_size * seq_len, num_k_heads, head_k_dim)
+        .repeat_interleave(g_ratio, dim=1)
+        .reshape(batch_size, seq_len, num_v_heads, head_k_dim)
+    )
+    key = (
+        key.reshape(batch_size * seq_len, num_k_heads, head_k_dim)
+        .repeat_interleave(g_ratio, dim=1)
+        .reshape(batch_size, seq_len, num_v_heads, head_k_dim)
+    )
+
   q_t, k_t, v_t, beta_t, g_t = [
-      x.transpose(1, 2).contiguous().to(compute_dtype)
+      x.transpose(1, 2).contiguous().to(torch.float32)
       for x in (query, key, value, beta, g)
   ]
-  recurrent_state_in = recurrent_state.to(torch.float32)
-
-  # Call custom op
-  core_out, new_recurrent_state = torch.ops.litert_torch.gated_delta_update(
-      q_t, k_t, v_t, beta_t, g_t, recurrent_state_in, mode=mode
+  chunk_size = 64
+  if seq_len > 1 and gdn_mode == 1 and seq_len >= chunk_size:
+    return chunk_gated_delta_rule(
+        q_t, k_t, v_t, beta_t, g_t, recurrent_state, chunk_size=chunk_size
+    )
+  return recurrent_gated_delta_rule(
+      q_t, k_t, v_t, beta_t, g_t, recurrent_state, valid_mask=valid_mask
   )
-
-  # Transpose output back to [B, N, H, D_v] and cast back to original dtype
-  core_out = core_out.transpose(1, 2).contiguous().to(initial_dtype)
-  new_recurrent_state = new_recurrent_state.to(torch.float32)
-
-  # Apply RMSNorm
-  variance = core_out.to(torch.float32).pow(2).mean(-1, keepdim=True)
-  core_out_norm = norm_weight * (
-      core_out * torch.rsqrt(variance + rms_norm_eps).to(initial_dtype)
-  )
-
-  # Gate with z (z is [B, N, H*D_v])
-  z_reshaped = z.reshape(batch_size, seq_len, num_v_heads, head_v_dim)
-  out = core_out_norm * F.silu(z_reshaped)
-
-  # Reshape to [B, N, H*D_v]
-  out = out.reshape(batch_size, seq_len, -1)
-
-  return out, new_conv_state, new_recurrent_state
