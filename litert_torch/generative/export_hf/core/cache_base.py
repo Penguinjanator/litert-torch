@@ -71,6 +71,16 @@ class LiteRTLMCacheMixin(cache_utils.Cache, abc.ABC):
     """Creates a KV cache from the model config."""
     ...
 
+  @property
+  def max_cache_len(self) -> int:
+    """Returns the maximum cache length across all layers.
+
+    `transformers.cache_utils.Cache.max_cache_len` was deprecated and removed
+    upstream in favor of `get_max_length()`. LiteRT-LM caches are always
+    statically shaped, so we keep exposing it as a convenience accessor.
+    """
+    return self.get_max_length()
+
   def set_cache_runtime_args(self, cache_runtime_args: Dict[str, Any]) -> None:
     """Sets the cache runtime arguments."""
     for layer in self.layers:

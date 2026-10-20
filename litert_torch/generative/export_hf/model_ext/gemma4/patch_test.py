@@ -589,7 +589,15 @@ class PatchTest(parameterized.TestCase):
         subsampling_conv_channels=[128, 8],
         dtype="float32",
     )
-    audio_config._attn_implementation = "sdpa"
+    # The reference audio model only produces a correct boolean attention mask
+    # under "sdpa" in older transformers releases, while newer releases
+    # (>= 5.20) implement the chunked local attention in eager mode only and
+    # reject "sdpa" at construction time. Pick whichever the installed
+    # transformers version supports.
+    if getattr(modeling_gemma4.Gemma4AudioModel, "_supports_sdpa", False):
+      audio_config._attn_implementation = "sdpa"
+    else:
+      audio_config._attn_implementation = "eager"
 
     torch.manual_seed(42)
     ref_model = modeling_gemma4.Gemma4AudioModel(audio_config).eval()
@@ -600,8 +608,8 @@ class PatchTest(parameterized.TestCase):
       ).eval()
     patched_model.load_state_dict(ref_model.state_dict())
     # Verify that even when set_attn_implementation("eager") is called on the
-    # patched model (as done during export), it still matches the reference sdpa
-    # boolean mask behavior.
+    # patched model (as done during export), it still matches the reference
+    # mask behavior.
     patched_model.set_attn_implementation("eager")
 
     input_features = torch.randn(1, 80, 128, dtype=torch.float32)

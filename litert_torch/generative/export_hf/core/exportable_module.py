@@ -226,7 +226,7 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
           else:
             masks["sliding_attention"] = utils.create_sliding_mask(
                 input_pos.clone().unsqueeze(0),
-                kv_cache.get_max_cache_shape(),
+                kv_cache.get_max_length(),
                 sliding_window,
                 use_bool_mask=True,
             )
@@ -267,7 +267,7 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
             masks["sliding_attention"] = (
                 utils.create_sliding_mask(
                     input_pos.clone().unsqueeze(0),
-                    kv_cache.get_max_cache_shape(),
+                    kv_cache.get_max_length(),
                     sliding_window,
                 )
                 + mask
