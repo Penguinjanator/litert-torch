@@ -507,7 +507,9 @@ def load_model(
     feature_extractor = None
 
   # TODO(weiyiw): Refactor into a separate function.
-  tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+  tokenizer = transformers.AutoTokenizer.from_pretrained(
+      model_path, trust_remote_code=trust_remote_code
+  )
   if not hasattr(tokenizer, 'chat_template') or not tokenizer.chat_template:
     try:
       if utils.get_model_path_type(model_path) == 'repo_id':

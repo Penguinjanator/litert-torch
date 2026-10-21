@@ -17,6 +17,7 @@
 
 import dataclasses
 import os
+import re
 import tempfile
 from typing import Any, Sequence
 
@@ -79,6 +80,12 @@ _TRANSFORMERS_MODEL_PATH = _define_flag(
     'transformers_model_path',
     None,
     'Optional path to HuggingFace tokenizer directory or file for bundling.',
+)
+_LLM_METADATA_PATH = _define_flag(
+    flags.DEFINE_string,
+    'llm_metadata_path',
+    None,
+    'Optional path to LlmMetadataProto file for bundling.',
 )
 
 _MODEL_PATH = _define_flag(
@@ -155,6 +162,11 @@ _CALIBRATION_RANGE_SCALE = _define_flag(
 )
 
 
+_MASK_IO_TENSOR_REGEX = re.compile(
+    r'(^|_)mask_(local|global)(_\d+)?(_output)?$'
+)
+
+
 def _scale_calibration_results(
     calibration_result: dict[str, Any], scale_factor: float
 ) -> dict[str, Any]:
@@ -166,6 +178,9 @@ def _scale_calibration_results(
   scaled_result = {}
   for tensor_name, qsv in calibration_result.items():
     scaled_qsv = qsv.copy()
+    if _MASK_IO_TENSOR_REGEX.search(tensor_name):
+      scaled_result[tensor_name] = scaled_qsv
+      continue
     if 'min' in qsv:
       min_val = qsv['min']
       scaled_min = np.where(
@@ -180,6 +195,30 @@ def _scale_calibration_results(
       scaled_qsv['max'] = scaled_max
     scaled_result[tensor_name] = scaled_qsv
   return scaled_result
+
+
+def _symmetrize_mask_and_logits_calibration(
+    calibration_result: dict[str, Any],
+    aux_calibration_result: dict[str, Any] | None = None,
+) -> None:
+  """Ensures symmetric ranges (zero_point = 0) for attention masks and logits."""
+  for results in (calibration_result, aux_calibration_result):
+    if not results:
+      continue
+    for tensor_name, qsv in results.items():
+      if (
+          (
+              _MASK_IO_TENSOR_REGEX.search(tensor_name)
+              or tensor_name.endswith('logits_output')
+          )
+          and 'min' in qsv
+          and 'max' in qsv
+      ):
+        bound = float(
+            max(np.max(np.abs(qsv['min'])), np.max(np.abs(qsv['max'])))
+        )
+        qsv['min'] = np.full_like(qsv['min'], -bound)
+        qsv['max'] = np.full_like(qsv['max'], bound)
 
 
 def _apply_mlir_passes(
@@ -212,9 +251,11 @@ def quantize(
     output_path: str | None = None,
     embedder_model_path: str | None = None,
     aux_model_path: str | None = None,
+    aux_output_path: str | None = None,
     ple_model_path: str | None = None,
     spm_path: str | None = None,
     transformers_model_path: str | None = None,
+    llm_metadata_path: str | None = None,
     use_float_input_output_normalizer: bool = False,
     skip_mlir_passes: bool = True,
     calibration_range_scale: float = 1.0,
@@ -249,9 +290,15 @@ def quantize(
   ple_path = ple_model_path or unpacked.get('tf_lite_per_layer_embedder')
   spm_path = spm_path or unpacked.get('SP_Tokenizer')
   hf_path = transformers_model_path or unpacked.get('transformers_model_path')
-  llm_metadata_path = unpacked.get('LlmMetadataProto') or unpacked.get(
-      'LlmMetadata'
+  llm_metadata_path = (
+      llm_metadata_path
+      or unpacked.get('LlmMetadataProto')
+      or unpacked.get('LlmMetadata')
   )
+  if not llm_metadata_path and model_path:
+    default_meta = os.path.join(os.path.dirname(model_path), 'llm_metadata.pb')
+    if os.path.exists(default_meta):
+      llm_metadata_path = default_meta
 
   if not model_path:
     raise ValueError('Must specify model_path or input_litertlm.')
@@ -301,6 +348,11 @@ def quantize(
           aux_calibration_result, calibration_range_scale
       )
 
+  _symmetrize_mask_and_logits_calibration(
+      calibration_result=calibration_result,
+      aux_calibration_result=aux_calibration_result,
+  )
+
   print('--- Aligning KV cache parameters across models...')
   quant_utils.align_kv_cache_params(
       calibration_results=calibration_result,
@@ -344,26 +396,38 @@ def quantize(
   print(f'--- Exporting quantized model to: {output_path} ...')
   quantization_result.export_model(output_path, overwrite=True)
 
-  aux_output_path = None
   if aux_model_path and aux_calibration_result:
     print(f'--- Initializing Quantizer for aux model: {aux_model_path} ...')
     q_aux = quantizer.Quantizer(aux_model_path)
     if quantization_recipe:
       q_aux.load_quantization_recipe(quantization_recipe)
     else:
-      q_aux = quant_utils.add_main_model_quant_recipe(
-          q_aux,
-          allow_float_operations=use_float_input_output_normalizer,
-          a16w8=True,
+      # Restore default INPUT materialization for aux model (main model skips
+      # embeddings).
+      algorithm_manager.register_quantized_op(
+          algorithm_key=algorithm_manager.AlgorithmName.MIN_MAX_UNIFORM_QUANT,
+          tfl_op_name=qtyping.TFLOperationName.INPUT,
+          init_qsv_func=naive_min_max_quantize.init_qsvs,
+          calibration_func=naive_min_max_quantize.min_max_calibrate,
+          materialize_func=quant_utils.get_custom_materialize_input(''),
       )
+      # Quantize graph outputs, KV cache updates, and inputs to 16-bit
+      for op in [
+          qtyping.TFLOperationName.OUTPUT,
+          qtyping.TFLOperationName.DYNAMIC_UPDATE_SLICE,
+          qtyping.TFLOperationName.INPUT,
+      ]:
+        q_aux.add_static_config(
+            regex='.*',
+            operation_name=op,
+            activation_num_bits=16,
+            weight_num_bits=8,
+        )
 
     print('--- Running aux model quantization...')
     aux_quantization_result = q_aux.quantize(aux_calibration_result)
-    aux_quantization_result = _apply_mlir_passes(
-        aux_quantization_result, skip_mlir_passes=skip_mlir_passes
-    )
 
-    aux_output_path = (
+    aux_output_path = aux_output_path or (
         output_litertlm + '.aux_intermediate.tflite'
         if output_litertlm
         else aux_model_path + '.quantized.tflite'
@@ -381,7 +445,7 @@ def quantize(
         output_litertlm=output_litertlm,
         prefilldecode_model_path=output_path,
         embedder_model_path=embedder_path,
-        auxiliary_model_path=aux_output_path,
+        auxiliary_model_path=aux_output_path or aux_model_path,
         ple_model_path=ple_path,
         spm_path=spm_path,
         transformers_model_path=hf_path,
@@ -408,9 +472,11 @@ def main(argv: Sequence[str]) -> None:
       output_path=_OUTPUT_PATH.value,
       embedder_model_path=_EMBEDDER_MODEL_PATH.value,
       aux_model_path=_AUX_MODEL_PATH.value,
+      aux_output_path=_AUX_OUTPUT_PATH.value,
       ple_model_path=_PLE_MODEL_PATH.value,
       spm_path=_SPM_PATH.value,
       transformers_model_path=_TRANSFORMERS_MODEL_PATH.value,
+      llm_metadata_path=_LLM_METADATA_PATH.value,
       use_float_input_output_normalizer=_USE_FLOAT_INPUT_OUTPUT_NORMALIZER.value,
       skip_mlir_passes=_SKIP_MLIR_PASSES.value,
       calibration_range_scale=_CALIBRATION_RANGE_SCALE.value,

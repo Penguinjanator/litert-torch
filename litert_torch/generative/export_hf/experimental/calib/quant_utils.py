@@ -502,13 +502,18 @@ def add_main_model_quant_recipe(
         weight_num_bits=8,
     )
   if allow_float_operations:
+    q = _add_stablehlo_composite_graph_recipe(
+        q,
+        norm_regex='.*(q_norm|k_norm).*',
+        activation_num_bits=16,
+    )
     q.update_quantization_recipe(
-        regex='.*',
+        regex='^(?!.*(q_norm|k_norm)).*',
         operation_name=qtyping.TFLOperationName.STABLEHLO_COMPOSITE,
         algorithm_key=quantizer.AlgorithmName.NO_QUANTIZE,
     )
     q.update_quantization_recipe(
-        regex='.*post_qkv.*',
+        regex='.*(post_qkv|(DecoderLayer|decoder_layer)_[0-9]+;).*',
         operation_name=qtyping.TFLOperationName.ADD,
         algorithm_key=quantizer.AlgorithmName.NO_QUANTIZE,
     )
@@ -519,7 +524,7 @@ def add_main_model_quant_recipe(
     )
   else:
     q.add_static_config(
-        regex='.*post_qkv.*',
+        regex='.*(post_qkv|(DecoderLayer|decoder_layer)_[0-9]+;).*',
         operation_name=qtyping.TFLOperationName.ADD,
         activation_num_bits=16,
         weight_num_bits=8,

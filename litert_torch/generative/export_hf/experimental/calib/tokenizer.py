@@ -98,7 +98,7 @@ class Tokenizer:
       )
     elif transformers_model_path:
       self.tx_tokenizer = transformers.AutoTokenizer.from_pretrained(
-          transformers_model_path
+          transformers_model_path, trust_remote_code=True
       )
       if chat_template and not getattr(
           self.tx_tokenizer, 'chat_template', None
@@ -138,7 +138,7 @@ class Tokenizer:
     if transformers_model_path:
       try:
         config = transformers.AutoConfig.from_pretrained(
-            transformers_model_path
+            transformers_model_path, trust_remote_code=True
         )
         image_preprocessor_cls = IMAGE_PREPREOCESSORS.get(
             config.model_type, None

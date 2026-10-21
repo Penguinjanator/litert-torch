@@ -20,8 +20,13 @@ from unittest import mock
 
 from absl.testing import absltest
 from litert_torch.generative.export_hf.experimental.calib import quant_utils
+from litert_torch.generative.export_hf.experimental.calib import quantize as quantize_lib
 from litert_torch.generative.export_hf.experimental.calib import tokenizer as tokenizer_lib
+import numpy as np
 import transformers
+
+from ai_edge_quantizer import qtyping
+from ai_edge_quantizer import quantizer
 
 
 class QuantUtilsChatTemplateTest(absltest.TestCase):
@@ -194,6 +199,109 @@ class QuantUtilsChatTemplateTest(absltest.TestCase):
           tok.tx_tokenizer.chat_template,
           "{{ messages[0]['content'] }} [CUSTOM_TEMPLATE]",
       )
+
+  def test_scale_calibration_results_skips_mask_tensors(self):
+    calibration_result = {
+        "prefill_128_mask_global": {
+            "min": np.array([-100.0], dtype=np.float32),
+            "max": np.array([0.0], dtype=np.float32),
+        },
+        "mask_local_0_output": {
+            "min": np.array([-50.0], dtype=np.float32),
+            "max": np.array([0.0], dtype=np.float32),
+        },
+        "decoder_layer_0_activation": {
+            "min": np.array([-10.0], dtype=np.float32),
+            "max": np.array([20.0], dtype=np.float32),
+        },
+    }
+    scaled = quantize_lib._scale_calibration_results(calibration_result, 1.5)
+    np.testing.assert_allclose(
+        scaled["prefill_128_mask_global"]["min"], [-100.0]
+    )
+    np.testing.assert_allclose(scaled["mask_local_0_output"]["min"], [-50.0])
+    np.testing.assert_allclose(
+        scaled["decoder_layer_0_activation"]["min"], [-15.0]
+    )
+    np.testing.assert_allclose(
+        scaled["decoder_layer_0_activation"]["max"], [30.0]
+    )
+
+  def test_symmetrize_mask_and_logits_calibration(self):
+    main_calib = {
+        "prefill_128_mask_global": {
+            "min": np.array([-100.0], dtype=np.float32),
+            "max": np.array([0.0], dtype=np.float32),
+        },
+        "decode_logits_output": {
+            "min": np.array([-12.0], dtype=np.float32),
+            "max": np.array([25.0], dtype=np.float32),
+        },
+        "hidden_states": {
+            "min": np.array([-3.0], dtype=np.float32),
+            "max": np.array([7.0], dtype=np.float32),
+        },
+    }
+    aux_calib = {
+        "prefill_mask_128_mask_local_output": {
+            "min": np.array([-80.0], dtype=np.float32),
+            "max": np.array([0.0], dtype=np.float32),
+        },
+    }
+    quantize_lib._symmetrize_mask_and_logits_calibration(main_calib, aux_calib)
+    np.testing.assert_allclose(
+        main_calib["prefill_128_mask_global"]["min"], [-100.0]
+    )
+    np.testing.assert_allclose(
+        main_calib["prefill_128_mask_global"]["max"], [100.0]
+    )
+    np.testing.assert_allclose(
+        main_calib["decode_logits_output"]["min"], [-25.0]
+    )
+    np.testing.assert_allclose(
+        main_calib["decode_logits_output"]["max"], [25.0]
+    )
+    np.testing.assert_allclose(main_calib["hidden_states"]["min"], [-3.0])
+    np.testing.assert_allclose(main_calib["hidden_states"]["max"], [7.0])
+    np.testing.assert_allclose(
+        aux_calib["prefill_mask_128_mask_local_output"]["min"], [-80.0]
+    )
+    np.testing.assert_allclose(
+        aux_calib["prefill_mask_128_mask_local_output"]["max"], [80.0]
+    )
+
+  def test_add_main_model_quant_recipe_rules(self):
+    mock_q = mock.MagicMock()
+    quant_utils.add_main_model_quant_recipe(
+        mock_q, allow_float_operations=True, a16w8=True
+    )
+    mock_q.add_static_config.assert_any_call(
+        regex=".*(q_norm|k_norm).*",
+        operation_name=qtyping.TFLOperationName.STABLEHLO_COMPOSITE,
+        activation_num_bits=16,
+        weight_num_bits=8,
+    )
+    mock_q.update_quantization_recipe.assert_any_call(
+        regex="^(?!.*(q_norm|k_norm)).*",
+        operation_name=qtyping.TFLOperationName.STABLEHLO_COMPOSITE,
+        algorithm_key=quantizer.AlgorithmName.NO_QUANTIZE,
+    )
+    mock_q.update_quantization_recipe.assert_any_call(
+        regex=".*(post_qkv|(DecoderLayer|decoder_layer)_[0-9]+;).*",
+        operation_name=qtyping.TFLOperationName.ADD,
+        algorithm_key=quantizer.AlgorithmName.NO_QUANTIZE,
+    )
+
+    mock_q_int = mock.MagicMock()
+    quant_utils.add_main_model_quant_recipe(
+        mock_q_int, allow_float_operations=False, a16w8=True
+    )
+    mock_q_int.add_static_config.assert_any_call(
+        regex=".*(post_qkv|(DecoderLayer|decoder_layer)_[0-9]+;).*",
+        operation_name=qtyping.TFLOperationName.ADD,
+        activation_num_bits=16,
+        weight_num_bits=8,
+    )
 
 
 if __name__ == "__main__":
