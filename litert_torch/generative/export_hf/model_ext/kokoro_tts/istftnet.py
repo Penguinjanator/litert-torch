@@ -44,7 +44,8 @@ class AdaIN1d(nn.Module):
     # be lost if affine=False. When affine is true, there's additional
     # learnably parameters. This shouldn't really matter setting it to True,
     # since we're in inference mode
-    self.norm = nn.InstanceNorm1d(num_features, affine=True)
+    self.eps = 6.103515625e-5  # 2^-14: smallest positive normal FP16 value.
+    self.norm = nn.InstanceNorm1d(num_features, eps=self.eps, affine=True)
     self.fc = nn.Linear(style_dim, num_features * 2)
 
   def forward(self, x, s, mask=None):
@@ -59,13 +60,19 @@ class AdaIN1d(nn.Module):
           mask = F.pad(mask, (x.shape[2] - mask.shape[2], 0))
         elif mask.shape[2] > x.shape[2]:
           mask = mask[:, :, : x.shape[2]]
-      valid_count = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+      # Use mean() rather than sum() across the time axis (up to 46,081 steps
+      # in the vocoder) so FP16 intermediate reductions do not overflow 65,504.
+      # Use 2^-14 (6.103515625e-5) for the variance epsilon so mobile GPUs with
+      # hardware FP16 subnormal flush-to-zero (e.g., Qualcomm Adreno) do not
+      # flush eps to 0.0h and produce 0.0h / 0.0h = NaN on zero-variance
+      # channels.
+      valid_frac = mask.mean(dim=-1, keepdim=True).clamp(min=self.eps)
       x_valid = x * mask
-      mean = x_valid.sum(dim=-1, keepdim=True) / valid_count
-      var = ((x_valid - mean) * mask).pow(2).sum(
+      mean = x_valid.mean(dim=-1, keepdim=True) / valid_frac
+      var = ((x_valid - mean) * mask).pow(2).mean(
           dim=-1, keepdim=True
-      ) / valid_count
-      x_norm = (x - mean) / (var + 1e-5).sqrt() * mask
+      ) / valid_frac
+      x_norm = (x - mean) / (var + self.eps).sqrt() * mask
       h = self.fc(s)
       h = h.view(h.size(0), h.size(1), 1)
       gamma, beta = torch.chunk(h, chunks=2, dim=1)
@@ -283,46 +290,63 @@ class SineGen(nn.Module):
     Returns:
       Sine waveforms tensor.
     """
-    # convert to F0 in rad. The interger part n can be ignored
-    # because 2 * torch.pi * n doesn't affect phase
-    rad = f0_values / self.sampling_rate
-    rad_values = rad - torch.floor(rad)
     # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
     if not self.flag_for_pulse:
       s_scale = int(self.upsample_scale)
-      batch_size, l_full, dim = rad_values.shape
+      batch_size, l_full, dim = f0_values.shape
       l_down = l_full // s_scale
-      rad_down = rad_values[:, : l_down * s_scale, :].view(
+      f0_down = f0_values[:, : l_down * s_scale, :].view(
           batch_size, l_down, s_scale, dim
       )[:, :, 0, :]
+      # Compute per-step cycle increment on the downsampled F0 grid first, and
+      # scale by s_scale / sampling_rate (= 300 / 24000 = 0.0125) rather than
+      # 1 / sampling_rate (= 4.167e-5 < 2^-14), which flushes to 0.0h on GPUs
+      # with FP16 subnormal flush-to-zero (e.g., Qualcomm Adreno).
+      rad_down = f0_down * (float(s_scale) / self.sampling_rate)
+      rad_down_wrapped = rad_down - torch.floor(rad_down)
       # Accumulate phase in *cycles* (not radians) and wrap into [0, 1).
-      # sin() is 2*pi periodic so wrapping is exact, but it keeps the argument
-      # bounded. Without it the accumulator reaches ~2.4e5 rad, far outside the
-      # |x| <= 2^16 range where OpenCL guarantees sin() accuracy, which makes
-      # GPU output diverge from CPU and corrupts the harmonic excitation.
-      cyc_down = torch.cumsum(rad_down, dim=1) * float(s_scale)
+      # sin() is 2*pi periodic so wrapping is exact, and blocked modulo-1
+      # accumulation keeps intermediate sums < 24 cycles so FP16 retains full
+      # fractional phase precision across long sequences.
+      block_size = 16
+      if l_down >= block_size and l_down % block_size == 0:
+        num_blocks = l_down // block_size
+        rad_blocks = rad_down_wrapped.view(
+            batch_size, num_blocks, block_size, dim
+        )
+        block_cumsum = torch.cumsum(rad_blocks, dim=2)
+        block_cumsum = block_cumsum - torch.floor(block_cumsum)
+        block_totals = block_cumsum[:, :, -1:, :]
+        prefix_totals = torch.cumsum(block_totals, dim=1) - block_totals
+        prefix_totals = prefix_totals - torch.floor(prefix_totals)
+        cyc_down = (block_cumsum + prefix_totals).view(batch_size, l_down, dim)
+      else:
+        cyc_down = torch.cumsum(rad_down_wrapped, dim=1)
       cyc_down = cyc_down - torch.floor(cyc_down)
 
-      # Per-substep increment in cycles. This equals (x1 - x0) / S, but is taken
-      # straight from rad_down so it is not affected by the wrap above.
-      k = torch.arange(
-          s_scale, device=rad_values.device, dtype=rad_values.dtype
-      ).view(1, 1, s_scale, 1)
+      # Per-substep increment in cycles: k_frac = [0, 1/S, ..., (S-1)/S] in
+      # [0, 1), multiplied by the unwrapped per-frame cycle increment rad_down.
+      k_frac = torch.arange(
+          s_scale, device=f0_values.device, dtype=f0_values.dtype
+      ).view(1, 1, s_scale, 1) / float(s_scale)
       # Broadcast instead of building S tensors and stacking them: the previous
       # `torch.stack([...for k in range(S)])` lowered to a CONCATENATION with S
       # (=300) inputs, which overflows the OpenCL kernel argument list on
       # Adreno.
       stacked = (
-          cyc_down[:, :-1, :].unsqueeze(2) + k * rad_down[:, 1:, :].unsqueeze(2)
+          cyc_down[:, :-1, :].unsqueeze(2)
+          + k_frac * rad_down[:, 1:, :].unsqueeze(2)
       ).reshape(batch_size, (l_down - 1) * s_scale, dim)
       last_block = (
           cyc_down[:, -1:, :].unsqueeze(2)
-          + k * rad_down[:, -1:, :].unsqueeze(2)
+          + k_frac * rad_down[:, -1:, :].unsqueeze(2)
       ).reshape(batch_size, s_scale, dim)
       phase = torch.cat([stacked, last_block], dim=1)
       phase = phase - torch.floor(phase)
       sines = torch.sin(phase * (2.0 * torch.pi))
     else:
+      rad = f0_values / self.sampling_rate
+      rad_values = rad - torch.floor(rad)
       # If necessary, make sure that the first time step of every
       # voiced segments is sin(pi) or cos(0)
       # This is used for pulse-train generation
@@ -679,14 +703,8 @@ class InterleavedConvTranspose1d(nn.Module):
     b, c, l = x.shape
     if self.stride == 1:
       x_inter = x
-    elif self.stride == 2:
-      x_zeros = torch.zeros_like(x)
-      x_inter = torch.stack([x, x_zeros], dim=-1).view(b, c, l * 2)
     else:
-      zeros = torch.zeros(
-          (b, c, l, self.stride - 1), device=x.device, dtype=x.dtype
-      )
-      x_inter = torch.cat([x.unsqueeze(-1), zeros], dim=-1).view(
+      x_inter = F.pad(x.unsqueeze(-1), (0, self.stride - 1)).view(
           b, c, l * self.stride
       )
     if self.pad_left > 0 or self.pad_right > 0:

@@ -277,7 +277,9 @@ class BidirectionalFusedLSTM(nn.Module):
         x_bwd_b, 1, idx_b.unsqueeze(-1).expand(-1, -1, self.hidden_size)
     )
     if mask is not None:
-      x_bwd = x_bwd * (1.0 - mask.float().unsqueeze(-1))
+      keep = 1.0 - mask.float().unsqueeze(-1)
+      x_fwd = x_fwd * keep
+      x_bwd = x_bwd * keep
 
     x_out = torch.cat([x_fwd, x_bwd], dim=-1)
     return x_out

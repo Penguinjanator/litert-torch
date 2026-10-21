@@ -149,9 +149,13 @@ class CustomSTFT(nn.Module):
     # magnitude, phase
     magnitude = torch.sqrt(real_out**2 + imag_out**2 + 1e-14)
     # High-precision polynomial atan2 approximation for full GPU delegation.
+    # Clamp the denominator to the smallest positive normal FP16 value
+    # (2^-14 = 6.103515625e-5) so GPUs that force FP16 subnormal flush-to-zero
+    # (e.g., Qualcomm Adreno) do not flush eps to 0.0h and produce
+    # 0.0h / 0.0h = NaN when real_out == 0 and imag_out == 0.
     ay = torch.abs(imag_out)
     ax = torch.abs(real_out)
-    eps = 1e-12
+    fp16_min_normal = 6.103515625e-5
     invert = ay > ax
     # Use min/max rather than `where(invert, ax/ay, ay/ax)`. The polynomial
     # below is only valid for r in [0, 1]; the `where` form evaluates *both*
@@ -163,7 +167,7 @@ class CustomSTFT(nn.Module):
     # comparison is harmless (at ay == ax both quadrant branches agree on pi/4).
     amin = torch.minimum(ay, ax)
     amax = torch.maximum(ay, ax)
-    r = amin / (amax + eps)
+    r = amin / torch.clamp(amax, min=fp16_min_normal)
     c1 = 0.99997726
     c3 = -0.33262347
     c5 = 0.19354346
