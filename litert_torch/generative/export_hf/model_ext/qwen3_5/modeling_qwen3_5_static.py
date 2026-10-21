@@ -27,12 +27,12 @@ tokens.
 import copy
 from typing import Any, Dict, List, Optional, Tuple, Union
 from litert_torch.generative.export_hf.model_ext.qwen3_5 import gated_delta_rule
+from litert_torch.generative.layers import normalization
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Qwen3_5Config
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
 from transformers.models.qwen3_5.modular_qwen3_5 import Qwen3_5MLP
 from transformers.models.qwen3_5.modular_qwen3_5 import Qwen3_5RMSNorm
@@ -48,10 +48,58 @@ def _unwrap_config(config: Any) -> Any:
   return config
 
 
-def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-  """Aligns with l2norm in FLA / Qwen3.5 linear attention."""
-  inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-  return x * inv_norm
+def l2norm(
+    x: torch.Tensor,
+    dim: int = -1,
+    eps: float = 1e-6,
+    scale: float = 1.0,
+) -> torch.Tensor:
+  """Aligns with l2norm in FLA / Qwen3.5 linear attention using fused odml.rms_norm."""
+  if dim != -1 and dim != x.ndim - 1:
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * (inv_norm * scale)
+  head_dim = x.shape[-1]
+  weight = torch.full(
+      (head_dim,),
+      scale / (head_dim**0.5),
+      dtype=x.dtype,
+      device=x.device,
+  )
+  ones = torch.ones((head_dim,), dtype=x.dtype, device=x.device)
+  return normalization.rms_norm_with_hlfb(
+      x,
+      weight,
+      eps / head_dim,
+      ones,
+  )
+
+
+class Qwen3_5RMSNormGated(nn.Module):  # pylint: disable=invalid-name
+  """Fused gated RMSNorm Layer for Qwen3.5 GatedDeltaNet."""
+
+  def __init__(self, hidden_size: int, eps: float = 1e-6):
+    super().__init__()
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.hidden_size = hidden_size
+
+  def forward(
+      self, hidden_states: torch.Tensor, gate: torch.Tensor
+  ) -> torch.Tensor:
+    normed = normalization.rms_norm_with_hlfb(
+        hidden_states,
+        self.weight,
+        self.variance_epsilon,
+        torch.ones(
+            (self.hidden_size,),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ),
+    )
+    return normed * F.silu(gate)
+
+  def extra_repr(self) -> str:
+    return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 def apply_rotary_pos_emb(
@@ -193,11 +241,14 @@ class Qwen3_5StaticGatedDeltaNet(nn.Module):
       beta = beta * vm_3d
       g = g * vm_3d
 
-    # 2. L2 normalize query and key
-    query = l2norm(query, dim=-1, eps=self.rms_norm_eps)
+    # 2. L2 normalize query (with folded 1/sqrt(head_k_dim) scale) and key
+    query = l2norm(
+        query,
+        dim=-1,
+        eps=self.rms_norm_eps,
+        scale=1.0 / (self.head_k_dim**0.5),
+    )
     key = l2norm(key, dim=-1, eps=self.rms_norm_eps)
-    scale = 1.0 / (self.head_k_dim**0.5)
-    query = (query.to(torch.float32) * scale).to(query.dtype)
 
     # 3. Core Gated Delta Rule update
     core_attn_out, new_recurrent_state = (
