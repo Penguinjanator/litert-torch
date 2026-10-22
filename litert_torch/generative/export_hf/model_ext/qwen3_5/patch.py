@@ -460,6 +460,10 @@ def apply_qwen3_5_model_patches(
   gdn_use_fp32 = extra_kwargs.get(
       "gdn_use_fp32", getattr(export_config, "gdn_use_fp32", True)
   )
+  if "use_short_conv_composite" in extra_kwargs:
+    use_short_conv = bool(extra_kwargs["use_short_conv_composite"])
+  else:
+    use_short_conv = True
 
   replaced_modules: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
 
@@ -469,6 +473,8 @@ def apply_qwen3_5_model_patches(
       module.gdn_mode = int(gdn_mode)
     if hasattr(module, "use_fp32"):
       module.use_fp32 = bool(gdn_use_fp32)
+    if hasattr(module, "use_short_conv_composite"):
+      module.use_short_conv_composite = bool(use_short_conv)
     for child_name, child in module.named_children():
       if isinstance(
           child,

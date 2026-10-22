@@ -26,6 +26,7 @@ tokens.
 
 import copy
 from typing import Any, Dict, List, Optional, Tuple, Union
+from litert_torch.generative.export_hf.experimental.composites import short_conv as short_conv_composite
 from litert_torch.generative.export_hf.model_ext.qwen3_5 import gated_delta_rule
 from litert_torch.generative.layers import normalization
 import torch
@@ -138,6 +139,7 @@ class Qwen3_5StaticGatedDeltaNet(nn.Module):
       use_fused_gdn: bool = True,
       gdn_mode: int = 0,
       use_fp32: bool = True,
+      use_short_conv_composite: bool = True,
   ):
     super().__init__()
     self.layer_idx = layer_idx
@@ -167,6 +169,7 @@ class Qwen3_5StaticGatedDeltaNet(nn.Module):
     self.use_fused_gdn = use_fused_gdn
     self.gdn_mode = gdn_mode
     self.use_fp32 = use_fp32
+    self.use_short_conv_composite = use_short_conv_composite
     self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
     self.in_proj_qkv = nn.Linear(hidden_size, self.conv_dim, bias=False)
@@ -190,34 +193,53 @@ class Qwen3_5StaticGatedDeltaNet(nn.Module):
     has_valid_mask = valid_mask is not None and valid_mask.numel() > 0
 
     # 1. Causal 1D Conv with static conv_state
-    mixed_qkv_t = mixed_qkv.transpose(1, 2)
     if has_valid_mask:
       assert valid_mask is not None
-      mixed_qkv_masked = mixed_qkv_t * valid_mask.view(
-          batch_size, 1, seq_len
-      ).to(mixed_qkv_t.dtype)
-    else:
-      mixed_qkv_masked = mixed_qkv_t
-
-    full_qkv = torch.cat([conv_state, mixed_qkv_masked], dim=-1)
-    conv_out = F.conv1d(
-        full_qkv,
-        self.conv1d.weight,
-        self.conv1d.bias,
-        padding=0,
-        groups=self.conv_dim,
-    )
-    conv_out = F.silu(conv_out[:, :, -seq_len:]).transpose(1, 2)
-
-    if seq_len > 1 and has_valid_mask:
-      assert valid_mask is not None
-      num_real = valid_mask[0].to(torch.float32).sum().to(torch.int32)
-      indices = num_real + torch.arange(
-          state_len, device=full_qkv.device, dtype=torch.int32
+      mixed_qkv = mixed_qkv * valid_mask.view(batch_size, seq_len, 1).to(
+          mixed_qkv.dtype
       )
-      new_conv_state = torch.ops.tfl.gather(full_qkv, indices, 2)
+
+    if getattr(self, "use_short_conv_composite", True):
+      num_valid_tokens = None
+      if seq_len > 1 and has_valid_mask:
+        assert valid_mask is not None
+        num_valid_tokens = (
+            valid_mask.to(torch.float32)
+            .sum(dim=-1, keepdim=False)
+            .to(torch.int32)
+        )
+      conv_out, new_conv_state = short_conv_composite.apply_short_conv_step(
+          in_proj_out=mixed_qkv,
+          conv_state=conv_state,
+          conv_weight=self.conv1d.weight,
+          conv_bias=self.conv1d.bias,
+          num_valid_tokens=num_valid_tokens,
+          conv_L_cache=self.conv_kernel_size,
+          is_gated=False,
+          use_silu=True,
+      )
     else:
-      new_conv_state = full_qkv[:, :, -state_len:]
+      mixed_qkv_masked = mixed_qkv.transpose(1, 2)
+
+      full_qkv = torch.cat([conv_state, mixed_qkv_masked], dim=-1)
+      conv_out = F.conv1d(
+          full_qkv,
+          self.conv1d.weight,
+          self.conv1d.bias,
+          padding=0,
+          groups=self.conv_dim,
+      )
+      conv_out = F.silu(conv_out[:, :, -seq_len:]).transpose(1, 2)
+
+      if seq_len > 1 and has_valid_mask:
+        assert valid_mask is not None
+        num_real = valid_mask[0].to(torch.float32).sum().to(torch.int32)
+        indices = num_real + torch.arange(
+            state_len, device=full_qkv.device, dtype=torch.int32
+        )
+        new_conv_state = torch.ops.tfl.gather(full_qkv, indices, 2)
+      else:
+        new_conv_state = full_qkv[:, :, -state_len:]
 
     query, key, value = torch.split(
         conv_out, [self.key_dim, self.key_dim, self.value_dim], dim=-1
@@ -363,6 +385,9 @@ class Qwen3_5StaticDecoderLayer(nn.Module):
           use_fused_gdn=getattr(config, "use_fused_gdn", True),
           gdn_mode=getattr(config, "gdn_mode", 0),
           use_fp32=getattr(config, "gdn_use_fp32", True),
+          use_short_conv_composite=getattr(
+              config, "use_short_conv_composite", True
+          ),
       )
     elif self.block_type == "full_attention":
       self.self_attn = Qwen3_5Attention(config, layer_idx)  # pyrefly: ignore[bad-argument-type]
