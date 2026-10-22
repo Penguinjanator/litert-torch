@@ -30,6 +30,7 @@ from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
 from litert_torch.generative.export_hf.model_ext.kokoro_tts import kokoro_tts as kokoro_tts_lib
 from litert_torch.generative.export_hf.model_ext.lfm2_vl import vision_exportable as lfm2_vl_vision_exportable
+from litert_torch.generative.export_hf.model_ext.minicpm_o import minicpm_o as minicpm_o_lib
 from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as moonshine_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_tdt as parakeet_tdt_lib
@@ -244,3 +245,19 @@ def get_image_gen_model_cls(model_type: str):
     return flux2_klein_lib.Flux2Klein
   else:
     raise ValueError(f'Unsupported ImageGen model type: {model_type}')
+
+
+def get_any2any_model_cls(model_type: str):
+  """Gets Any2Any multimodal model class by model type."""
+  if model_type in (
+      'minicpmo',
+      'minicpm_o',
+      'minicpm-o',
+      'minicpm-o-4.5',
+      'minicpm-o-4_5',
+      'MiniCPM-o-4_5',
+      'MiniCPMO',
+  ):
+    return minicpm_o_lib.MiniCpmO
+  else:
+    raise ValueError(f'Unsupported Any2Any model type: {model_type}')

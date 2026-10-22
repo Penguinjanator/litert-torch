@@ -339,6 +339,11 @@ def export(
     export_tasks.append(export_lib.export_tokenizer)
     if export_config.bundle_litert_lm:
       export_tasks.append(litert_lm_builder.package_model)
+  elif task == ExportTask.ANY_TO_ANY:
+    export_tasks.append(export_lib.export_any2any_models)
+    export_tasks.append(export_lib.export_tokenizer)
+    if export_config.bundle_litert_lm:
+      export_tasks.append(litert_lm_builder.package_model)
   else:
     # Submodule exports must run before prefill/decode: with Converter V2 and
     # `delete_in_memory_params`, prefill/decode frees the model's parameters.

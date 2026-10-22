@@ -33,16 +33,24 @@ class ExportTask(str, enum.Enum):
   AUTOMATIC_SPEECH_RECOGNITION = "automatic_speech_recognition"
   TEXT_TO_SPEECH = "text_to_speech"
   TEXT_TO_IMAGE = "text_to_image"
+  ANY_TO_ANY = "any_to_any"
 
 
 # Keys that are legitimately passed through to model-specific code via
 # `extra_kwargs`. Anything else is rejected so that a mistyped flag fails loudly
 # instead of being silently ignored.
 _KNOWN_EXTRA_KWARGS = frozenset({
+    "audio_include_mask_inputs",
+    "audio_mel_frames",
+    "audio_num_layers",
     "gemma4_vision_max_soft_tokens",
     "litert_samples_conversion_dir",
+    "llm_intermediate_size",
+    "llm_num_layers",
     "max_seq_len",
     "targets",
+    "vision_num_layers",
+    "vision_num_patches",
 })
 
 # Legacy flag names accepted for one release, mapped in `__post_init__`.
@@ -393,6 +401,11 @@ class ExportableModuleConfig:
         self.externalize_embedder = False
         self.single_token_embedder = False
         self.externalize_rope = False
+      case ExportTask.ANY_TO_ANY:
+        self.split_cache = False
+        self.externalize_embedder = True
+        self.single_token_embedder = True
+        self.externalize_rope = False
       case _:
         self.export_vision_encoder = False
         self.export_audio_encoder = False
@@ -455,6 +468,7 @@ class ExportableModuleConfig:
         ExportTask.IMAGE_TEXT_TO_TEXT,
         ExportTask.MULTIMODAL_LM,
         ExportTask.TEXT_TO_SPEECH,
+        ExportTask.ANY_TO_ANY,
     ):
       unsupported.append(f"task={self.task}")
     # `split_cache` always sets `litert_moe_sequential`, which only affects

@@ -363,6 +363,41 @@ def load_model(
         tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
     )
 
+  if task == ExportTask.ANY_TO_ANY:
+    local_model_dir = (
+        model_path
+        if os.path.exists(model_path)
+        else huggingface_hub.snapshot_download(model_path)
+    )
+    model_type = export_config.litert_lm_model_type_override
+    if not model_type:
+      config_path = os.path.join(local_model_dir, 'config.json')
+      if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+          model_type = json.load(f).get('model_type', 'minicpmo')
+      else:
+        model_type = 'minicpmo'
+    model_cls = model_ext_exportables.get_any2any_model_cls(model_type)
+    model = model_cls(local_model_dir, export_config=export_config)
+    try:
+      tokenizer = transformers.AutoTokenizer.from_pretrained(
+          model.model_dir, trust_remote_code=trust_remote_code
+      )
+    except Exception:  # pylint: disable=broad-exception-caught
+      tokenizer_json = os.path.join(model.model_dir, 'tokenizer.json')
+      if not os.path.exists(tokenizer_json):
+        raise
+      tokenizer = transformers.PreTrainedTokenizerFast(
+          tokenizer_file=tokenizer_json
+      )
+    config = transformers.PretrainedConfig.from_dict({'model_type': model_type})
+    return SourceModelArtifacts(
+        model=model,
+        model_config=config,
+        text_model_config=config,
+        tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
+    )
+
   if task == ExportTask.TEXT_TO_SPEECH:
     config = _load_tts_config(model_path, trust_remote_code)
     model_cls = model_ext_exportables.get_tts_model_cls(config.model_type)
@@ -1266,6 +1301,21 @@ def export_image_gen_models(
   """Exports ImageGen models."""
   image_gen_model = source_model_artifacts.model
   artifacts = image_gen_model.export(export_config)
+  return dataclasses.replace(
+      exported_model_artifacts,
+      additional_model_paths=artifacts,
+  )
+
+
+@progress.task('Export Any2Any models')
+def export_any2any_models(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+):
+  """Exports Any2Any multimodal models."""
+  any2any_model = source_model_artifacts.model
+  artifacts = any2any_model.export(export_config)
   return dataclasses.replace(
       exported_model_artifacts,
       additional_model_paths=artifacts,

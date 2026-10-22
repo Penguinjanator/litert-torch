@@ -493,6 +493,84 @@ def package_image_gen_model(
   )
 
 
+_ANY2ANY_TFLITE_MODEL_TYPES: dict[str, str] = {
+    'text_embedder': 'tf_lite_text_embedder',
+    'vision_encoder': 'tf_lite_vision_encoder',
+    'audio_encoder': 'tf_lite_audio_encoder',
+    'llm_backbone': 'tf_lite_llm_backbone',
+    'tts_projector': 'tf_lite_tts_projector',
+    'tts_decoder': 'tf_lite_tts_decoder',
+    'audio_vocoder': 'tf_lite_audio_vocoder',
+}
+
+
+def package_any2any_model(
+    source_model_artifacts: export_lib.SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: export_lib.ExportedModelArtifacts,
+) -> export_lib.ExportedModelArtifacts:
+  """Packs exported Any2Any submodels and metadata into a .litertlm file."""
+  work_dir = export_config.work_dir or export_config.output_dir
+  output_dir = export_config.output_dir or export_config.work_dir
+  tokenizer_model_path = (
+      export_config.tokenizer_path_override
+      or exported_model_artifacts.tokenizer_model_path
+  )
+
+  any2any_model = source_model_artifacts.model
+  any2any_metadata = any2any_model.get_any2any_metadata(export_config)
+  any2any_metadata_path = os.path.join(work_dir, 'any2any_metadata.pb')  # pyrefly: ignore[no-matching-overload]
+  with open(any2any_metadata_path, 'wb') as f:
+    f.write(any2any_metadata.SerializeToString())
+
+  builder = litertlm_builder.LitertLmFileBuilder()
+  builder.add_system_metadata(
+      litertlm_builder.Metadata(
+          key='Authors',
+          value='ODML',
+          dtype=litertlm_builder.DType.STRING,
+      )
+  )
+  builder.add_any2any_metadata(any2any_metadata_path)
+  if tokenizer_model_path:
+    if tokenizer_model_path.endswith('.json'):
+      builder.add_hf_tokenizer(tokenizer_model_path)
+    else:
+      builder.add_sentencepiece_tokenizer(tokenizer_model_path)
+
+  if exported_model_artifacts.additional_model_paths:
+    for (
+        name,
+        submodel_path,
+    ) in exported_model_artifacts.additional_model_paths.items():
+      if name in _ANY2ANY_TFLITE_MODEL_TYPES:
+        builder.add_tflite_model(
+            submodel_path,
+            _ANY2ANY_TFLITE_MODEL_TYPES[name],
+        )
+      elif submodel_path.endswith('.bin'):
+        builder.add_generic_binary_data(
+            submodel_path,
+            additional_metadata=[
+                litertlm_builder.Metadata(
+                    key='name',
+                    value=name,
+                    dtype=litertlm_builder.DType.STRING,
+                )
+            ],
+        )
+      else:
+        raise ValueError(f'Unsupported Any2Any model component: {name}')
+
+  model_path = os.path.join(output_dir, 'model.litertlm')  # pyrefly: ignore[no-matching-overload]
+  with open(model_path, 'wb') as f:
+      builder.build(f)
+  return dataclasses.replace(
+      exported_model_artifacts,
+      litert_lm_model_path=model_path,
+  )
+
+
 @progress.task('Package model')
 def package_model(
     source_model_artifacts: export_lib.SourceModelArtifacts,
@@ -502,6 +580,12 @@ def package_model(
   """Packs models to LiteRT LM."""
   if export_config.task == export_lib.ExportTask.TEXT_TO_IMAGE:
     return package_image_gen_model(
+        source_model_artifacts,
+        export_config,
+        exported_model_artifacts,
+    )
+  if export_config.task == export_lib.ExportTask.ANY_TO_ANY:
+    return package_any2any_model(
         source_model_artifacts,
         export_config,
         exported_model_artifacts,
