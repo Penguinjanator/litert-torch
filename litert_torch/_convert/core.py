@@ -119,6 +119,10 @@ def export_torch_signature(
         strict=True,
     )
 
+  exported_program = fx_infra.graph_utils.remove_unused_non_user_inputs(
+      exported_program
+  )
+
   if not run_decompositions:
     return exported_program
 

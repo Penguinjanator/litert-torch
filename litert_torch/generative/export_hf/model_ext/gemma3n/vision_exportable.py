@@ -51,12 +51,7 @@ class LiteRTExportableModuleForGemma3nVisionAdapter(
       soft_tokens,
   ):
     image_features = self.model.model.embed_vision(inputs_embeds=soft_tokens)
-    eoi = self.tokenizer.encode(
-        self.tokenizer.special_tokens_map['eoi_token'], add_special_tokens=False
-    )
-    eoi_emb = self.model.get_input_embeddings()(torch.tensor(eoi)[None, :])
-
-    mm_embedding = torch.concat([image_features, eoi_emb], axis=1)  # pyrefly: ignore[unexpected-keyword]
+    mm_embedding = torch.concat([image_features, self.eoi_emb], axis=1)  # pyrefly: ignore[unexpected-keyword]
     return {'mm_embedding': mm_embedding}
 
   def get_sample_inputs(
@@ -75,12 +70,16 @@ class LiteRTExportableModuleForGemma3nVisionAdapter(
     ).pixel_values
     with torch.device('meta'):
       features = self.model.model.vision_tower(
-          pixel_values=dummy_image
+          pixel_values=dummy_image.to('meta')
       ).last_hidden_state
       features = features.reshape(
           features.shape[0],
           self.model.config.vision_config.hidden_size,
           self.model.config.vision_soft_tokens_per_image,
       ).permute(0, 2, 1)
-    inputs = {'soft_tokens': torch.zeros_like(features, dtype=torch.float32)}
+    inputs = {
+        'soft_tokens': torch.zeros_like(
+            features, dtype=torch.float32, device='cpu'
+        )
+    }
     return {'vision_adapter': (inputs, {})}

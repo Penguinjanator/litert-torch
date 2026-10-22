@@ -400,6 +400,7 @@ class ExportableModuleConfig:
     if self.split_cache:
       self.externalize_embedder = True
       self.externalize_rope = True
+      self.single_token_embedder = False
       if self.cache_implementation is None:
         self.cache_implementation = "LiteRTLMSplitCache"
       self.moe_exports_implementation = "litert_moe_sequential"
@@ -451,6 +452,8 @@ class ExportableModuleConfig:
     unsupported = []
     if self.task not in (
         ExportTask.TEXT_GENERATION,
+        ExportTask.IMAGE_TEXT_TO_TEXT,
+        ExportTask.MULTIMODAL_LM,
         ExportTask.TEXT_TO_SPEECH,
     ):
       unsupported.append(f"task={self.task}")

@@ -72,23 +72,18 @@ class LiteRTExportableModuleForGemma4UnifiedEndOfImage(
 
   def __init__(self, model: torch.nn.Module, export_config, tokenizer):
     super().__init__(export_config)
-    self.model = model
-    self.tokenizer = tokenizer
+    token_ids = tokenizer.encode(
+        tokenizer.special_tokens_map['eoi_token'],
+        add_special_tokens=False,
+    )
+    self.register_buffer(
+        'eoi_embedding',
+        exportable_module_base.embed_tokens_on_cpu(model, token_ids),
+        persistent=False,
+    )
 
   def forward(self):
-    return {
-        'eoi_embedding': self.model.get_input_embeddings()(
-            torch.tensor(
-                [
-                    self.tokenizer.encode(
-                        self.tokenizer.special_tokens_map['eoi_token'],
-                        add_special_tokens=False,
-                    )
-                ],
-                dtype=torch.int32,
-            )
-        )
-    }
+    return {'eoi_embedding': self.eoi_embedding}
 
   def get_sample_inputs(
       self, model_config, **kwargs

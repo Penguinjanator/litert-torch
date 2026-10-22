@@ -15,6 +15,7 @@
 """Patches for Gemma4 model for on-device deployment."""
 
 import contextlib
+import weakref
 from litert_torch.backend import optimization_barrier as optimization_barrier_lib
 from litert_torch.backend.torch_tfl import _ops as _  # Registers torch.ops.tfl.*
 from litert_torch.generative.export_hf.experimental.composites import qkv_norm_rope
@@ -196,17 +197,21 @@ try:
           self.gate_proj.in_features,
           gate_out_features + up_out_features,
           bias=self.gate_proj.bias is not None,
+          device=self.gate_proj.weight.device,
+          dtype=self.gate_proj.weight.dtype,
       )
 
-      # Copy weights and biases
-      with torch.no_grad():
-        self.gate_up_proj.weight.copy_(
-            torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
-        )
-        if self.gate_up_proj.bias is not None:
-          self.gate_up_proj.bias.copy_(
-              torch.cat([self.gate_proj.bias, self.up_proj.bias], dim=0)
+      # Copy weights and biases when not on the meta device (Converter V2
+      # reconstructs `gate_up_proj` from checkpoint weights during export).
+      if not self.gate_proj.weight.is_meta:
+        with torch.no_grad():
+          self.gate_up_proj.weight.copy_(
+              torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
           )
+          if self.gate_up_proj.bias is not None:
+            self.gate_up_proj.bias.copy_(
+                torch.cat([self.gate_proj.bias, self.up_proj.bias], dim=0)
+            )
 
       self.gate_size = gate_out_features
 
@@ -281,20 +286,24 @@ try:
               self.q_proj.in_features,
               q_out_features + k_out_features + v_out_features,
               bias=self.q_proj.bias is not None,
+              device=self.q_proj.weight.device,
+              dtype=self.q_proj.weight.dtype,
           )
 
-          # Copy weights and biases
-          with torch.no_grad():
-            tensors_to_cat = [self.q_proj.weight, self.k_proj.weight]
-            if self.v_proj is not None:
-              tensors_to_cat.append(self.v_proj.weight)
-            self.qkv_proj.weight.copy_(torch.cat(tensors_to_cat, dim=0))
-
-            if self.qkv_proj.bias is not None:
-              biases_to_cat = [self.q_proj.bias, self.k_proj.bias]
+          # Copy weights and biases when not on the meta device (Converter V2
+          # reconstructs `qkv_proj` from checkpoint weights during export).
+          if not self.q_proj.weight.is_meta:
+            with torch.no_grad():
+              tensors_to_cat = [self.q_proj.weight, self.k_proj.weight]
               if self.v_proj is not None:
-                biases_to_cat.append(self.v_proj.bias)
-              self.qkv_proj.bias.copy_(torch.cat(biases_to_cat, dim=0))
+                tensors_to_cat.append(self.v_proj.weight)
+              self.qkv_proj.weight.copy_(torch.cat(tensors_to_cat, dim=0))
+
+              if self.qkv_proj.bias is not None:
+                biases_to_cat = [self.q_proj.bias, self.k_proj.bias]
+                if self.v_proj is not None:
+                  biases_to_cat.append(self.v_proj.bias)
+                self.qkv_proj.bias.copy_(torch.cat(biases_to_cat, dim=0))
 
           self.q_size = q_out_features
           self.k_size = k_out_features
@@ -715,8 +724,46 @@ except ImportError:
     yield
 
 
+# TODO(b/576081319): Clean up once Converter V2 folds SliceOp and elementwise
+# ops on DenseResourceElementsAttr constants.
+_PATCHED_MODULES: list[weakref.ReferenceType[torch.nn.Module]] = []
+
+
 class LiteRTGemma4VisionPatchEmbedder(Gemma4VisionPatchEmbedder):
   """LiteRT Gemma4 Vision Patch Embedder."""
+
+  def __init__(self, config):
+    super().__init__(config)
+    # TODO(b/576081319): Clean up once Converter V2 folds SliceOp on
+    # DenseResourceElementsAttr constants.
+    table = self.position_embedding_table
+    del self._parameters["position_embedding_table"]
+    self.register_buffer(
+        "position_embedding_table",
+        torch.ones(table.shape, dtype=table.dtype, device="cpu"),
+        persistent=True,
+    )
+    self.precompute_buffers()
+    _PATCHED_MODULES.append(weakref.ref(self))
+
+  def precompute_buffers(self):
+    if self.position_embedding_table.is_meta:
+      return
+    with torch.no_grad():
+      self.register_buffer(
+          "table_x",
+          self.position_embedding_table[0].detach().cpu().clone(),
+          persistent=False,
+      )
+      self.register_buffer(
+          "table_y",
+          self.position_embedding_table[1].detach().cpu().clone(),
+          persistent=False,
+      )
+
+  def _load_from_state_dict(self, *args, **kwargs):
+    super()._load_from_state_dict(*args, **kwargs)
+    self.precompute_buffers()
 
   def _position_embeddings(
       self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor
@@ -732,12 +779,17 @@ class LiteRTGemma4VisionPatchEmbedder(Gemma4VisionPatchEmbedder):
     clamped_positions_y = clamped_positions[..., 1]
     one_hot_x = clamped_positions_x.unsqueeze(-1) == classes
     one_hot_y = clamped_positions_y.unsqueeze(-1) == classes
-    one_hot_x = one_hot_x.to(self.position_embedding_table.dtype)
-    one_hot_y = one_hot_y.to(self.position_embedding_table.dtype)
 
     # AI Edge Quantizer crashes on BMM weight quant.
-    table_x = self.position_embedding_table[0]
-    table_y = self.position_embedding_table[1]
+    # TODO(b/576081319): Clean up once Converter V2 folds SliceOp on
+    # DenseResourceElementsAttr constants.
+    table_x = getattr(self, "table_x", None)
+    table_y = getattr(self, "table_y", None)
+    if table_x is None or table_y is None:
+      table_x = self.position_embedding_table[0]
+      table_y = self.position_embedding_table[1]
+    one_hot_x = one_hot_x.to(table_x.dtype)
+    one_hot_y = one_hot_y.to(table_y.dtype)
     x_embeddings = one_hot_x @ table_x
     y_embeddings = one_hot_y @ table_y
     position_embeddings = x_embeddings + y_embeddings
@@ -867,6 +919,12 @@ class LiteRTGemma4AudioSubSampleConvProjectionLayer(
     modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer
 ):
   """LiteRT Gemma4 Audio SubSample Conv Projection Layer for GPU export."""
+
+  def __init__(self, in_channels: int, out_channels: int, norm_eps: float):
+    super().__init__(in_channels, out_channels, norm_eps)
+    self.norm = normalization.LayerNorm(
+        out_channels, eps=norm_eps, use_bias=False, enable_hlfb=True
+    )
 
   def forward(
       self, hidden_states: torch.Tensor, mask: torch.Tensor | None = None
@@ -1215,6 +1273,11 @@ def gemma4_litert_patch():
     )
     modeling_gemma4.Gemma4AudioAttention = original_audio_attention
     modeling_gemma4.Gemma4AudioModel = original_audio_model
+    for ref in list(_PATCHED_MODULES):
+      m = ref()
+      if m is not None:
+        m.precompute_buffers()
+    _PATCHED_MODULES.clear()
 
 
 # pytype: enable=import-error

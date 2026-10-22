@@ -165,9 +165,9 @@ class LayerNorm(torch.nn.Module):
     self.enable_hlfb = enable_hlfb
     self.normalized_shape = (dim,)
     self.eps = eps
-    self.weight = torch.nn.Parameter(torch.empty(dim), requires_grad=False)
+    self.weight = torch.nn.Parameter(torch.ones(dim), requires_grad=False)
     self.bias = (
-        torch.nn.Parameter(torch.empty(dim), requires_grad=False)
+        torch.nn.Parameter(torch.zeros(dim), requires_grad=False)
         if use_bias
         else None
     )
@@ -181,7 +181,7 @@ class LayerNorm(torch.nn.Module):
     Returns:
       torch.Tensor: output tensor after applying LayerNorm.
     """
-    if self.enable_hlfb and self.bias is not None:
+    if self.enable_hlfb:
       return layer_norm_with_hlfb(
           x, self.normalized_shape, self.weight, self.bias, self.eps
       )
@@ -225,19 +225,20 @@ def rms_norm_with_hlfb(
 
 def layer_norm_with_hlfb(
     x: torch.Tensor,
-    normalized_shape: list[int],
+    normalized_shape: list[int] | tuple[int, ...],
     w: torch.Tensor,
-    b: torch.Tensor,
+    b: torch.Tensor | None,
     eps: float,
 ):
   """Layer Normalization with high-level function boundary enabled.
 
   Args:
     x (torch.Tensor): Input tensor for Layer Normalization, with BCHW shape.
-    normalized_shape (list[int]): Input shape from an expected input of size,
-      same as https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html.
+    normalized_shape (list[int] | tuple[int, ...]): Input shape from an expected
+      input of size, same as
+      https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html.
     w (torch.Tensor): The weight tensor for the normalization.
-    b (torch.Tensor): The bias tensor for the normalization.
+    b (torch.Tensor | None): The optional bias tensor for the normalization.
     eps (float): A small float value to ensure numerical stability.
 
   Returns:
@@ -247,7 +248,19 @@ def layer_norm_with_hlfb(
       name="odml.group_norm",
       attr={"num_groups": 1, "epsilon": eps, "channel_axis": 1},
   )
-  x, w, b = builder.mark_inputs(x, w, b)
-  y = F.layer_norm(x, normalized_shape, w, b, eps=eps)
+  if b is not None:
+    x, w, b = builder.mark_inputs(x, w, b)
+  else:
+    x, w = builder.mark_inputs(x, w)
+
+  dims = tuple(range(-len(normalized_shape), 0))
+  x_f = x.float()
+  mean = x_f.mean(dim=dims, keepdim=True)
+  centered = x_f - mean
+  var = centered.pow(2).mean(dim=dims, keepdim=True)
+  y = (centered * torch.rsqrt(var + eps)).type_as(x) * w
+  if b is not None:
+    y = y + b
+
   y = builder.mark_outputs(y)
   return y

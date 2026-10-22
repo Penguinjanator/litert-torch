@@ -68,6 +68,51 @@ class NormalizationTest(parameterized.TestCase):
     self.assertEqual(out.shape, (model_dim,))
     self.assertTrue(torch.allclose(out, expected_values))
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="layer_norm_with_bias_no_hlfb",
+          use_bias=True,
+          enable_hlfb=False,
+      ),
+      dict(
+          testcase_name="layer_norm_with_bias_hlfb",
+          use_bias=True,
+          enable_hlfb=True,
+      ),
+      dict(
+          testcase_name="layer_norm_no_bias_no_hlfb",
+          use_bias=False,
+          enable_hlfb=False,
+      ),
+      dict(
+          testcase_name="layer_norm_no_bias_hlfb",
+          use_bias=False,
+          enable_hlfb=True,
+      ),
+  )
+  def test_layer_norm(self, use_bias: bool, enable_hlfb: bool):
+    model_dim = 10
+    layer_norm = normalization.LayerNorm(
+        dim=model_dim,
+        use_bias=use_bias,
+        enable_hlfb=enable_hlfb,
+    )
+    ref_layer_norm = torch.nn.LayerNorm(
+        model_dim, elementwise_affine=True, bias=use_bias
+    )
+    with torch.no_grad():
+      ref_layer_norm.weight.uniform_(0.5, 1.5)
+      layer_norm.weight.copy_(ref_layer_norm.weight)
+      if use_bias:
+        ref_layer_norm.bias.uniform_(-0.5, 0.5)
+        layer_norm.bias.copy_(ref_layer_norm.bias)
+
+    x = torch.randn((2, 4, model_dim), dtype=torch.float32)
+    out = layer_norm(x)
+    expected = ref_layer_norm(x)
+    self.assertEqual(out.shape, x.shape)
+    self.assertTrue(torch.allclose(out, expected, rtol=1e-5, atol=1e-5))
+
 
 if __name__ == "__main__":
   googletest.main()

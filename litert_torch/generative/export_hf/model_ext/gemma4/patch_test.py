@@ -20,6 +20,7 @@ import types
 from absl.testing import parameterized
 from litert_torch.generative.export_hf.core import export_lib
 from litert_torch.generative.export_hf.core import exportable_module_config
+from litert_torch.generative.export_hf.core import weights_loader
 import litert_torch.generative.export_hf.model_ext as _
 from litert_torch.generative.export_hf.model_ext.gemma4 import patch
 from litert_torch.generative.layers import moe
@@ -349,6 +350,24 @@ class PatchTest(parameterized.TestCase):
           actual_logits, expected_logits, rtol=1e-4, atol=1e-4
       )
 
+  def test_patch_gemma4_model_on_meta_device(self):
+    config = _get_dummy_gemma4_text_config()
+    config.vocab_size = 256
+    config.attention_k_eq_v = True
+    with weights_loader.init_params_on_meta():
+      model = modeling_gemma4.Gemma4ForCausalLM(config).eval()
+
+    export_config = exportable_module_config.ExportableModuleConfig(
+        model="dummy",
+        apply_gpu_composites=True,
+    )
+    with patch.patch_gemma4_model(model, export_config):
+      layer = model.model.layers[0]
+      self.assertIsInstance(layer.mlp, patch.FusedGemma4TextMLP)
+      self.assertTrue(layer.mlp.gate_up_proj.weight.is_meta)
+      self.assertIsInstance(layer.self_attn, patch.FusedGemma4TextAttention)
+      self.assertTrue(layer.self_attn.qkv_proj.weight.is_meta)
+
   def test_gemma4_router_equivalence(self):
     config = _get_dummy_gemma4_text_config()
     config.num_experts = 128
@@ -606,6 +625,13 @@ class PatchTest(parameterized.TestCase):
       patched_model = modeling_gemma4.Gemma4AudioModel(
           copy.deepcopy(audio_config)
       ).eval()
+    for layer in (
+        patched_model.subsample_conv_projection.layer0,
+        patched_model.subsample_conv_projection.layer1,
+    ):
+      self.assertIsInstance(layer.norm, patch.normalization.LayerNorm)
+      self.assertTrue(layer.norm.enable_hlfb)
+      self.assertIsNone(layer.norm.bias)
     patched_model.load_state_dict(ref_model.state_dict())
     # Verify that even when set_attn_implementation("eager") is called on the
     # patched model (as done during export), it still matches the reference
@@ -688,6 +714,52 @@ class PatchTest(parameterized.TestCase):
         "Per-expert scale binding changed the MoE output.\n"
         f"Max diff: {(expected_output - actual_output).abs().max().item()}",
     )
+
+  def test_vision_patch_embedder_precomputes_tables(self):
+    vision_config = modeling_gemma4.Gemma4VisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        patch_size=14,
+        position_embedding_size=64,
+        pooling_kernel_size=2,
+    )
+    torch.manual_seed(0)
+    ref_embedder = modeling_gemma4.Gemma4VisionPatchEmbedder(
+        vision_config
+    ).eval()
+    with torch.no_grad():
+      ref_embedder.position_embedding_table.normal_()
+
+    with patch.gemma4_litert_patch():
+      patched_embedder = modeling_gemma4.Gemma4VisionPatchEmbedder(
+          vision_config
+      ).eval()
+    patched_embedder.load_state_dict(ref_embedder.state_dict())
+
+    self.assertIn("table_x", patched_embedder._buffers)
+    self.assertIn("table_y", patched_embedder._buffers)
+    torch.testing.assert_close(
+        patched_embedder.table_x, ref_embedder.position_embedding_table[0]
+    )
+    torch.testing.assert_close(
+        patched_embedder.table_y, ref_embedder.position_embedding_table[1]
+    )
+
+    pixel_values = torch.randn(1, 16, 3 * 14 * 14)
+    pixel_position_ids = torch.randint(0, 8, (1, 16, 2))
+    padding_positions = torch.zeros((1, 16), dtype=torch.bool)
+    with torch.no_grad():
+      ref_out = ref_embedder(
+          pixel_values, pixel_position_ids, padding_positions
+      )
+      patched_out = patched_embedder(
+          pixel_values, pixel_position_ids, padding_positions
+      )
+    torch.testing.assert_close(patched_out, ref_out, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

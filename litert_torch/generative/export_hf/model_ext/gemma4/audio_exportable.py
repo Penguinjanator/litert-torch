@@ -25,7 +25,7 @@ class LiteRTExportableModuleForGemma4AudioEncoder(
 
   def __init__(self, model: torch.nn.Module, export_config):
     super().__init__(export_config)
-    self.model = model
+    self.audio_tower = model.model.audio_tower
 
   def forward(
       self,
@@ -34,8 +34,9 @@ class LiteRTExportableModuleForGemma4AudioEncoder(
   ):
     input_features = src_inputs
     attention_mask = mask.squeeze(1)
-    audio_model = self.model.model.audio_tower
-    audio_output = audio_model(input_features, attention_mask, return_dict=True)
+    audio_output = self.audio_tower(
+        input_features, attention_mask, return_dict=True
+    )
     ret = {
         'features': audio_output.last_hidden_state,
         'mask': audio_output.attention_mask,
@@ -99,23 +100,18 @@ class LiteRTExportableModuleForGemma4EndOfAudio(
 
   def __init__(self, model: torch.nn.Module, export_config, tokenizer):
     super().__init__(export_config)
-    self.model = model
-    self.tokenizer = tokenizer
+    token_ids = tokenizer.encode(
+        tokenizer.special_tokens_map['eoa_token'],
+        add_special_tokens=False,
+    )
+    self.register_buffer(
+        'eoa_embedding',
+        exportable_module_base.embed_tokens_on_cpu(model, token_ids),
+        persistent=False,
+    )
 
   def forward(self):
-    return {
-        'eoa_embedding': self.model.get_input_embeddings()(
-            torch.tensor(
-                [
-                    self.tokenizer.encode(
-                        self.tokenizer.special_tokens_map['eoa_token'],
-                        add_special_tokens=False,
-                    )
-                ],
-                dtype=torch.int32,
-            )
-        )
-    }
+    return {'eoa_embedding': self.eoa_embedding}
 
   def get_sample_inputs(
       self, model_config, **kwargs

@@ -185,8 +185,8 @@ def export(
     use_bool_mask: Whether to use a boolean attention mask instead of
       materializing fp32 mask constants.
     use_fused_sdpa_cache_update: Whether sliding-window layers emit the
-      `odml.fused_sdpa_cache_update` composite (attention plus ring buffer
-      write in one op). Requires `apply_gpu_composites` and
+      `odml.fused_sdpa_cache_update` composite (attention plus ring buffer write
+      in one op). Requires `apply_gpu_composites` and
       `sliding_window_ring_buffer_size`.
     prefill_logits: Whether the prefill signature returns logits for the final
       position. Defaults to on only when multi-output composites
@@ -259,7 +259,8 @@ def export(
     model_dtype: Dtype the model is loaded and traced in (weights and graph):
       'float32' (default) or 'bfloat16'. Not the deployment activation dtype;
       see `experimental_use_fp16`. Mutually exclusive with it.
-    use_v2: Whether to use Converter V2. Only supports `text_generation`.
+    use_v2: Whether to use Converter V2. Supports `text_generation`,
+      `image_text_to_text`, `multimodal_lm`, and `text_to_speech`.
     delete_in_memory_params: With `use_v2`, loads the model on the meta device
       and streams weights from the checkpoint during serialization instead of
       keeping them in memory.
@@ -339,10 +340,15 @@ def export(
     if export_config.bundle_litert_lm:
       export_tasks.append(litert_lm_builder.package_model)
   else:
-    # Must run before prefill/decode: with Converter V2 and
-    # `delete_in_memory_params`, that export frees the model's parameters.
+    # Submodule exports must run before prefill/decode: with Converter V2 and
+    # `delete_in_memory_params`, prefill/decode frees the model's parameters.
     if export_config.externalize_embedder:
       export_tasks.append(export_lib.export_embedder_model)
+    export_tasks.append(export_lib.export_additional_models)
+    if export_config.export_vision_encoder:
+      export_tasks.append(export_lib.export_vision_encoder_models)
+    if export_config.export_audio_encoder:
+      export_tasks.append(export_lib.export_audio_encoder_models_for_llm)
     export_tasks.append(export_lib.export_text_prefill_decode_model)
     if (
         export_config.aot_backend is not None
@@ -352,11 +358,6 @@ def export(
       legacy_compile_triggered = True
     if export_config.split_cache:
       export_tasks.append(export_lib.export_auxiliary_model)
-    export_tasks.append(export_lib.export_additional_models)
-    if export_config.export_vision_encoder:
-      export_tasks.append(export_lib.export_vision_encoder_models)
-    if export_config.export_audio_encoder:
-      export_tasks.append(export_lib.export_audio_encoder_models_for_llm)
     export_tasks.append(export_lib.export_tokenizer)
     if export_config.bundle_litert_lm:
       export_tasks.append(litert_lm_builder.package_model)

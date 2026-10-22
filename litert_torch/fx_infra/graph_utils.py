@@ -54,6 +54,61 @@ def is_torch_version_under(torch_version: str) -> bool:
   return current_version < compared_version
 
 
+def remove_unused_non_user_inputs(
+    ep: torch.export.ExportedProgram,
+) -> torch.export.ExportedProgram:
+  """Removes unused parameter, buffer, and constant placeholders."""
+  graph_signature = ep.graph_signature
+  if getattr(graph_signature, "backward_signature", None) is not None:
+    return ep
+  prunable_kinds = (
+      torch.export.graph_signature.InputKind.PARAMETER,
+      torch.export.graph_signature.InputKind.BUFFER,
+      torch.export.graph_signature.InputKind.CONSTANT_TENSOR,
+  )
+  mutated_targets = set(graph_signature.buffers_to_mutate.values()) | set(
+      graph_signature.parameters_to_mutate.values()
+  )
+  placeholder_nodes = [n for n in ep.graph.nodes if n.op == "placeholder"]
+  if len(placeholder_nodes) != len(graph_signature.input_specs):
+    return ep
+
+  kept_specs = []
+  removed_targets = set()
+  removed = False
+  for node, spec in zip(placeholder_nodes, graph_signature.input_specs):
+    if (
+        spec.kind in prunable_kinds
+        and not node.users
+        and spec.target not in mutated_targets
+    ):
+      ep.graph.erase_node(node)
+      if isinstance(spec.target, str):
+        removed_targets.add(spec.target)
+      removed = True
+    else:
+      kept_specs.append(spec)
+
+  if removed:
+    graph_signature.input_specs = kept_specs
+    kept_targets = {
+        s.target
+        for s in kept_specs
+        if s.kind in prunable_kinds and isinstance(s.target, str)
+    }
+    for submod in ep.graph_module.modules():
+      if isinstance(submod, torch.fx.GraphModule):
+        kept_targets.update(
+            n.target for n in submod.graph.nodes if n.op == "get_attr"
+        )
+    for target in removed_targets - kept_targets:
+      ep.state_dict.pop(target, None)
+      ep.constants.pop(target, None)
+    ep.graph.lint()
+    ep.graph_module.recompile()
+  return ep
+
+
 def reset_from_node_meta(ep: torch.export.ExportedProgram):
   """Resets the "from_node" meta field to fx node name only for the exported program."""
 

@@ -464,6 +464,51 @@ class TestConverterV2(googletest.TestCase):
         atol=1e-3,
     )
 
+  def test_unused_submodule_params_excluded_from_params_bin(self):
+    """Unused parameters on a wrapped root model are not serialized."""
+
+    class TwoTowerModel(nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.encoder = SimpleLinearModel()
+        self.unused_tower = nn.Linear(64, 64)
+
+    class EncoderWrapper(nn.Module):
+
+      def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+      def forward(self, x):
+        return self.m.encoder(x)
+
+    ref = TwoTowerModel().eval()
+    with torch.device("meta"):
+      meta_model = TwoTowerModel().eval()
+    # Only provide encoder weights; querying unused_tower would raise KeyError.
+    weights = {f"m.encoder.{k}": v for k, v in ref.encoder.state_dict().items()}
+    sample_input = (torch.empty(1, 4, device="meta"),)
+    export_dir = self.create_tempdir().full_path
+
+    edge_model = converter_v2.convert(
+        EncoderWrapper(meta_model),
+        sample_input,
+        export_dir=export_dir,
+        weights_loader=weights,
+    )
+
+    with open(os.path.join(export_dir, "weights_metadata.json"), "r") as f:
+      meta = json.load(f)
+    self.assertLen(meta["signatures"]["serving_default"], 2)
+    x = torch.randn(1, 4)
+    np.testing.assert_allclose(
+        edge_model(x.numpy()),
+        ref.encoder(x).detach().numpy(),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
   def test_is_supported(self):
     self.assertTrue(converter_v2_lib.is_supported())
 

@@ -347,6 +347,9 @@ def exported_program_to_mlir(
     The lowered MLIR module, metadata, and weight tensors bundle from exported
     program.
   """
+  exported_program = fx_infra.graph_utils.remove_unused_non_user_inputs(
+      exported_program
+  )
   exported_program = fx_infra.safe_run_decompositions(
       exported_program,
       fx_infra.decomp.pre_lower_decomp(),
@@ -388,6 +391,9 @@ def exported_program_to_mlir(
     _pre_lower_pass(exported_program)
 
   _convert_q_dq_per_channel_args_to_list(exported_program)
+  exported_program = fx_infra.graph_utils.remove_unused_non_user_inputs(
+      exported_program
+  )
   if inline_constants:
     inline_consts_lib.inline_consts(exported_program)
 

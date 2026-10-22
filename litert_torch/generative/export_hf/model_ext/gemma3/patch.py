@@ -68,17 +68,20 @@ class FusedGemma3MLP(torch.nn.Module):
         self.gate_proj.in_features,
         gate_out_features + up_out_features,
         bias=self.gate_proj.bias is not None,
+        device=self.gate_proj.weight.device,
+        dtype=self.gate_proj.weight.dtype,
     )
 
     # Copy weights and biases
-    with torch.no_grad():
-      self.gate_up_proj.weight.copy_(
-          torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
-      )
-      if self.gate_up_proj.bias is not None:
-        self.gate_up_proj.bias.copy_(
-            torch.cat([self.gate_proj.bias, self.up_proj.bias], dim=0)
+    if not self.gate_proj.weight.is_meta:
+      with torch.no_grad():
+        self.gate_up_proj.weight.copy_(
+            torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
         )
+        if self.gate_up_proj.bias is not None:
+          self.gate_up_proj.bias.copy_(
+              torch.cat([self.gate_proj.bias, self.up_proj.bias], dim=0)
+          )
 
     self.gate_size = gate_out_features
 
@@ -132,22 +135,26 @@ class FusedGemma3Attention(torch.nn.Module):
           self.q_proj.in_features,
           q_out_features + k_out_features + v_out_features,
           bias=self.q_proj.bias is not None,
+          device=self.q_proj.weight.device,
+          dtype=self.q_proj.weight.dtype,
       )
 
       # Copy weights and biases
-      with torch.no_grad():
-        self.qkv_proj.weight.copy_(
-            torch.cat(
-                [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
-                dim=0,
-            )
-        )
-        if self.qkv_proj.bias is not None:
-          self.qkv_proj.bias.copy_(
+      if not self.q_proj.weight.is_meta:
+        with torch.no_grad():
+          self.qkv_proj.weight.copy_(
               torch.cat(
-                  [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0
+                  [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
+                  dim=0,
               )
           )
+          if self.qkv_proj.bias is not None:
+            self.qkv_proj.bias.copy_(
+                torch.cat(
+                    [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias],
+                    dim=0,
+                )
+            )
 
       self.q_size = q_out_features
       self.k_size = k_out_features

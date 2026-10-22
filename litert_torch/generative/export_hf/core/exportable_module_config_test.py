@@ -232,6 +232,8 @@ class ConverterV2OptionsTest(parameterized.TestCase):
       dict(split_cache=False),
       dict(split_cache=True),
       dict(split_cache=True, experimental_use_fp16=True),
+      dict(task="image_text_to_text"),
+      dict(task="multimodal_lm"),
       dict(task="text_to_speech"),
   )
   def test_supported(self, **kwargs):
@@ -241,6 +243,15 @@ class ConverterV2OptionsTest(parameterized.TestCase):
   def test_delete_in_memory_params_requires_v2(self):
     with self.assertRaisesRegex(ValueError, "requires `use_v2=True`"):
       _config(delete_in_memory_params=True)
+
+  @parameterized.parameters("image_text_to_text", "multimodal_lm")
+  def test_split_cache_disables_single_token_embedder_for_multimodal(
+      self, task
+  ):
+    config = _config(task=task, split_cache=True)
+    self.assertFalse(config.single_token_embedder)
+    self.assertTrue(config.externalize_embedder)
+    self.assertTrue(config.externalize_rope)
 
   @parameterized.named_parameters(
       ("task", dict(task="text_to_image"), "task="),

@@ -132,6 +132,20 @@ class InitAndCastTest(absltest.TestCase):
         loader("model.proj.weight")
     self.assertIs(tiny.rotary.inv_freq, real)
 
+  def test_materialize_params_on_cpu_restores_meta(self):
+    ref = _Tiny()
+    state = dict(ref.state_dict())
+    with weights_loader_lib.init_params_on_meta():
+      tiny = _Tiny()
+    self.assertTrue(all(p.is_meta for p in tiny.parameters()))
+    with weights_loader_lib.materialize_params_on_cpu(
+        tiny, weights_loader=state.__getitem__
+    ):
+      self.assertTrue(all(not p.is_meta for p in tiny.parameters()))
+      self.assertIs(tiny.lm_head.weight, tiny.embed_tokens.weight)
+      torch.testing.assert_close(tiny.proj.weight, ref.proj.weight)
+    self.assertTrue(all(p.is_meta for p in tiny.parameters()))
+
 
 class HFCheckpointWeightsLoaderTest(absltest.TestCase):
 
@@ -147,6 +161,12 @@ class HFCheckpointWeightsLoaderTest(absltest.TestCase):
             2, 4
         ),
         "model.language_model.layers.0.self_attn.v_proj.weight": torch.randn(
+            2, 4
+        ),
+        "model.language_model.layers.1.self_attn.q_proj.weight": torch.randn(
+            4, 4
+        ),
+        "model.language_model.layers.1.self_attn.k_proj.weight": torch.randn(
             2, 4
         ),
         "model.language_model.layers.0.mlp.gate_proj.weight": torch.randn(6, 4),
@@ -186,6 +206,55 @@ class HFCheckpointWeightsLoaderTest(absltest.TestCase):
             self.tensors[f"{prefix}mlp.up_proj.weight"],
         ]),
     )
+    # Gemma-4 global attention with `attention_k_eq_v=True` has no `v_proj`.
+    l1_prefix = "model.language_model.layers.1."
+    qk = self.loader("model.model.layers.1.self_attn.qkv_proj.weight")
+    torch.testing.assert_close(
+        qk,
+        torch.cat([
+            self.tensors[f"{l1_prefix}self_attn.q_proj.weight"],
+            self.tensors[f"{l1_prefix}self_attn.k_proj.weight"],
+        ]),
+    )
+
+  def test_embed_tokens_on_cpu_meta_and_real(self):
+    class _ScaledEmbedding(nn.Embedding):
+
+      def __init__(self):
+        super().__init__(8, 4)
+        self.register_buffer(
+            "embed_scale",
+            torch.tensor(2.0, dtype=torch.float32),
+            persistent=False,
+        )
+
+      def forward(self, input_ids):
+        return super().forward(input_ids) * self.embed_scale
+
+    class _ModelWithEmb(nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.embed_tokens = _ScaledEmbedding()
+
+      def get_input_embeddings(self):
+        return self.model.language_model.embed_tokens
+
+    real_model = _ModelWithEmb()
+    with torch.no_grad():
+      real_model.get_input_embeddings().weight.copy_(
+          self.tensors["model.language_model.embed_tokens.weight"]
+      )
+    expected = weights_loader_lib.embed_tokens_on_cpu(real_model, [3])
+
+    with weights_loader_lib.init_params_on_meta():
+      meta_model = _ModelWithEmb()
+    weights_loader_lib.load_persistent_buffers_(meta_model, self.loader)
+    actual = weights_loader_lib.embed_tokens_on_cpu(meta_model, [3])
+    self.assertFalse(actual.is_meta)
+    torch.testing.assert_close(actual, expected)
 
   def test_tied_lm_head(self):
     loader = weights_loader_lib.HFCheckpointWeightsLoader(

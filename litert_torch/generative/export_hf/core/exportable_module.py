@@ -21,11 +21,13 @@ from litert_torch.generative.export_hf.core import cache as cache_lib
 from litert_torch.generative.export_hf.core import cache_base as kv_cache_lib
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import utils
+from litert_torch.generative.export_hf.core import weights_loader
 from litert_torch.generative.export_hf.core.sliding_window import attention_mask as sliding_window_attention_mask
 from litert_torch.generative.export_hf.core.split_cache import attention as _
 import torch
 
 ExportableModuleConfig = exportable_module_config.ExportableModuleConfig
+embed_tokens_on_cpu = weights_loader.embed_tokens_on_cpu
 
 # Model keys (`config.model_type` or `export_config.model` substrings) whose
 # text-generation global attention mask is guaranteed to be purely causal.

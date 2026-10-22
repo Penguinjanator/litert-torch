@@ -153,7 +153,64 @@ def load_persistent_buffers_(
         " values: %s",
         missing,
     )
+  model._weights_loader = weights_loader  # pylint: disable=protected-access
   return model
+
+
+def embed_tokens_on_cpu(
+    model: nn.Module,
+    token_ids: list[int],
+    weights_loader: WeightsLoader | None = None,
+) -> torch.Tensor:
+  """Evaluates `model.get_input_embeddings()` on `token_ids` on CPU.
+
+  Used for constant special-token embeddings (e.g. EOI / EOA) so export does
+  not trace a gather over the full vocabulary embedding table. When the model's
+  parameters are on the meta device, the requested rows are read via
+  `weights_loader` without materializing the full table on the module.
+
+  Args:
+    model: The source model.
+    token_ids: Token IDs to embed (batch size 1).
+    weights_loader: Optional loader; defaults to the one attached by
+      `load_persistent_buffers_`.
+
+  Returns:
+    A CPU tensor of shape `[1, len(token_ids), embedding_dim]`.
+
+  Raises:
+    RuntimeError: If the embedding weights are on the meta device and no
+      `weights_loader` is available.
+  """
+  emb = model.get_input_embeddings()
+  ids = torch.tensor([token_ids], dtype=torch.int32)
+  with torch.no_grad():
+    if not emb.weight.is_meta:
+      return emb(ids.to(emb.weight.device)).detach().cpu().clone()
+    if weights_loader is None:
+      weights_loader = getattr(model, "_weights_loader", None)
+    if weights_loader is None:
+      raise RuntimeError(
+          "Input embedding weights are on the meta device, but no"
+          " `weights_loader` is available."
+      )
+    fqn = next(
+        (
+            f"{n}.weight" if n else "weight"
+            for n, m in model.named_modules()
+            if m is emb
+        ),
+        "embed_tokens.weight",
+    )
+    rows = weights_loader(fqn)[ids.long()].to(emb.weight.dtype).clone()
+    scale = getattr(emb, "embed_scale", None)
+    if scale is not None:
+      rows = rows * scale.detach().cpu().to(rows.dtype)
+    else:
+      scalar_scale = getattr(emb, "scalar_embed_scale", None)
+      if scalar_scale is not None:
+        rows = rows * scalar_scale
+    return rows
 
 
 @contextlib.contextmanager
@@ -198,6 +255,57 @@ def buffers_on_meta(
   finally:
     for module, name, buf in originals:
       module._buffers[name] = buf  # pylint: disable=protected-access
+
+
+@contextlib.contextmanager
+def materialize_params_on_cpu(
+    *roots: nn.Module,
+    weights_loader: WeightsLoader,
+) -> Iterator[None]:
+  """Temporarily loads meta parameters of `roots` onto CPU from `weights_loader`.
+
+  Used when exporting a submodule with Converter V1 while the parent model's
+  parameters live on the meta device (Converter V2). Shared parameters are
+  materialized once, and all parameters are restored to meta on exit so CPU
+  memory is released immediately after conversion.
+
+  Args:
+    *roots: The modules whose meta parameters should be materialized on CPU.
+    weights_loader: Loader resolving parameter FQNs relative to each root.
+
+  Yields:
+    None.
+  """
+  materialized: dict[int, nn.Parameter] = {}
+  originals: list[tuple[nn.Module, str, nn.Parameter]] = []
+  with torch.no_grad():
+    for root in roots:
+      for prefix, module in root.named_modules(remove_duplicate=False):
+        for name, param in list(module._parameters.items()):  # pylint: disable=protected-access
+          if param is None or not param.is_meta:
+            continue
+          if id(param) not in materialized:
+            fqn = f"{prefix}.{name}" if prefix else name
+            value = None
+            for candidate in (fqn, f"model.{fqn}", f"model.model.{fqn}"):
+              try:
+                value = weights_loader(candidate)
+                break
+              except KeyError:
+                continue
+            if value is None:
+              value = weights_loader(fqn)
+            materialized[id(param)] = nn.Parameter(
+                value.to(dtype=param.dtype, device="cpu"),
+                requires_grad=param.requires_grad,
+            )
+          originals.append((module, name, param))
+          module._parameters[name] = materialized[id(param)]  # pylint: disable=protected-access
+  try:
+    yield
+  finally:
+    for module, name, param in originals:
+      module._parameters[name] = param  # pylint: disable=protected-access
 
 
 def with_tensors(
@@ -383,6 +491,10 @@ class HFCheckpointWeightsLoader:
       tensor = self._load_fused(
           param_name, "qkv_proj", ("q_proj", "k_proj", "v_proj")
       )
+    if tensor is None:
+      # Gemma-4 global attention layers with `attention_k_eq_v=True` have no
+      # `v_proj`, so `qkv_proj` only fuses `q_proj` and `k_proj`.
+      tensor = self._load_fused(param_name, "qkv_proj", ("q_proj", "k_proj"))
     if tensor is None:
       tensor = self._load_fused(
           param_name, "gate_up_proj", ("gate_proj", "up_proj")

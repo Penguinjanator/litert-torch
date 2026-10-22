@@ -17,6 +17,7 @@
 import contextlib
 import dataclasses
 import gc
+import itertools
 import json
 import os
 from typing import Any, cast
@@ -840,6 +841,60 @@ def export_embedder_model(
   )
 
 
+def _convert_and_export_module(
+    module: torch.nn.Module,
+    sample_inputs: dict[str, tuple[dict[str, torch.Tensor], Any]],
+    model_path: str,
+    export_config: exportable_module.ExportableModuleConfig,
+    weights_loader: weights_loader_lib.WeightsLoader | None,
+    use_v2: bool | None = None,
+) -> None:
+  """Converts and exports a single exportable module (V1 or V2)."""
+  if use_v2 is None:
+    use_v2 = export_config.use_v2
+  with contextlib.ExitStack() as stack:
+    if not use_v2:
+      if weights_loader is not None:
+        stack.enter_context(
+            weights_loader_lib.materialize_params_on_cpu(
+                module, weights_loader=weights_loader
+            )
+        )
+      v2_kwargs = {}
+      trace_on_meta = False
+    else:
+      if weights_loader is not None:
+        # Parameters are on meta (Converter V2): trace on meta and serve real
+        # buffer values to the converter, as for the prefill/decode model.
+        buffer_values = stack.enter_context(
+            weights_loader_lib.buffers_on_meta(module)
+        )
+        weights_loader = weights_loader_lib.with_tensors(
+            weights_loader, buffer_values
+        )
+      v2_kwargs = _v2_convert_kwargs(export_config, weights_loader, model_path)
+      trace_on_meta = weights_loader is not None
+    device = next(
+        itertools.chain(module.parameters(), module.buffers()),
+        torch.empty(0),
+    ).device
+    converter = converter_utils.Converter()
+    for signature_name, (sig_inputs, _) in sample_inputs.items():
+      if trace_on_meta:
+        sig_inputs = {k: v.to(device) for k, v in sig_inputs.items()}
+      converter.add_signature(
+          signature_name,
+          module.eval(),
+          sample_kwargs=sig_inputs,
+      )
+    lrt_model = converter.convert(
+        strict_export=False,
+        **v2_kwargs,
+    )
+  if not use_v2:
+    lrt_model.export(model_path)
+
+
 @progress.task('Export vision encoder models')
 def export_vision_encoder_models(
     source_model_artifacts: SourceModelArtifacts,
@@ -851,6 +906,7 @@ def export_vision_encoder_models(
   image_processor = source_model_artifacts.image_processor
   model_config = source_model_artifacts.model_config
   tokenizer = source_model_artifacts.tokenizer
+  weights_loader = source_model_artifacts.weights_loader
   quantization_recipe = (
       export_config.vision_encoder_quantization_recipe
       if export_config.vision_encoder_quantization_recipe is not None
@@ -871,21 +927,19 @@ def export_vision_encoder_models(
     eoi_module = eoi_module_cls(model, export_config, tokenizer)
   else:
     eoi_module = None
-  converter = converter_utils.Converter()
   sample_inputs = encode_module.get_sample_inputs(
       model_config,
       image_processor=image_processor,
       **export_config.extra_kwargs,
   )
-  for signature_name, (sample_inputs, _) in sample_inputs.items():
-    converter.add_signature(
-        signature_name,
-        encode_module.eval(),
-        sample_kwargs=sample_inputs,
-    )
-  lrt_model = converter.convert(strict_export=False)
   vision_encoder_path = os.path.join(work_dir, 'vision_encoder.tflite')  # pyrefly: ignore[no-matching-overload]
-  lrt_model.export(vision_encoder_path)
+  _convert_and_export_module(
+      encode_module,
+      sample_inputs,
+      vision_encoder_path,
+      export_config,
+      weights_loader,
+  )
   quantization_recipe_list = (
       quantization_recipe.split(',') if quantization_recipe else [None]
   )
@@ -894,21 +948,19 @@ def export_vision_encoder_models(
     gc.collect()
 
   if adapter_module:
-    converter = converter_utils.Converter()
     sample_inputs = adapter_module.get_sample_inputs(
         model_config,
         image_processor=image_processor,
         **export_config.extra_kwargs,
     )
-    for signature_name, (sample_inputs, _) in sample_inputs.items():
-      converter.add_signature(
-          signature_name,
-          adapter_module.eval(),
-          sample_kwargs=sample_inputs,
-      )
-    lrt_model = converter.convert(strict_export=False)
     adapter_path = os.path.join(work_dir, 'vision_adapter.tflite')  # pyrefly: ignore[no-matching-overload]
-    lrt_model.export(adapter_path)
+    _convert_and_export_module(
+        adapter_module,
+        sample_inputs,
+        adapter_path,
+        export_config,
+        weights_loader,
+    )
     quantization_recipe_list = (
         quantization_recipe.split(',') if quantization_recipe else [None]
     )
@@ -919,20 +971,18 @@ def export_vision_encoder_models(
     adapter_path = None
 
   if eoi_module:
-    converter = converter_utils.Converter()
     sample_inputs = eoi_module.get_sample_inputs(
         model_config,
         **export_config.extra_kwargs,
     )
-    for signature_name, (sample_inputs, _) in sample_inputs.items():
-      converter.add_signature(
-          signature_name,
-          eoi_module.eval(),
-          sample_kwargs=sample_inputs,
-      )
-    lrt_model = converter.convert(strict_export=False)
     eoi_path = os.path.join(work_dir, 'eoi.tflite')  # pyrefly: ignore[no-matching-overload]
-    lrt_model.export(eoi_path)
+    _convert_and_export_module(
+        eoi_module,
+        sample_inputs,
+        eoi_path,
+        export_config,
+        weights_loader,
+    )
   else:
     eoi_path = None
 
@@ -958,6 +1008,7 @@ def export_audio_encoder_models_for_llm(
     return exported_model_artifacts
   model_config = source_model_artifacts.model_config
   tokenizer = source_model_artifacts.tokenizer
+  weights_loader = source_model_artifacts.weights_loader
   quantization_recipe = (
       export_config.audio_encoder_quantization_recipe
       if export_config.audio_encoder_quantization_recipe is not None
@@ -980,21 +1031,22 @@ def export_audio_encoder_models_for_llm(
       if eoa_module_cls is not None
       else None
   )
-  converter = converter_utils.Converter()
   sample_inputs = encode_module.get_sample_inputs(
       model_config,
       feature_extractor=feature_extractor,
       **export_config.extra_kwargs,
   )
-  for signature_name, (sample_inputs, _) in sample_inputs.items():
-    converter.add_signature(
-        signature_name,
-        encode_module.eval(),
-        sample_kwargs=sample_inputs,
-    )
-  lrt_model = converter.convert(strict_export=False)
   audio_encoder_path = os.path.join(work_dir, 'audio_encoder.tflite')  # pyrefly: ignore[no-matching-overload]
-  lrt_model.export(audio_encoder_path)
+  # TODO(b/576081319): Switch audio encoder back to Converter V2 once constant
+  # folding on DenseResourceElementsAttr is supported.
+  _convert_and_export_module(
+      encode_module,
+      sample_inputs,
+      audio_encoder_path,
+      export_config,
+      weights_loader,
+      use_v2=False,
+  )
   quantization_recipe_list = (
       quantization_recipe.split(',') if quantization_recipe else [None]
   )
@@ -1003,21 +1055,19 @@ def export_audio_encoder_models_for_llm(
     gc.collect()
 
   if adapter_module is not None:
-    converter = converter_utils.Converter()
     sample_inputs = adapter_module.get_sample_inputs(
         model_config,
         feature_extractor=feature_extractor,
         **export_config.extra_kwargs,
     )
-    for signature_name, (sample_inputs, _) in sample_inputs.items():
-      converter.add_signature(
-          signature_name,
-          adapter_module.eval(),
-          sample_kwargs=sample_inputs,
-      )
-    lrt_model = converter.convert(strict_export=False)
     adapter_path = os.path.join(work_dir, 'audio_adapter.tflite')  # pyrefly: ignore[no-matching-overload]
-    lrt_model.export(adapter_path)
+    _convert_and_export_module(
+        adapter_module,
+        sample_inputs,
+        adapter_path,
+        export_config,
+        weights_loader,
+    )
     for recipe in quantization_recipe_list:
       adapter_path = maybe_quantize_model(adapter_path, recipe)
       gc.collect()
@@ -1025,20 +1075,18 @@ def export_audio_encoder_models_for_llm(
     adapter_path = None
 
   if eoa_module is not None:
-    converter = converter_utils.Converter()
     sample_inputs = eoa_module.get_sample_inputs(
         model_config,
         **export_config.extra_kwargs,
     )
-    for signature_name, (sample_inputs, _) in sample_inputs.items():
-      converter.add_signature(
-          signature_name,
-          eoa_module.eval(),
-          sample_kwargs=sample_inputs,
-      )
-    lrt_model = converter.convert(strict_export=False)
     eoa_path = os.path.join(work_dir, 'eoa.tflite')  # pyrefly: ignore[no-matching-overload]
-    lrt_model.export(eoa_path)
+    _convert_and_export_module(
+        eoa_module,
+        sample_inputs,
+        eoa_path,
+        export_config,
+        weights_loader,
+    )
   else:
     eoa_path = None
   return dataclasses.replace(
@@ -1314,36 +1362,16 @@ def export_additional_models_impl(
   assert work_dir is not None
   embedder_module = exportable_module_cls(model)
   model_path = os.path.join(work_dir, f'{name}.tflite')
-  weights_loader = source_model_artifacts.weights_loader
-  with contextlib.ExitStack() as stack:
-    if weights_loader is not None:
-      # Parameters are on meta (Converter V2): trace on meta and serve real
-      # buffer values to the converter, as for the prefill/decode model.
-      buffer_values = stack.enter_context(
-          weights_loader_lib.buffers_on_meta(embedder_module)
-      )
-      weights_loader = weights_loader_lib.with_tensors(
-          weights_loader, buffer_values
-      )
-    device = next(embedder_module.parameters(), torch.empty(0)).device
-    converter = converter_utils.Converter()
-    sample_inputs = embedder_module.get_sample_inputs(
-        text_model_config, export_config
-    )
-    for signature_name, (sample_inputs, _) in sample_inputs.items():
-      if weights_loader is not None:
-        sample_inputs = {k: v.to(device) for k, v in sample_inputs.items()}
-      converter.add_signature(
-          signature_name,
-          embedder_module.eval(),
-          sample_kwargs=sample_inputs,
-      )
-    lrt_model = converter.convert(
-        strict_export=False,
-        **_v2_convert_kwargs(export_config, weights_loader, model_path),
-    )
-  if not export_config.use_v2:
-    lrt_model.export(model_path)
+  sample_inputs = embedder_module.get_sample_inputs(
+      text_model_config, export_config
+  )
+  _convert_and_export_module(
+      embedder_module,
+      sample_inputs,
+      model_path,
+      export_config,
+      source_model_artifacts.weights_loader,
+  )
   quantization_recipe_list = (
       quantization_recipe.split(',') if quantization_recipe else [None]
   )
