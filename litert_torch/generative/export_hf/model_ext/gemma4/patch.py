@@ -1226,53 +1226,39 @@ class LiteRTGemma4AudioModel(Gemma4AudioModel):
 def gemma4_litert_patch():
   """Gemma4 patch."""
   print("Gemma4 patch applied.")
+  from transformers.models import gemma4 as gemma4_pkg  # pylint: disable=g-import-not-at-top
   from transformers.models.gemma4 import modeling_gemma4  # pylint: disable=g-import-not-at-top
 
-  original_norm = modeling_gemma4.Gemma4RMSNorm
-  modeling_gemma4.Gemma4RMSNorm = Gemma4RMSNorm
-
-  original_vision_encoder = modeling_gemma4.Gemma4VisionEncoder
-  modeling_gemma4.Gemma4VisionEncoder = LiteRTGemma4VisionEncoder
-
-  original_patch_embedder = modeling_gemma4.Gemma4VisionPatchEmbedder
-  modeling_gemma4.Gemma4VisionPatchEmbedder = LiteRTGemma4VisionPatchEmbedder
-
-  original_pooler = modeling_gemma4.Gemma4VisionPooler
-  modeling_gemma4.Gemma4VisionPooler = LiteRTGemma4VisionPooler
-
-  original_text_model = modeling_gemma4.Gemma4TextModel
-  modeling_gemma4.Gemma4TextModel = LiteRTGemma4TextModel
-
-  original_text_router = modeling_gemma4.Gemma4TextRouter
-  modeling_gemma4.Gemma4TextRouter = LiteRTGemma4TextRouter
-
-  original_audio_subsample_layer = (
-      modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer
-  )
-  modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer = (
-      LiteRTGemma4AudioSubSampleConvProjectionLayer
-  )
-
-  original_audio_attention = modeling_gemma4.Gemma4AudioAttention
-  modeling_gemma4.Gemma4AudioAttention = LiteRTGemma4AudioAttention
-
-  original_audio_model = modeling_gemma4.Gemma4AudioModel
-  modeling_gemma4.Gemma4AudioModel = LiteRTGemma4AudioModel
+  replacements = {
+      "Gemma4RMSNorm": Gemma4RMSNorm,
+      "Gemma4VisionEncoder": LiteRTGemma4VisionEncoder,
+      "Gemma4VisionPatchEmbedder": LiteRTGemma4VisionPatchEmbedder,
+      "Gemma4VisionPooler": LiteRTGemma4VisionPooler,
+      "Gemma4TextModel": LiteRTGemma4TextModel,
+      "Gemma4TextRouter": LiteRTGemma4TextRouter,
+      "Gemma4AudioSubSampleConvProjectionLayer": (
+          LiteRTGemma4AudioSubSampleConvProjectionLayer
+      ),
+      "Gemma4AudioAttention": LiteRTGemma4AudioAttention,
+      "Gemma4AudioModel": LiteRTGemma4AudioModel,
+  }
+  originals = {name: getattr(modeling_gemma4, name) for name in replacements}
+  for name, cls in replacements.items():
+    setattr(modeling_gemma4, name, cls)
+    if name in gemma4_pkg.__dict__:
+      setattr(gemma4_pkg, name, cls)
+    if name in transformers.__dict__:
+      setattr(transformers, name, cls)
 
   try:
     yield
   finally:
-    modeling_gemma4.Gemma4RMSNorm = original_norm
-    modeling_gemma4.Gemma4VisionEncoder = original_vision_encoder
-    modeling_gemma4.Gemma4VisionPatchEmbedder = original_patch_embedder
-    modeling_gemma4.Gemma4VisionPooler = original_pooler
-    modeling_gemma4.Gemma4TextModel = original_text_model
-    modeling_gemma4.Gemma4TextRouter = original_text_router
-    modeling_gemma4.Gemma4AudioSubSampleConvProjectionLayer = (
-        original_audio_subsample_layer
-    )
-    modeling_gemma4.Gemma4AudioAttention = original_audio_attention
-    modeling_gemma4.Gemma4AudioModel = original_audio_model
+    for name, cls in originals.items():
+      setattr(modeling_gemma4, name, cls)
+      if name in gemma4_pkg.__dict__:
+        setattr(gemma4_pkg, name, cls)
+      if name in transformers.__dict__:
+        setattr(transformers, name, cls)
     for ref in list(_PATCHED_MODULES):
       m = ref()
       if m is not None:

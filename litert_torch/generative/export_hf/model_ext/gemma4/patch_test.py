@@ -25,6 +25,7 @@ import litert_torch.generative.export_hf.model_ext as _
 from litert_torch.generative.export_hf.model_ext.gemma4 import patch
 from litert_torch.generative.layers import moe
 import torch
+import transformers
 from transformers.models.gemma4 import modeling_gemma4
 
 from absl.testing import absltest as googletest
@@ -671,6 +672,52 @@ class PatchTest(parameterized.TestCase):
         "LiteRTGemma4AudioModel vs Gemma4AudioModel mismatch.\n"
         f"Max diff: {max_diff}",
     )
+
+  def test_gemma4_litert_patch_syncs_lazy_module_for_auto_model(self):
+    audio_config = modeling_gemma4.Gemma4AudioConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        output_proj_dims=96,
+        attention_chunk_size=12,
+        attention_context_left=13,
+        attention_context_right=0,
+        conv_kernel_size=5,
+        subsampling_conv_channels=[128, 8],
+        dtype="float32",
+    )
+    audio_config._attn_implementation = "eager"
+    text_config = _get_dummy_gemma4_text_config()
+
+    # Populate `_LazyModule` caches on `transformers.models.gemma4` and
+    # `transformers` before entering `gemma4_litert_patch`.
+    unpatched_audio = transformers.AutoModel.from_config(audio_config)
+    unpatched_text = transformers.AutoModel.from_config(text_config)
+    _ = getattr(transformers, "Gemma4AudioModel", None)
+    _ = getattr(transformers, "Gemma4TextModel", None)
+    self.assertNotIsInstance(unpatched_audio, patch.LiteRTGemma4AudioModel)
+    self.assertNotIsInstance(unpatched_text, patch.LiteRTGemma4TextModel)
+
+    with patch.gemma4_litert_patch():
+      patched_audio = transformers.AutoModel.from_config(
+          copy.deepcopy(audio_config)
+      ).eval()
+      patched_text = transformers.AutoModel.from_config(
+          copy.deepcopy(text_config)
+      ).eval()
+      self.assertIsInstance(patched_audio, patch.LiteRTGemma4AudioModel)
+      self.assertIsInstance(patched_text, patch.LiteRTGemma4TextModel)
+
+      input_features = torch.randn(1, 80, 128, dtype=torch.float32)
+      attention_mask = torch.ones(1, 80, dtype=torch.bool)
+      with torch.no_grad():
+        out = patched_audio(input_features, attention_mask, return_dict=True)
+      self.assertEqual(out.last_hidden_state.shape[0], 1)
+
+    restored_audio = transformers.AutoModel.from_config(audio_config)
+    restored_text = transformers.AutoModel.from_config(text_config)
+    self.assertNotIsInstance(restored_audio, patch.LiteRTGemma4AudioModel)
+    self.assertNotIsInstance(restored_text, patch.LiteRTGemma4TextModel)
 
   def test_bind_per_expert_scale_matches_router_folding(self):
     config = _get_dummy_gemma4_text_config()
