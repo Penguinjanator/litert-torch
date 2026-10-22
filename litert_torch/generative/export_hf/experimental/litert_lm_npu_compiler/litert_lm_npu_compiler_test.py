@@ -707,14 +707,20 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
         soc_model='SM8750',
     )
 
-    # By default, text_encoder and audio_encoder_hw are compiled, while vision is skipped
-    self.assertLen(compiled_instances, 2)
+    # By default, text_encoder, audio_encoder_hw, and vision_encoder compile.
+    self.assertLen(compiled_instances, 3)
     for inst in compiled_instances:
       inst.assert_called_once()
       args, kwargs = inst.call_args
+      input_model = kwargs.get('input_model') or args[0]
+      model_name = os.path.basename(str(input_model.path))
       self.assertEqual(kwargs['qualcomm_optimization_level'], 'O3')
       self.assertEqual(kwargs['qualcomm_log_level'], 'off')
       self.assertTrue(kwargs['qualcomm_enable_weight_sharing'])
+      if 'vision_encoder' in model_name:
+        self.assertEqual(
+            kwargs.get('qualcomm_graph_transform'), 'experimental_all'
+        )
 
   @mock.patch(
       'litert_torch.generative.export_hf.experimental.litert_lm_npu_compiler.litert_lm_npu_compiler.ApplyPlugin'
@@ -807,7 +813,9 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
       self.assertEqual(kwargs['qualcomm_log_level'], 'off')
       self.assertTrue(kwargs['qualcomm_enable_weight_sharing'])
       if 'vision_encoder' in model_name:
-        self.assertEqual(kwargs.get('qualcomm_htp_p_point'), 22)
+        self.assertEqual(
+            kwargs.get('qualcomm_graph_transform'), 'experimental_all'
+        )
 
     self.assertTrue(
         any('text_encoder' in name for name in compiled_model_names)

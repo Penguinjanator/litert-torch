@@ -45,11 +45,11 @@ GENERIC_DEFAULT_CONFIGS = {
             ],
         },
         'vision_encoder': {
-            'compile': False,
+            'compile': True,
             'flags': [
                 '--qualcomm_optimization_level=O3',
                 '--qualcomm_log_level=off',
-                '--qualcomm_htp_p_point=22',
+                '--qualcomm_graph_transform=experimental_all',
             ],
         },
     },
