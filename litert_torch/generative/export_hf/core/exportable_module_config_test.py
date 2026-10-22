@@ -114,11 +114,15 @@ class SdpaCompositeTest(parameterized.TestCase):
 class LegacyFlagTest(parameterized.TestCase):
 
   def test_legacy_prefill_flag_maps_to_true(self):
-    with self.assertWarns(DeprecationWarning):
+    with warnings.catch_warnings(record=True) as caught_warnings:
+      warnings.simplefilter("always", DeprecationWarning)
       config = _config(
           use_sdpa_composite=True,
           extra_kwargs={"use_sdpa_composite_for_prefill": True},
       )
+    self.assertTrue(
+        any(issubclass(w.category, DeprecationWarning) for w in caught_warnings)
+    )
     self.assertTrue(config.use_sdpa_composite)
     self.assertTrue(config.apply_gpu_composites)
 
@@ -128,10 +132,14 @@ class LegacyFlagTest(parameterized.TestCase):
     Setting only the prefill flag used to trace prefill with the composite while
     the sample inputs were built without `param_tensor`.
     """
-    with self.assertWarns(DeprecationWarning):
+    with warnings.catch_warnings(record=True) as caught_warnings:
+      warnings.simplefilter("always", DeprecationWarning)
       config = _config(
           extra_kwargs={"use_sdpa_composite_for_prefill": True},
       )
+    self.assertTrue(
+        any(issubclass(w.category, DeprecationWarning) for w in caught_warnings)
+    )
     self.assertTrue(config.use_sdpa_composite)
     self.assertTrue(config.apply_gpu_composites)
 

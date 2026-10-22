@@ -40,6 +40,11 @@ class LiteRTLMCacheLayerMixin(cache_utils.CacheLayerMixin, abc.ABC):
     """Returns the index of the sequence dimension in V cache."""
     ...
 
+  @abc.abstractmethod
+  def get_max_length(self) -> int:
+    """Returns the maximum length of the cache."""
+    ...
+
   def set_cache_runtime_args(self, cache_runtime_args: Dict[str, Any]) -> None:
     """Sets the cache runtime arguments."""
     setattr(self, "cache_runtime_args", cache_runtime_args)
@@ -93,6 +98,18 @@ class LiteRTLMCacheMixin(cache_utils.Cache, abc.ABC):
       if hasattr(layer, "to"):
         layer.to(*args, **kwargs)
     return self
+
+  def get_max_length(self, layer_idx: int | None = None) -> int:
+    """Returns the maximum length of the cache."""
+    if layer_idx is not None and layer_idx >= len(self.layers):
+      return -1
+    if layer_idx is None:
+      return max(layer.get_max_length() for layer in self.layers)  # pyrefly: ignore[missing-attribute]
+    return self.layers[layer_idx].get_max_length()  # pyrefly: ignore[missing-attribute]
+
+  def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+    """Returns the maximum length of the cache."""
+    return self.get_max_length(layer_idx)
 
 
 CACHE_REGISTRY: dict[str, type[LiteRTLMCacheMixin]] = {}

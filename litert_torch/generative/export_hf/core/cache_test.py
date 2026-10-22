@@ -123,6 +123,7 @@ class CacheTest(googletest.TestCase):
     # Cache attributes
     self.assertTrue(kv_cache.is_compileable)
     self.assertTrue([not x for x in kv_cache.is_sliding])
+    self.assertEqual(kv_cache.get_max_length(), context_len)
     self.assertEqual(kv_cache.max_cache_len, context_len)
 
   def test_update(self):
