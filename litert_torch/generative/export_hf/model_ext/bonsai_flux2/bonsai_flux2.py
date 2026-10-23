@@ -38,7 +38,7 @@ except ImportError:
 from ai_edge_quantizer import qtyping
 from ai_edge_quantizer import quantizer as quantizer_lib
 from ai_edge_quantizer import recipe_manager as recipe_manager_lib
-from tensorflow.lite.python import schema_py_generated as schema_fb  # pylint: disable=g-direct-tensorflow-import
+from ai_edge_litert import schema_py_generated as schema_fb
 
 _DEFAULT_QWEN3_CONFIG = {
     "architectures": ["Qwen3ForCausalLM"],

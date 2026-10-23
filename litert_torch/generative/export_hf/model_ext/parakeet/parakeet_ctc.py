@@ -39,7 +39,12 @@ class ParakeetCTCEncoder(torch.nn.Module):
           hidden_states, position_embeddings=position_embeddings
       )
 
-    logits = self._ctc_head(hidden_states.transpose(1, 2)).transpose(1, 2)
+    if type(self._ctc_head).forward is torch.nn.Conv1d.forward:
+      # Older transformers: `ctc_head` is a plain Conv1d over channels.
+      logits = self._ctc_head(hidden_states.transpose(1, 2)).transpose(1, 2)
+    else:
+      # transformers v5 `ParakeetEncoderCTCHead` transposes internally.
+      logits = self._ctc_head(hidden_states)
     return (logits,)
 
 
