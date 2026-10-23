@@ -170,6 +170,7 @@ def build_litertlm(
         'Either tokenizer_model_path or hf_tokenizer_model_path must be'
         ' provided.'
     )
+  # TODO(b/538727793): Migrate to LlmMetadata.TfLiteModelType.
   builder.add_tflite_model(
       tflite_model_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
   )
