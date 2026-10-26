@@ -540,6 +540,14 @@ def load_model(
           ),
       )
       weights_loader_lib.load_persistent_buffers_(model, weights_loader)
+      # `from_config` only initializes `generation_config` from `config.json`.
+      # Load `generation_config.json` when present (matching `from_pretrained`),
+      # ignoring `OSError` when the checkpoint has no `generation_config.json`.
+      with contextlib.suppress(OSError):
+        model.generation_config = transformers.GenerationConfig.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
     elif export_config.use_random_weights:
       model = auto_model_cls.from_config(
           config=config,

@@ -346,6 +346,56 @@ class ExportLibTest(parameterized.TestCase):
       expected_sigs_multi.append(f"decode_cache_{cache_len}")
     self.assertEqual(added_signatures, expected_sigs_multi)
 
+  @mock.patch(
+      "litert_torch.generative.export_hf.core.export_lib"
+      ".verify_model_compatibility"
+  )
+  @mock.patch(
+      "litert_torch.generative.export_hf.core.export_lib.weights_loader_lib"
+  )
+  @mock.patch(
+      "litert_torch.generative.export_hf.core.export_lib.model_ext_patches"
+      ".get_patch_context"
+  )
+  @mock.patch("litert_torch.generative.export_hf.core.export_lib.transformers")
+  def test_load_model_use_v2_loads_generation_config(
+      self,
+      mock_transformers,
+      mock_patch_context,
+      mock_weights_loader_lib,
+      mock_verify_compat,
+  ):
+    del mock_patch_context, mock_verify_compat  # Unused.
+    mock_config = mock.MagicMock()
+    mock_config.model_type = "gemma3"
+    del mock_config.text_config
+    mock_transformers.AutoConfig.from_pretrained.return_value = mock_config
+
+    mock_model = mock.MagicMock()
+    mock_model.to.return_value = mock_model
+    mock_transformers.AutoModelForCausalLM.from_config.return_value = mock_model
+    mock_weights_loader_lib.cast_params_.return_value = mock_model
+
+    mock_gen_config = mock.MagicMock()
+    mock_transformers.GenerationConfig.from_pretrained.return_value = (
+        mock_gen_config
+    )
+
+    export_config = export_lib.exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        use_v2=True,
+        use_random_weights=False,
+    )
+    artifacts = export_lib.load_model("dummy_model", export_config)
+
+    mock_transformers.GenerationConfig.from_pretrained.assert_called_once_with(
+        "dummy_model",
+        trust_remote_code=False,
+    )
+    self.assertIs(artifacts.model.generation_config, mock_gen_config)
+    self.assertEqual(mock_gen_config.cache_implementation, "static")
+    self.assertFalse(mock_gen_config.do_sample)
+
 
 if __name__ == "__main__":
   absltest.main()
