@@ -145,6 +145,8 @@ def export(
     model_dtype: str | None = None,
     use_v2: bool = False,
     delete_in_memory_params: bool = False,
+    model_extension: Any = None,
+    extension_modules: list[str] | str | None = None,
     # pylint: enable=unused-argument
     **kwargs,
 ):
@@ -264,6 +266,12 @@ def export(
     delete_in_memory_params: With `use_v2`, loads the model on the meta device
       and streams weights from the checkpoint during serialization instead of
       keeping them in memory.
+    model_extension: Optional `model_ext.ModelExtension` subclass/instance (or
+      sequence of extensions) customizing patching, exportables, and metadata
+      for this export run (see `model_ext/extension.py`).
+    extension_modules: Optional comma-separated string or list of dotted Python
+      module paths to import before export so `@register_model_extension`
+      decorators run (e.g. `['my_pkg.my_arch_extension']`).
     **kwargs: Additional keyword arguments to pass to the exportable module
       config.
 

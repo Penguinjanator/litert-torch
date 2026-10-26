@@ -12,33 +12,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Exportable modules for extended modules."""
+"""LiteRT-LM `LlmMetadata` and `ExecutorMetadata` builders for `export_hf`.
+
+Provides two metadata hooks consumed by `core/litert_lm_builder.py` when
+packaging `.litertlm` bundles:
+
+1. `get_metadata_builder`: Resolves the active `ModelExtension` and returns a
+   callable that runs `ModelExtension.build_llm_metadata` to populate
+   architecture-specific `LlmMetadata` fields (such as multimodal token IDs and
+   prompt templates; see `model_ext/gemma3/metadata_builder.py` and
+   `model_ext/gemma4/metadata_builder.py`).
+2. `get_executor_metadata_builder` / `build_executor_metadata`: Constructs
+   `ExecutorMetadata` describing runtime `StateBuffer` entries (global KV cache,
+   sliding-window local KV cache, `linear_attention`, and `conv` recurrent
+   states) inferred from `model_config.layer_types`, unless overridden by
+   `ModelExtension.get_executor_metadata_builder`.
+"""
 
 from litert_torch.generative.export_hf.core import export_lib
 from litert_torch.generative.export_hf.core import exportable_module
-from litert_torch.generative.export_hf.model_ext.gemma3 import metadata_builder as gemma3_metadata_builder
-from litert_torch.generative.export_hf.model_ext.gemma4 import metadata_builder as gemma4_metadata_builder
+# Registers built-in extensions.
+from litert_torch.generative.export_hf.model_ext import builtin_extensions as _
+from litert_torch.generative.export_hf.model_ext import extension as extension_lib
 import transformers
 
 
 def get_metadata_builder(
     model_config: transformers.PretrainedConfig,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
 ):
-  """Gets metadata builder."""
-  if model_config.model_type == 'gemma3':
-    return gemma3_metadata_builder.build_llm_metadata
-  elif model_config.model_type == 'gemma3n':
-    return gemma3_metadata_builder.build_llm_metadata
-  elif (
-      model_config.model_type == 'gemma4'
+  """Returns an `LlmMetadata` builder delegating to the active `ModelExtension`.
+
+  See `model_ext/gemma3/extension.py` and `model_ext/gemma4/extension.py` for
+  built-in `ModelExtension.build_llm_metadata` implementations.
+
+  Args:
+    model_config: Loaded `PretrainedConfig` for the checkpoint.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    A callable `(source_model_artifacts, export_config,
+    exported_model_artifacts, llm_metadata) -> llm_metadata` that applies the
+    resolved extension's `build_llm_metadata` hook (or returns `llm_metadata`
+    unchanged if no extension applies).
+  """
+  ext = extension_lib.resolve_model_extension(model_config, export_config)
+
+  def _combined_builder(
+      source_model_artifacts,
+      cfg,
+      exported_model_artifacts,
+      llm_metadata,
   ):
-    return gemma4_metadata_builder.build_llm_metadata
-  elif model_config.model_type == 'gemma4_unified':
-    return gemma4_metadata_builder.build_llm_metadata
-  else:
-    return (
-        lambda source_model_artifacts, export_config, exported_model_artifacts, llm_metadata: llm_metadata
+    resolved_ext = ext or extension_lib.resolve_model_extension(
+        model_config, cfg
     )
+    if resolved_ext is not None:
+      llm_metadata = resolved_ext.build_llm_metadata(
+          source_model_artifacts,
+          cfg,
+          exported_model_artifacts,
+          llm_metadata,
+      )
+    return llm_metadata
+
+  return _combined_builder
 
 
 try:
@@ -52,7 +90,7 @@ try:
       maximum_sequence_length: int | None = None,
       minimum_sequence_length: int | None = None,
   ) -> None:
-    """Adds a state buffer to the LLM executor metadata."""
+    """Adds a `StateBuffer` entry to `LlmExecutorMetadata`."""
     buffer = llm_metadata.state_buffers.add()
     buffer.prefill_input_name = name
     buffer.prefill_output_name = name
@@ -73,7 +111,30 @@ try:
       exported_model_artifacts: export_lib.ExportedModelArtifacts,
       executor_metadata: executor_metadata_pb2.ExecutorMetadata | None = None,
   ) -> executor_metadata_pb2.ExecutorMetadata:
-    """Builds executor metadata."""
+    """Populates default `ExecutorMetadata` state buffers from `layer_types`.
+
+    Emits per-layer `StateBuffer` descriptors matching the standard cache tensor
+    naming convention (`kv_cache_k_{i}`, `kv_cache_v_{i}`, `kv_cache_c_{i}`,
+    `kv_cache_r_{i}`) for `full_attention`, `sliding_attention`,
+    `linear_attention` (e.g. `qwen3_5`), and `conv` (e.g. `lfm2`) layers, along
+    with sliding-window attention mask settings when ring-buffer cache is used.
+
+    Args:
+      source_model_artifacts: Loaded `SourceModelArtifacts` with `model_config`.
+      export_config: Active `ExportableModuleConfig` specifying cache lengths
+        and KV time-step axes.
+      exported_model_artifacts: Unused `ExportedModelArtifacts` placeholder for
+        builder signature compatibility.
+      executor_metadata: Optional existing `ExecutorMetadata` message to
+        populate; a new message is allocated when `None`.
+
+    Returns:
+      Populated `executor_metadata_pb2.ExecutorMetadata` protobuf message.
+
+    Raises:
+      ValueError: If `text_config.layer_types` contains an unrecognized layer
+        type string.
+    """
     del exported_model_artifacts
     if executor_metadata is None:
       executor_metadata = executor_metadata_pb2.ExecutorMetadata()
@@ -98,6 +159,7 @@ try:
             'apply_gpu_composites', False
         )
     )
+    del apply_gpu_composites
     enable_ring_buffer = (
         getattr(export_config, 'sliding_window_ring_buffer_size', None)
         is not None
@@ -177,7 +239,10 @@ try:
 
     if sliding_window_size is not None and enable_ring_buffer:
       local_mask_type = executor_metadata_pb2.ATTENTION_MASK_TYPE_CAUSAL
-      if getattr(source_model_artifacts.model_config, 'vision_config', None) is not None:
+      if (
+          getattr(source_model_artifacts.model_config, 'vision_config', None)
+          is not None
+      ):
         local_mask_type = (
             executor_metadata_pb2.ATTENTION_MASK_TYPE_VISION_BIDIRECTIONAL
         )
@@ -200,7 +265,26 @@ except ImportError:
 
 def get_executor_metadata_builder(
     model_config: transformers.PretrainedConfig,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
 ):
-  """Gets executor metadata builder."""
-  del model_config
+  """Returns the `ExecutorMetadata` builder for `model_config`.
+
+  Uses `ModelExtension.get_executor_metadata_builder(model_config)` when the
+  resolved extension defines one; otherwise returns the default
+  `build_executor_metadata` function (or `None` when `executor_metadata_pb2` is
+  unavailable in the environment).
+
+  Args:
+    model_config: Loaded `PretrainedConfig` for the checkpoint.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    An executor metadata builder callable, or `None` if executor metadata proto
+    support is unavailable.
+  """
+  ext = extension_lib.resolve_model_extension(model_config, export_config)
+  if ext is not None:
+    ext_builder = ext.get_executor_metadata_builder(model_config)
+    if ext_builder is not None:
+      return ext_builder
   return build_executor_metadata

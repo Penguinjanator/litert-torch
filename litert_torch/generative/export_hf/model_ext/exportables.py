@@ -12,32 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Exportable modules for extended modules."""
+"""Exportable module and model-wrapper dispatchers for `export_hf`.
+
+The core export pipeline (`core/export_lib.py`) calls the functions in this
+module to look up architecture-specific `ExportableModule` subclasses, task
+model wrappers (ASR, TTS, ImageGen, Any2Any), and checkpoint `model_type`
+inference heuristics. Each function resolves the active `ModelExtension` via
+`extension.resolve_model_extension` (combining built-in extensions from
+`builtin_extensions` with any custom `--extension_modules` or
+`model_extension=...` overrides) and applies standard fallbacks when an
+extension returns `None`.
+"""
 
 from typing import Any
 
 from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core.speech import exportables as speech_exportables
-from litert_torch.generative.export_hf.model_ext.bonsai_flux2 import bonsai_flux2 as bonsai_flux2_lib
-from litert_torch.generative.export_hf.model_ext.flux2_klein import flux2_klein as flux2_klein_lib
-from litert_torch.generative.export_hf.model_ext.gemma3 import vision_exportable as gemma3_vision_exportable
-from litert_torch.generative.export_hf.model_ext.gemma3n import exportable_module as gemma3n_exportable
-from litert_torch.generative.export_hf.model_ext.gemma3n import vision_exportable as gemma3n_vision_exportable
-from litert_torch.generative.export_hf.model_ext.gemma4 import audio_exportable as gemma4_audio_exportable
-from litert_torch.generative.export_hf.model_ext.gemma4 import exportable_module as gemma4_exportable
-from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_exportable_module as gemma4_split_cache_exportable_module
-from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
-from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
-from litert_torch.generative.export_hf.model_ext.kokoro_tts import kokoro_tts as kokoro_tts_lib
-from litert_torch.generative.export_hf.model_ext.lfm2_vl import vision_exportable as lfm2_vl_vision_exportable
-from litert_torch.generative.export_hf.model_ext.minicpm_o import minicpm_o as minicpm_o_lib
-from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as moonshine_lib
-from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
-from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_tdt as parakeet_tdt_lib
-from litert_torch.generative.export_hf.model_ext.qwen3 import qwen3_asr as qwen3_asr_lib
-from litert_torch.generative.export_hf.model_ext.qwen3_5 import exportable_module as qwen3_5_exportable
-from litert_torch.generative.export_hf.model_ext.qwen3_tts import qwen3_tts as qwen3_tts_lib
-from litert_torch.generative.export_hf.model_ext.whisper import whisper as whisper_lib
+# Registers built-in extensions.
+from litert_torch.generative.export_hf.model_ext import builtin_extensions as _
+from litert_torch.generative.export_hf.model_ext import extension as extension_lib
 import transformers
 
 
@@ -45,219 +38,300 @@ def get_prefill_decode_exportables(
     model_config: transformers.PretrainedConfig,
     export_config: exportable_module.ExportableModuleConfig,
 ):
-  """Gets prefill-decode exportables."""
-  if model_config.model_type == 'gemma3n':
-    assert (
-        not export_config.split_cache
-    ), 'Split cache is not supported for Gemma3N.'
-    assert (
-        export_config.externalize_embedder
-    ), 'External embedder is required for Gemma3N.'
-    print('Using Gemma3N exportables.')
-    return (
-        gemma3n_exportable.LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder,
-        gemma3n_exportable.LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder,
-    )
-  elif (
-      model_config.model_type == 'gemma4'
-  ):
-    if model_config.get_text_config().hidden_size_per_layer_input:
-      assert (
-          export_config.externalize_embedder
-      ), 'External embedder is required for Gemma4.'
-      print('Using Gemma4 exportables.')
-      if export_config.split_cache:
-        return (
-            gemma4_split_cache_exportable_module.LiteRTSplitCacheExportableModuleForDecoderOnlyLMPrefill,
-            gemma4_split_cache_exportable_module.LiteRTSplitCacheExportableModuleForDecoderOnlyLMGenerate,
-        )
-      else:
-        return (
-            gemma4_exportable.LiteRTExportableModuleForDecoderOnlyLMPrefillExternalEmbedder,
-            gemma4_exportable.LiteRTExportableModuleForDecoderOnlyLMGenerateExternalEmbedder,
-        )
-    else:
-      return None
-  elif model_config.model_type in ('qwen3_5', 'qwen3_5_text'):
-    print('Using Qwen3.5 exportables.')
-    if export_config.split_cache:
-      return (
-          qwen3_5_exportable.LiteRTSplitCacheExportableModuleForQwen3_5Prefill,
-          qwen3_5_exportable.LiteRTSplitCacheExportableModuleForQwen3_5Generate,
-      )
-    elif export_config.externalize_embedder:
-      return (
-          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5PrefillExternalEmbedder,
-          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5GenerateExternalEmbedder,
-      )
-    else:
-      return (
-          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5Prefill,
-          qwen3_5_exportable.LiteRTExportableModuleForQwen3_5Generate,
-      )
-  else:
-    pass
+  """Returns custom `(prefill_cls, decode_cls)` exportables or `None`.
+
+  Delegates to `ModelExtension.get_prefill_decode_exportables`. When `None` is
+  returned, `core/export_lib.py` falls back to the generic decoder-only
+  prefill/decode exportable modules. See `model_ext/qwen3_5/extension.py`,
+  `model_ext/gemma3n/extension.py`, and `model_ext/gemma4/extension.py` for
+  built-in custom prefill/decode implementations.
+
+  Args:
+    model_config: Loaded `PretrainedConfig` for the checkpoint.
+    export_config: Active `ExportableModuleConfig`.
+
+  Returns:
+    A 2-tuple `(prefill_cls, decode_cls)` of `ExportableModule` subclasses, or
+    `None` if the generic core exportables should be used.
+  """
+  ext = extension_lib.resolve_model_extension(model_config, export_config)
+  if ext is not None:
+    return ext.get_prefill_decode_exportables(model_config, export_config)
   return None
 
 
 def get_vision_exportables(
     model_config: transformers.PretrainedConfig,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
 ):
-  """Gets vision exportables."""
-  if model_config.model_type == 'gemma3':
-    return (
-        gemma3_vision_exportable.LiteRTExportableModuleForGemma3VisionEncoder,
-        gemma3_vision_exportable.LiteRTExportableModuleForGemma3VisionAdapter,
-        None,
-    )
-  elif model_config.model_type == 'gemma3n':
-    return (
-        gemma3n_vision_exportable.LiteRTExportableModuleForGemma3nVisionEncoder,
-        gemma3n_vision_exportable.LiteRTExportableModuleForGemma3nVisionAdapter,
-        None,
-    )
-  elif (
-      model_config.model_type == 'gemma4'
-  ):
-    return (
-        gemma4_vision_exportable.LiteRTExportableModuleForGemma4VisionEncoder,
-        gemma4_vision_exportable.LiteRTExportableModuleForGemma4VisionAdapter,
-        gemma4_vision_exportable.LiteRTExportableModuleForGemma4EndOfImage,
-    )
-  elif model_config.model_type == 'gemma4_unified':
-    return (
-        gemma4_unified_vision_exportable.LiteRTExportableModuleForGemma4UnifiedVisionEncoder,
-        None,
-        gemma4_unified_vision_exportable.LiteRTExportableModuleForGemma4UnifiedEndOfImage,
-    )
-  elif model_config.model_type == 'lfm2_vl':
-    return (
-        lfm2_vl_vision_exportable.LiteRTExportableModuleForLFM2VisionEncoder,
-        lfm2_vl_vision_exportable.LiteRTExportableModuleForLFM2VisionAdapter,
-        None,
-    )
-  else:
-    raise ValueError(f'Unsupported model type: {model_config.model_type}')
+  """Returns `(encoder_cls, adapter_cls, eoi_cls)` for vision tower export.
+
+  Delegates to `ModelExtension.get_vision_exportables`. See
+  `model_ext/gemma3/extension.py`, `model_ext/gemma4/extension.py`, and
+  `model_ext/lfm2_vl/extension.py` for built-in examples.
+
+  Args:
+    model_config: Loaded `PretrainedConfig` for the multimodal checkpoint.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    A 3-tuple `(encoder_cls, adapter_cls, eoi_cls)` where `adapter_cls` and
+    `eoi_cls` may be `None`.
+
+  Raises:
+    ValueError: If no extension provides vision exportables for
+      `model_config.model_type`.
+  """
+  ext = extension_lib.resolve_model_extension(model_config, export_config)
+  if ext is not None:
+    ext_exportables = ext.get_vision_exportables(model_config, export_config)
+    if ext_exportables is not None:
+      return tuple(ext_exportables)
+  raise ValueError(f'Unsupported model type: {model_config.model_type}')
 
 
 def get_audio_exportables(
     model_config: transformers.PretrainedConfig,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
 ):
-  """Gets audio exportables."""
-  if (
-      model_config.model_type == 'gemma4'
-  ):
-    return (
-        gemma4_audio_exportable.LiteRTExportableModuleForGemma4AudioEncoder,
-        gemma4_audio_exportable.LiteRTExportableModuleForGemma4AudioAdapter,
-        gemma4_audio_exportable.LiteRTExportableModuleForGemma4EndOfAudio,
-    )
-  else:
-    raise ValueError(f'Unsupported model type: {model_config.model_type}')
+  """Returns `(encoder_cls, adapter_cls, eoa_cls)` for audio tower export.
+
+  Delegates to `ModelExtension.get_audio_exportables`. See
+  `model_ext/gemma4/extension.py` for a built-in example.
+
+  Args:
+    model_config: Loaded `PretrainedConfig` for the multimodal checkpoint.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    A 3-tuple `(encoder_cls, adapter_cls, eoa_cls)` where `adapter_cls` and
+    `eoa_cls` may be `None`.
+
+  Raises:
+    ValueError: If no extension provides audio exportables for
+      `model_config.model_type`.
+  """
+  ext = extension_lib.resolve_model_extension(model_config, export_config)
+  if ext is not None:
+    ext_exportables = ext.get_audio_exportables(model_config, export_config)
+    if ext_exportables is not None:
+      return tuple(ext_exportables)
+  raise ValueError(f'Unsupported model type: {model_config.model_type}')
 
 
 def get_additional_exportables(
     model_config: transformers.PretrainedConfig,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
 ):
-  """Gets additional exportables."""
-  if model_config.model_type == 'gemma3n':
-    return {
-        'per_layer_embedder': (
-            gemma3n_exportable.LiteRTExportableModuleForPerLayerEmbedder
-        ),
-    }
-  elif (
-      model_config.model_type == 'gemma4'
-  ):
-    if not model_config.get_text_config().hidden_size_per_layer_input:
-      return {}
-    return {
-        'per_layer_embedder': (
-            gemma4_exportable.LiteRTExportableModuleForPerLayerEmbedder
-        ),
-    }
-  else:
-    pass
+  """Returns `{submodel_name: exportable_cls}` for auxiliary submodels.
+
+  Delegates to `ModelExtension.get_additional_exportables`. See
+  `model_ext/gemma3n/extension.py` and `model_ext/gemma4/extension.py`
+  (`'per_layer_embedder'`) for built-in examples.
+
+  Args:
+    model_config: Loaded `PretrainedConfig` for the checkpoint.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    Dictionary mapping submodel names to `ExportableModule` subclasses (empty
+    `{}` if no auxiliary submodels apply).
+  """
+  ext = extension_lib.resolve_model_extension(model_config, export_config)
+  if ext is not None:
+    return dict(ext.get_additional_exportables(model_config, export_config))
   return {}
 
 
 def get_speech_exportables(
     model_config: transformers.PretrainedConfig,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
 ):
-  """Gets speech (ASR) exportables."""
-  if model_config.model_type == 'parakeet_ctc':
-    return (speech_exportables.LiteRTExportableModuleForAsrEncode,)
-  else:
-    return (
-        speech_exportables.LiteRTExportableModuleForAsrEncode,
-        speech_exportables.LiteRTExportableModuleForAsrDecode,
-    )
+  """Returns ASR exportable module classes, defaulting to encode + decode.
+
+  Delegates to `ModelExtension.get_speech_exportables` and falls back to
+  `(LiteRTExportableModuleForAsrEncode, LiteRTExportableModuleForAsrDecode)`
+  when no custom speech exportables are specified. See `ParakeetCtcExtension`
+  in `model_ext/parakeet/extension.py` for an encoder-only override example.
+
+  Args:
+    model_config: Loaded `PretrainedConfig` for the ASR checkpoint.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    Tuple of ASR `ExportableModule` subclasses to export.
+  """
+  ext = extension_lib.resolve_model_extension(model_config, export_config)
+  if ext is not None:
+    ext_exportables = ext.get_speech_exportables(model_config, export_config)
+    if ext_exportables is not None:
+      return ext_exportables
+  return (
+      speech_exportables.LiteRTExportableModuleForAsrEncode,
+      speech_exportables.LiteRTExportableModuleForAsrDecode,
+  )
 
 
-def get_speech_model_cls(model_type: str):
-  """Gets ASR model class by model type."""
-  if model_type == 'parakeet_ctc':
-    return parakeet_ctc_lib.ParakeetCTC
-  elif model_type == 'parakeet_tdt':
-    return parakeet_tdt_lib.ParakeetTDT
-  elif model_type == 'whisper':
-    return whisper_lib.Whisper
-  elif model_type == 'moonshine':
-    return moonshine_lib.Moonshine
-  elif model_type == 'qwen3_asr':
-    return qwen3_asr_lib.Qwen3Asr
-  else:
-    raise ValueError(f'Unsupported speech model type: {model_type}')
+def get_speech_model_cls(
+    model_type: str,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
+):
+  """Returns the ASR model wrapper class registered for `model_type`.
+
+  See `model_ext/whisper/extension.py`, `model_ext/parakeet/extension.py`,
+  `model_ext/moonshine/extension.py`, and `model_ext/qwen3/extension.py` for
+  built-in examples.
+
+  Args:
+    model_type: Speech `model_type` string from `PretrainedConfig`.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    The ASR model wrapper class for `model_type`.
+
+  Raises:
+    ValueError: If no extension provides a speech model class for `model_type`.
+  """
+  ext = extension_lib.resolve_model_extension(model_type, export_config)
+  if ext is not None:
+    cls = ext.get_speech_model_cls(model_type)
+    if cls is not None:
+      return cls
+  raise ValueError(f'Unsupported speech model type: {model_type}')
 
 
-def get_tts_model_cls(model_type: str):
-  """Gets TTS model class by model type."""
-  if model_type in ('qwen3_tts', 'qwen3_tts_talker', 'qwen3'):
-    return qwen3_tts_lib.Qwen3Tts
-  elif model_type in ('kokoro', 'kokoro_tts', 'kokoro-82m', 'kokoro_82m'):
-    return kokoro_tts_lib.KokoroTts
-  else:
-    raise ValueError(f'Unsupported TTS model type: {model_type}')
+def get_tts_model_cls(
+    model_type: str,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
+):
+  """Returns the TTS model wrapper class registered for `model_type`.
+
+  See `model_ext/kokoro_tts/extension.py` and `model_ext/qwen3_tts/extension.py`
+  for built-in examples.
+
+  Args:
+    model_type: TTS `model_type` string.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    The TTS model wrapper class for `model_type`.
+
+  Raises:
+    ValueError: If no extension provides a TTS model class for `model_type`.
+  """
+  ext = extension_lib.resolve_model_extension(model_type, export_config)
+  if ext is not None:
+    cls = ext.get_tts_model_cls(model_type)
+    if cls is not None:
+      return cls
+  raise ValueError(f'Unsupported TTS model type: {model_type}')
 
 
 def infer_tts_model_type(
-    config_dict: dict[str, Any], model_path: str
+    config_dict: dict[str, Any],
+    model_path: str,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
 ) -> str | None:
-  """Infers the TTS model type of a checkpoint that has no `model_type`.
+  """Infers `model_type` for a TTS checkpoint lacking `config.model_type`.
+
+  See `model_ext/kokoro_tts/extension.py` for a built-in implementation of
+  `ModelExtension.is_matching_tts_checkpoint`.
 
   Args:
-    config_dict: The raw `config.json` contents, or `{}` if there is none.
-    model_path: HF repo id or local checkpoint directory.
+    config_dict: Parsed `config.json` dictionary (or `{}` if missing).
+    model_path: HuggingFace repo ID or local checkpoint directory path.
+    export_config: Optional `ExportableModuleConfig`.
 
   Returns:
-    A model type accepted by `get_tts_model_cls`, or None if unrecognized.
+    Inferred `model_type` string, or `None` if no TTS extension matched.
   """
-  if kokoro_tts_lib.KokoroTts.is_kokoro_checkpoint(config_dict, model_path):
-    return 'kokoro'
-  return None
+  return extension_lib.infer_model_type_from_extensions(
+      model_path=model_path,
+      task='text_to_speech',
+      config_dict=config_dict,
+      export_config=export_config,
+  )
 
 
-def get_image_gen_model_cls(model_type: str):
-  """Gets ImageGen model class by model type or pipeline class name."""
-  if model_type == 'bonsai_flux2':
-    return bonsai_flux2_lib.BonsaiFlux2
-  elif model_type in ('flux2_klein', 'Flux2KleinPipeline'):
-    return flux2_klein_lib.Flux2Klein
-  else:
-    raise ValueError(f'Unsupported ImageGen model type: {model_type}')
+def infer_model_type(
+    model_path: str,
+    task: Any = None,
+    config_dict: dict[str, Any] | None = None,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
+) -> str | None:
+  """Infers `model_type` for checkpoints without a standard HF `model_type`.
+
+  See `model_ext/bonsai_flux2/extension.py` and
+  `model_ext/flux2_klein/extension.py` for built-in `match_checkpoint` examples.
+
+  Args:
+    model_path: HuggingFace repo ID or local checkpoint directory path.
+    task: Export task enum or string.
+    config_dict: Optional parsed dictionary from `model_index.json` or
+      `config.json`.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    Inferred `model_type` string, or `None` if no extension matched.
+  """
+  return extension_lib.infer_model_type_from_extensions(
+      model_path=model_path,
+      task=task,
+      config_dict=config_dict,
+      export_config=export_config,
+  )
 
 
-def get_any2any_model_cls(model_type: str):
-  """Gets Any2Any multimodal model class by model type."""
-  if model_type in (
-      'minicpmo',
-      'minicpm_o',
-      'minicpm-o',
-      'minicpm-o-4.5',
-      'minicpm-o-4_5',
-      'MiniCPM-o-4_5',
-      'MiniCPMO',
-  ):
-    return minicpm_o_lib.MiniCpmO
-  else:
-    raise ValueError(f'Unsupported Any2Any model type: {model_type}')
+def get_image_gen_model_cls(
+    model_type: str,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
+):
+  """Returns the ImageGen wrapper class by `model_type` or pipeline class name.
+
+  See `model_ext/bonsai_flux2/extension.py` and
+  `model_ext/flux2_klein/extension.py` for built-in examples.
+
+  Args:
+    model_type: ImageGen `model_type` or Diffusers `_class_name` string.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    The ImageGen model wrapper class for `model_type`.
+
+  Raises:
+    ValueError: If no extension provides an ImageGen model class for
+      `model_type`.
+  """
+  ext = extension_lib.resolve_model_extension(model_type, export_config)
+  if ext is not None:
+    cls = ext.get_image_gen_model_cls(model_type)
+    if cls is not None:
+      return cls
+  raise ValueError(f'Unsupported ImageGen model type: {model_type}')
+
+
+def get_any2any_model_cls(
+    model_type: str,
+    export_config: exportable_module.ExportableModuleConfig | None = None,
+):
+  """Returns the Any2Any multimodal model wrapper class for `model_type`.
+
+  See `model_ext/minicpm_o/extension.py` for a built-in example.
+
+  Args:
+    model_type: Any2Any `model_type` string.
+    export_config: Optional `ExportableModuleConfig`.
+
+  Returns:
+    The Any2Any model wrapper class for `model_type`.
+
+  Raises:
+    ValueError: If no extension provides an Any2Any model class for
+      `model_type`.
+  """
+  ext = extension_lib.resolve_model_extension(model_type, export_config)
+  if ext is not None:
+    cls = ext.get_any2any_model_cls(model_type)
+    if cls is not None:
+      return cls
+  raise ValueError(f'Unsupported Any2Any model type: {model_type}')

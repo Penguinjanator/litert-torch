@@ -12,17 +12,1180 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Extension for HF integration."""
+"""Pluggable model extension contract and registry for `export_hf`.
 
-import dataclasses
+This module defines the `ModelExtension` interface and discovery/registration
+utilities that decouple model-specific customization from the core `export_hf`
+pipeline. Both built-in architectures under `model_ext/<arch>/extension.py` and
+out-of-tree user plugins implement `ModelExtension` to customize stages of the
+export lifecycle:
 
-from litert_torch.generative.export_hf.core import exportable_module
+1. **Checkpoint & Config Resolution**:
+   - `match_checkpoint` / `is_matching_tts_checkpoint` identify checkpoints
+     that omit a standard HuggingFace `model_type` (e.g. Diffusers pipelines in
+     `model_ext/bonsai_flux2/extension.py` or typeless TTS checkpoints in
+     `model_ext/kokoro_tts/extension.py`).
+   - `update_export_config` validates or mutates `ExportableModuleConfig` flags
+     once the model config is loaded.
+2. **Model Loading & Runtime Patching**:
+   - `patch_context` applies class-level patches around model construction so
+     custom layer classes are instantiated (see `model_ext/gemma3/patch.py` and
+     `model_ext/qwen3/patch.py`).
+   - Task-specific model wrapper selectors (`get_speech_model_cls`,
+     `get_tts_model_cls`, `get_image_gen_model_cls`, `get_any2any_model_cls`)
+     provide custom wrappers for non-causal-LM tasks.
+3. **Graph Tracing & Exportable Selection**:
+   - `patch_model` applies instance-level module replacements around
+     `torch.export` tracing (e.g. fusing QKV/MLP projections or injecting HLFB
+     composites; see `model_ext/gemma3/patch.py` and `model_ext/lfm2/patch.py`).
+   - Exportable selectors (`get_prefill_decode_exportables`,
+     `get_vision_exportables`, `get_audio_exportables`,
+     `get_additional_exportables`, `get_speech_exportables`) supply the
+     `ExportableModule` subclasses traced for each submodel.
+4. **LiteRT-LM Metadata & Packaging**:
+   - `get_litert_lm_section_types`, `get_llm_model_type_proto`,
+     `build_llm_metadata`, and `get_executor_metadata_builder` customize how
+     exported `.tflite` flatbuffers, tokenizers, and runtime state descriptors
+     are bundled into a `.litertlm` package (see
+     `model_ext/gemma4/extension.py` and `model_ext/bonsai_flux2/extension.py`).
+
+Extensions can be activated in three ways:
+- **In-process Python**: Pass `model_extension=MyExtension` (or a sequence of
+  extensions) to `export.export(...)` or `ExportableModuleConfig`.
+- **CLI / dynamic import**: Decorate a subclass with
+  `@register_model_extension` and pass `--extension_modules=my_pkg.my_ext`.
+- **Installed wheel entry points**: Declare an entry point under group
+  `litert_torch.model_extensions` in `pyproject.toml`.
+
+Built-in reference implementations live in `model_ext/<arch>/extension.py` and
+are registered via `model_ext/builtin_extensions.py` with `override=False` so
+explicit user registrations take precedence.
+"""
+
+import contextlib
+import importlib
+from importlib import metadata as importlib_metadata
+from typing import Any, Callable, ClassVar, NamedTuple, Sequence
+
+from litert_torch.generative.export_hf.core import exportable_module_config
 import transformers
 
 
+ENTRY_POINT_GROUP = 'litert_torch.model_extensions'
+
+
+class VisionExportablesSpec(NamedTuple):
+  """Exportable module classes for a multimodal vision tower.
+
+  Returned by `ModelExtension.get_vision_exportables` when `task` is
+  `image_text_to_text` or `multimodal_lm` and `export_vision_encoder=True`.
+  See `model_ext/gemma3/extension.py`, `model_ext/gemma4/extension.py`, and
+  `model_ext/lfm2_vl/extension.py` for built-in examples.
+
+  Attributes:
+    encoder_cls: Required `ExportableModule` subclass that wraps the vision
+      backbone (e.g. `LiteRTExportableModuleForGemma3VisionEncoder`).
+    adapter_cls: Optional `ExportableModule` subclass that projects vision
+      features into the text hidden dimension, or `None` when the encoder
+      already includes projection (as in
+      `model_ext/gemma4_unified/extension.py`).
+    eoi_cls: Optional `ExportableModule` subclass for exporting learned
+      end-of-image (EOI) token embeddings, or `None` if unused (see
+      `model_ext/gemma4/extension.py` for a non-`None` example).
+  """
+
+  encoder_cls: Any
+  adapter_cls: Any = None
+  eoi_cls: Any = None
+
+
+class AudioExportablesSpec(NamedTuple):
+  """Exportable module classes for a multimodal audio tower.
+
+  Returned by `ModelExtension.get_audio_exportables` when `task` is
+  `multimodal_lm` and `export_audio_encoder=True`. See
+  `model_ext/gemma4/extension.py` for a built-in example.
+
+  Attributes:
+    encoder_cls: Required `ExportableModule` subclass that wraps the audio
+      encoder tower (e.g. `LiteRTExportableModuleForGemma4AudioEncoder`).
+    adapter_cls: Optional `ExportableModule` subclass that projects encoded
+      audio features into the text hidden dimension, or `None` if fused into
+      `encoder_cls`.
+    eoa_cls: Optional `ExportableModule` subclass for exporting learned
+      end-of-audio (EOA) token embeddings, or `None` if unused.
+  """
+
+  encoder_cls: Any
+  adapter_cls: Any = None
+  eoa_cls: Any = None
+
+
+class ModelExtension:
+  """Base contract for pluggable model architecture extensions in `export_hf`.
+
+  Instances customize how a HuggingFace or custom PyTorch checkpoint is
+  configured, patched, wrapped in `ExportableModule` subclasses, and packaged
+  into `.litertlm` artifacts. Every hook defaults to `None` or a no-op so
+  subclasses only override the hooks needed for their architecture, and
+  multiple extensions can be layered via `CompositeModelExtension`.
+
+  Typical built-in examples by task:
+  - **Text-only / Multimodal LLM**: `model_ext/qwen3_5/extension.py`,
+    `model_ext/gemma3/extension.py`, `model_ext/gemma3n/extension.py`,
+    `model_ext/gemma4/extension.py`, `model_ext/lfm2_vl/extension.py`.
+  - **Speech Recognition (ASR)**: `model_ext/whisper/extension.py`,
+    `model_ext/parakeet/extension.py`, `model_ext/moonshine/extension.py`.
+  - **Text-to-Speech (TTS)**: `model_ext/kokoro_tts/extension.py`,
+    `model_ext/qwen3_tts/extension.py`.
+  - **Text-to-Image**: `model_ext/bonsai_flux2/extension.py`,
+    `model_ext/flux2_klein/extension.py`.
+  - **Any-to-Any Multimodal**: `model_ext/minicpm_o/extension.py`.
+
+  Example:
+    ```python
+    from litert_torch.generative.export_hf import model_ext
+
+    @model_ext.register_model_extension
+    class MyArchExtension(model_ext.ModelExtension):
+      model_types = ('my_arch',)
+
+      def get_prefill_decode_exportables(self, model_config, export_config):
+        return (MyPrefillExportable, MyDecodeExportable)
+    ```
+
+  Attributes:
+    model_types: Tuple or sequence of `config.json` `model_type` strings (or
+      Diffusers `_class_name` identifiers) handled by this extension.
+  """
+
+  model_types: ClassVar[Sequence[str]] = ()
+
+  def update_export_config(
+      self,
+      export_config: exportable_module_config.ExportableModuleConfig,
+      model_config: transformers.PretrainedConfig,
+  ) -> exportable_module_config.ExportableModuleConfig:
+    """Validates or updates `export_config` once `model_config` is loaded.
+
+    Invoked by the export pipeline after loading `model_config` and before
+    constructing or tracing exportable modules. Override this hook to enforce
+    architecture-specific invariants (e.g. requiring `externalize_embedder`) or
+    adjust default export flags based on model hyperparameters.
+
+    Args:
+      export_config: Current `ExportableModuleConfig` for the export run.
+      model_config: Loaded HuggingFace `PretrainedConfig` for the target model.
+
+    Returns:
+      The updated (or mutated in-place) `ExportableModuleConfig`.
+    """
+    del model_config
+    return export_config
+
+  @contextlib.contextmanager
+  def patch_context(self):
+    """Enters a class-level runtime patch context around model construction.
+
+    Invoked around `AutoModel*.from_pretrained(...)` / `from_config(...)` so
+    extensions can temporarily swap module classes or attention functions on a
+    modeling module before submodules are instantiated, restoring originals in a
+    `finally` block. For comparable built-in class-level patches, see
+    `gemma3_litert_patch` in `model_ext/gemma3/patch.py` and
+    `qwen3_litert_patch` in `model_ext/qwen3/patch.py`.
+
+    Yields:
+      Control to the model-loading block while class-level patches are active.
+    """
+    yield
+
+  @contextlib.contextmanager
+  def patch_model(
+      self,
+      model: Any,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ):
+    """Enters an instance-level patch context around model tracing and export.
+
+    Invoked after `model` is instantiated and before `torch.export` traces its
+    forward signatures. Override this hook to swap child modules on `model` in
+    place (such as fusing QKV/gate-up projections or inserting HLFB composite
+    wrappers conditioned on `export_config`) and restore them in a `finally`
+    block. For comparable built-in instance patches, see `patch_gemma3_model`
+    in `model_ext/gemma3/patch.py` and `patch_qwen3_model` in
+    `model_ext/qwen3/patch.py`.
+
+    Args:
+      model: Instantiated PyTorch model or task wrapper about to be traced.
+      export_config: Active `ExportableModuleConfig` controlling fusions and
+        composites.
+
+    Yields:
+      Control to the tracing/conversion block while `model` is patched.
+    """
+    del model, export_config
+    yield
+
+  def get_prefill_decode_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ) -> tuple[Any, Any] | None:
+    """Selects custom `(prefill_cls, decode_cls)` exportable module classes.
+
+    Invoked during text-generation and multimodal LLM export when building the
+    prefill/decode `.tflite` graph. Override this when the model passes extra
+    inputs/outputs (such as per-layer embeddings or hybrid linear-attention
+    caches) that are not covered by the generic decoder-only exportables in
+    `core/exportable_module.py` or `core/split_cache/exportable_module.py`.
+    See `model_ext/qwen3_5/extension.py`, `model_ext/gemma3n/extension.py`, and
+    `model_ext/gemma4/extension.py` for built-in examples.
+
+    Args:
+      model_config: Loaded `PretrainedConfig` for the checkpoint.
+      export_config: Active `ExportableModuleConfig` (inspect `split_cache` and
+        `externalize_embedder` to return matching prefill/decode classes).
+
+    Returns:
+      A 2-tuple `(prefill_exportable_cls, decode_exportable_cls)` of
+      `ExportableModule` subclasses, or `None` to fall back to the core generic
+      decoder-only prefill/decode exportables.
+    """
+    del model_config, export_config
+    return None
+
+  def get_vision_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> VisionExportablesSpec | tuple[Any, Any, Any] | None:
+    """Selects vision encoder, adapter, and EOI exportable module classes.
+
+    Invoked when `task` is `image_text_to_text` or `multimodal_lm` and
+    `export_config.export_vision_encoder` is True. See
+    `model_ext/gemma3/extension.py` (encoder + adapter),
+    `model_ext/gemma4_unified/extension.py` (encoder + EOI, `adapter_cls=None`),
+    and `model_ext/gemma4/extension.py` (encoder + adapter + EOI).
+
+    Args:
+      model_config: Loaded `PretrainedConfig` for the multimodal checkpoint.
+      export_config: Optional `ExportableModuleConfig` for the export run.
+
+    Returns:
+      A `VisionExportablesSpec` (or equivalent 3-tuple
+      `(encoder_cls, adapter_cls, eoi_cls)`), or `None` if this extension does
+      not support vision export for `model_config`.
+    """
+    del model_config, export_config
+    return None
+
+  def get_audio_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> AudioExportablesSpec | tuple[Any, Any, Any] | None:
+    """Selects audio encoder, adapter, and EOA exportable module classes.
+
+    Invoked when `task` is `multimodal_lm` and
+    `export_config.export_audio_encoder` is True. See
+    `model_ext/gemma4/extension.py` for a built-in implementation returning
+    encoder, adapter, and end-of-audio exportables.
+
+    Args:
+      model_config: Loaded `PretrainedConfig` for the multimodal checkpoint.
+      export_config: Optional `ExportableModuleConfig` for the export run.
+
+    Returns:
+      An `AudioExportablesSpec` (or equivalent 3-tuple
+      `(encoder_cls, adapter_cls, eoa_cls)`), or `None` if this extension does
+      not support audio encoder export for `model_config`.
+    """
+    del model_config, export_config
+    return None
+
+  def get_additional_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> dict[str, Any]:
+    """Returns auxiliary `{submodel_name: exportable_cls}` entries to export.
+
+    Invoked during LLM/multimodal export to export extra submodels alongside
+    prefill/decode, embedder, vision, and audio graphs. If `submodel_name` is a
+    custom section name (anything other than `'per_layer_embedder'`), also
+    override `get_litert_lm_section_types()` so `.litertlm` packaging knows
+    which section type to assign. See `model_ext/gemma3n/extension.py` and
+    `model_ext/gemma4/extension.py` (`'per_layer_embedder'`) for examples.
+
+    Args:
+      model_config: Loaded `PretrainedConfig` for the checkpoint.
+      export_config: Optional `ExportableModuleConfig` for the export run.
+
+    Returns:
+      Dictionary mapping submodel artifact names to `ExportableModule`
+      subclasses; empty dict `{}` when no auxiliary submodels are needed.
+    """
+    del model_config, export_config
+    return {}
+
+  def get_speech_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> tuple[Any, ...] | None:
+    """Selects exportable module classes for `automatic_speech_recognition`.
+
+    Invoked during ASR export to determine which subgraphs to trace. When
+    `None` is returned, `model_ext/exportables.py` falls back to the standard
+    encoder-decoder pair `(LiteRTExportableModuleForAsrEncode,
+    LiteRTExportableModuleForAsrDecode)`. Override this for encoder-only CTC
+    models; see `ParakeetCtcExtension` in `model_ext/parakeet/extension.py`.
+
+    Args:
+      model_config: Loaded `PretrainedConfig` for the speech model.
+      export_config: Optional `ExportableModuleConfig` for the export run.
+
+    Returns:
+      Tuple of ASR `ExportableModule` subclasses, or `None` to use the default
+      ASR encode + decode exportables.
+    """
+    del model_config, export_config
+    return None
+
+  def get_speech_model_cls(self, model_type: str) -> Any | None:
+    """Returns the ASR model wrapper class for `automatic_speech_recognition`.
+
+    Invoked during `load_model` when `task='automatic_speech_recognition'`.
+    See `model_ext/whisper/extension.py`, `model_ext/moonshine/extension.py`,
+    `model_ext/parakeet/extension.py`, and `Qwen3AsrExtension` in
+    `model_ext/qwen3/extension.py` for built-in examples.
+
+    Args:
+      model_type: Resolved `model_type` string of the speech checkpoint.
+
+    Returns:
+      An ASR model wrapper class (subclass of `core.speech.asr_model.AsrModel`),
+      or `None` if unsupported by this extension.
+    """
+    del model_type
+    return None
+
+  def get_tts_model_cls(self, model_type: str) -> Any | None:
+    """Returns the TTS model wrapper class for `text_to_speech` export.
+
+    Invoked during `load_model` when `task='text_to_speech'`. See
+    `model_ext/kokoro_tts/extension.py` and `model_ext/qwen3_tts/extension.py`
+    for built-in examples.
+
+    Args:
+      model_type: Resolved `model_type` string of the TTS checkpoint.
+
+    Returns:
+      A TTS model wrapper class (subclass of `core.tts.tts_model.TtsModel`), or
+      `None` if unsupported by this extension.
+    """
+    del model_type
+    return None
+
+  @classmethod
+  def is_matching_tts_checkpoint(
+      cls, config_dict: dict[str, Any], model_path: str
+  ) -> bool:
+    """Identifies a `text_to_speech` checkpoint lacking `config.model_type`.
+
+    Called by `match_checkpoint` when `task == 'text_to_speech'` and a
+    checkpoint's `config.json` is missing or omits `model_type` (common for
+    standalone TTS repositories). See `model_ext/kokoro_tts/extension.py` for a
+    built-in example.
+
+    Args:
+      config_dict: Parsed `config.json` dictionary (empty `{}` if absent).
+      model_path: HuggingFace repo ID or local checkpoint directory path.
+
+    Returns:
+      True if `(config_dict, model_path)` belongs to this TTS architecture.
+    """
+    del config_dict, model_path
+    return False
+
+  @classmethod
+  def match_checkpoint(
+      cls,
+      model_path: str,
+      task: Any = None,
+      config_dict: dict[str, Any] | None = None,
+  ) -> bool:
+    """Identifies checkpoints that do not declare a standard HF `model_type`.
+
+    Invoked during `load_model` for tasks whose checkpoints may use Diffusers
+    `model_index.json` or non-Transformers `config.json` layouts (such as
+    `text_to_image`, `text_to_speech`, and `any_to_any`). When True, the first
+    entry in `cls.model_types` is used as the inferred `model_type`. By default,
+    delegates `text_to_speech` checks to `is_matching_tts_checkpoint`. See
+    `model_ext/bonsai_flux2/extension.py` and
+    `model_ext/flux2_klein/extension.py` for built-in examples.
+
+    Args:
+      model_path: HuggingFace repo ID or local checkpoint directory path.
+      task: Export task enum or string (e.g. `'text_to_image'`).
+      config_dict: Parsed JSON from `model_index.json` or `config.json`, or
+        `None` if neither file exists.
+
+    Returns:
+      True if this extension handles the given checkpoint.
+    """
+    task_name = getattr(task, 'value', task)
+    if config_dict is not None and task_name == 'text_to_speech':
+      return cls.is_matching_tts_checkpoint(config_dict, model_path)
+    return False
+
+  def matches_checkpoint(
+      self,
+      model_path: str,
+      task: Any = None,
+      config_dict: dict[str, Any] | None = None,
+  ) -> bool:
+    """Instance-method dispatcher for `match_checkpoint`.
+
+    Used by `CompositeModelExtension` and `infer_model_type_from_extensions` so
+    both class-level heuristics and stateful extension instances can match
+    checkpoints uniformly.
+
+    Args:
+      model_path: HuggingFace repo ID or local checkpoint directory path.
+      task: Export task enum or string.
+      config_dict: Optional parsed config/index dictionary.
+
+    Returns:
+      True if this extension matches the checkpoint.
+    """
+    return self.match_checkpoint(model_path, task=task, config_dict=config_dict)
+
+  def get_image_gen_model_cls(self, model_type: str) -> Any | None:
+    """Returns the ImageGen wrapper class for `text_to_image` export.
+
+    Invoked during `load_model` when `task='text_to_image'`. See
+    `model_ext/bonsai_flux2/extension.py` and
+    `model_ext/flux2_klein/extension.py` for built-in examples.
+
+    Args:
+      model_type: Resolved `model_type` or Diffusers `_class_name` string.
+
+    Returns:
+      An image generation wrapper class (subclass of
+      `core.image_gen.image_gen_model.ImageGenModel`), or `None` if unsupported.
+    """
+    del model_type
+    return None
+
+  def get_any2any_model_cls(self, model_type: str) -> Any | None:
+    """Returns the Any2Any wrapper class for `any_to_any` multimodal export.
+
+    Invoked during `load_model` when `task='any_to_any'`. See
+    `model_ext/minicpm_o/extension.py` for a built-in example.
+
+    Args:
+      model_type: Resolved `model_type` string of the checkpoint.
+
+    Returns:
+      An Any2Any model wrapper class, or `None` if unsupported.
+    """
+    del model_type
+    return None
+
+  def get_litert_lm_section_types(self) -> dict[str, Any]:
+    """Maps auxiliary submodel names to `.litertlm` container section types.
+
+    Invoked by `core/litert_lm_builder.py` when packaging
+    `additional_model_paths` into a `.litertlm` archive (for LLM, ImageGen, and
+    Any2Any tasks). Values may be `LlmMetadata` section enum values or
+    section-type strings accepted by `LitertLmBuilder.add_tflite_model`. See
+    `model_ext/bonsai_flux2/extension.py` and
+    `model_ext/flux2_klein/extension.py` for built-in examples.
+
+    Returns:
+      Dictionary `{submodel_name: section_type}`; empty dict `{}` by default.
+    """
+    return {}
+
+  def get_llm_model_type_proto(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ) -> Any | None:
+    """Returns a custom `LlmModelType` protobuf message for `.litertlm` metadata.
+
+    Invoked by `core/litert_lm_builder.py` when populating
+    `llm_metadata.llm_model_type` (unless `litert_lm_model_type_override` is
+    set on `export_config`). Returning `None` falls back to the built-in
+    `model_type` switch (which defaults unknown architectures to
+    `GenericModel`).
+
+    Args:
+      model_config: Loaded `PretrainedConfig` for the checkpoint.
+      export_config: Active `ExportableModuleConfig`.
+
+    Returns:
+      An `llm_model_type_pb2.LlmModelType` message, or `None` to use core's
+      default `LlmModelType` selection.
+    """
+    del model_config, export_config
+    return None
+
+  def build_llm_metadata(
+      self,
+      source_model_artifacts: Any,
+      export_config: exportable_module_config.ExportableModuleConfig,
+      exported_model_artifacts: Any,
+      llm_metadata: Any,
+  ) -> Any:
+    """Customizes the `LlmMetadata` protobuf during `.litertlm` packaging.
+
+    Invoked by `core/litert_lm_builder.py` after base stop tokens, prompt
+    templates, and sampler parameters are populated. Override this hook to set
+    modality token IDs, vision/audio patch parameters, or architecture-specific
+    prompt formatting. See `model_ext/gemma3/extension.py`,
+    `model_ext/gemma3n/extension.py`, and `model_ext/gemma4/extension.py` for
+    built-in examples.
+
+    Args:
+      source_model_artifacts: `SourceModelArtifacts` containing `model`,
+        `model_config`, `tokenizer`, and processor objects.
+      export_config: Active `ExportableModuleConfig`.
+      exported_model_artifacts: `ExportedModelArtifacts` with paths to all
+        exported `.tflite` and tokenizer files.
+      llm_metadata: Pre-populated `llm_metadata_pb2.LlmMetadata` proto.
+
+    Returns:
+      The updated `LlmMetadata` protobuf message.
+    """
+    del source_model_artifacts, export_config, exported_model_artifacts
+    return llm_metadata
+
+  def get_executor_metadata_builder(
+      self,
+      model_config: transformers.PretrainedConfig,
+  ) -> Callable[..., Any] | None:
+    """Returns a custom builder for `ExecutorMetadata` state-buffer descriptors.
+
+    Invoked by `model_ext/metadata_builder.py` when packaging a `.litertlm`
+    bundle. Returning `None` uses the default `build_executor_metadata`
+    implementation in `model_ext/metadata_builder.py`, which automatically
+    derives global KV, sliding-window local KV, `linear_attention`, and `conv`
+    `StateBuffer` entries from `model_config.layer_types`. Override only when a
+    model uses custom state tensor names or buffer policies.
+
+    Args:
+      model_config: Loaded `PretrainedConfig` for the checkpoint.
+
+    Returns:
+      A callable `(source_model_artifacts, export_config,
+      exported_model_artifacts, executor_metadata=None) -> ExecutorMetadata`,
+      or `None` to use the standard state-buffer builder.
+    """
+    del model_config
+    return None
+
+
+class CompositeModelExtension(ModelExtension):
+  """Chains multiple `ModelExtension` instances in priority order.
+
+  Used when layering an explicit `export_config.model_extension` override on
+  top of a registered built-in extension (or when passing a list of extensions).
+  Composition semantics by hook category:
+  - **Context managers** (`patch_context`, `patch_model`): Entered in forward
+    order via `contextlib.ExitStack` (outermost = first extension, innermost =
+    last extension).
+  - **Sequential transforms** (`update_export_config`, `build_llm_metadata`):
+    Piped in forward order so later extensions refine earlier results.
+  - **Single-winner selectors** (`get_prefill_decode_exportables`,
+    `get_vision_exportables`, `get_audio_exportables`, `get_*_model_cls`,
+    `get_llm_model_type_proto`, `get_executor_metadata_builder`): Queried in
+    reverse order so the **last** extension returning non-`None` wins.
+  - **Map mergers** (`get_additional_exportables`,
+    `get_litert_lm_section_types`): Merged in forward order (`dict.update`) so
+    later extensions can add keys or override earlier keys.
+  """
+
+  def __init__(self, extensions: Sequence[ModelExtension]):
+    """Initializes a composite over `extensions` in low-to-high priority order."""
+    self._extensions = tuple(extensions)
+
+  @property
+  def extensions(self) -> tuple[ModelExtension, ...]:
+    """Returns the ordered tuple of underlying `ModelExtension` instances."""
+    return self._extensions
+
+  def update_export_config(
+      self,
+      export_config: exportable_module_config.ExportableModuleConfig,
+      model_config: transformers.PretrainedConfig,
+  ) -> exportable_module_config.ExportableModuleConfig:
+    """See base class."""
+    for ext in self._extensions:
+      export_config = ext.update_export_config(export_config, model_config)
+    return export_config
+
+  @contextlib.contextmanager
+  def patch_context(self):
+    """See base class."""
+    with contextlib.ExitStack() as stack:
+      for ext in self._extensions:
+        stack.enter_context(ext.patch_context())
+      yield
+
+  @contextlib.contextmanager
+  def patch_model(
+      self,
+      model: Any,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ):
+    """See base class."""
+    with contextlib.ExitStack() as stack:
+      for ext in self._extensions:
+        stack.enter_context(ext.patch_model(model, export_config))
+      yield
+
+  def get_prefill_decode_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ) -> tuple[Any, Any] | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_prefill_decode_exportables(model_config, export_config)
+      if res is not None:
+        return res
+    return None
+
+  def get_vision_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> VisionExportablesSpec | tuple[Any, Any, Any] | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_vision_exportables(model_config, export_config)
+      if res is not None:
+        return res
+    return None
+
+  def get_audio_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> AudioExportablesSpec | tuple[Any, Any, Any] | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_audio_exportables(model_config, export_config)
+      if res is not None:
+        return res
+    return None
+
+  def get_additional_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> dict[str, Any]:
+    """See base class."""
+    merged: dict[str, Any] = {}
+    for ext in self._extensions:
+      merged.update(ext.get_additional_exportables(model_config, export_config))
+    return merged
+
+  def get_speech_exportables(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: (
+          exportable_module_config.ExportableModuleConfig | None
+      ) = None,
+  ) -> tuple[Any, ...] | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_speech_exportables(model_config, export_config)
+      if res is not None:
+        return res
+    return None
+
+  def get_speech_model_cls(self, model_type: str) -> Any | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_speech_model_cls(model_type)
+      if res is not None:
+        return res
+    return None
+
+  def get_tts_model_cls(self, model_type: str) -> Any | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_tts_model_cls(model_type)
+      if res is not None:
+        return res
+    return None
+
+  def get_image_gen_model_cls(self, model_type: str) -> Any | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_image_gen_model_cls(model_type)
+      if res is not None:
+        return res
+    return None
+
+  def get_any2any_model_cls(self, model_type: str) -> Any | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_any2any_model_cls(model_type)
+      if res is not None:
+        return res
+    return None
+
+  def matches_checkpoint(
+      self,
+      model_path: str,
+      task: Any = None,
+      config_dict: dict[str, Any] | None = None,
+  ) -> bool:
+    """See base class."""
+    return any(
+        ext.matches_checkpoint(model_path, task=task, config_dict=config_dict)
+        for ext in self._extensions
+    )
+
+  def get_litert_lm_section_types(self) -> dict[str, Any]:
+    """See base class."""
+    merged: dict[str, Any] = {}
+    for ext in self._extensions:
+      merged.update(ext.get_litert_lm_section_types())
+    return merged
+
+  def get_llm_model_type_proto(
+      self,
+      model_config: transformers.PretrainedConfig,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ) -> Any | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_llm_model_type_proto(model_config, export_config)
+      if res is not None:
+        return res
+    return None
+
+  def build_llm_metadata(
+      self,
+      source_model_artifacts: Any,
+      export_config: exportable_module_config.ExportableModuleConfig,
+      exported_model_artifacts: Any,
+      llm_metadata: Any,
+  ) -> Any:
+    """See base class."""
+    for ext in self._extensions:
+      llm_metadata = ext.build_llm_metadata(
+          source_model_artifacts,
+          export_config,
+          exported_model_artifacts,
+          llm_metadata,
+      )
+    return llm_metadata
+
+  def get_executor_metadata_builder(
+      self,
+      model_config: transformers.PretrainedConfig,
+  ) -> Callable[..., Any] | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_executor_metadata_builder(model_config)
+      if res is not None:
+        return res
+    return None
+
+
+def compose_extensions(
+    *extensions: ModelExtension | type[ModelExtension] | None,
+) -> ModelExtension:
+  """Normalizes and composes one or more `ModelExtension` classes or instances.
+
+  Instantiates any `ModelExtension` subclasses, flattens nested
+  `CompositeModelExtension` instances, skips `None` entries, and returns either
+  a single `ModelExtension` or a `CompositeModelExtension`.
+
+  Args:
+    *extensions: Zero or more `ModelExtension` subclasses, instances, or `None`
+      ordered from lowest to highest override priority.
+
+  Returns:
+    A normalized `ModelExtension` (base no-op `ModelExtension()` when all
+    inputs are `None`).
+
+  Raises:
+    TypeError: If any non-`None` argument is neither a `ModelExtension`
+      subclass nor a `ModelExtension` instance.
+  """
+  normalized: list[ModelExtension] = []
+  for ext in extensions:
+    if ext is None:
+      continue
+    if isinstance(ext, type) and issubclass(ext, ModelExtension):
+      ext = ext()
+    if isinstance(ext, CompositeModelExtension):
+      normalized.extend(ext.extensions)
+    elif isinstance(ext, ModelExtension):
+      normalized.append(ext)
+    else:
+      raise TypeError(
+          'Expected ModelExtension subclass or instance, got'
+          f' {type(ext).__name__}.'
+      )
+  if not normalized:
+    return ModelExtension()
+  if len(normalized) == 1:
+    return normalized[0]
+  return CompositeModelExtension(normalized)
+
+
+# Map of model_type -> ModelExtension instance.
+_EXTENSION_REGISTRY: dict[str, ModelExtension] = {}
+_ENTRY_POINTS_LOADED = False
+
+
+def _coerce_extension(
+    ext: ModelExtension | type[ModelExtension],
+) -> ModelExtension:
+  """Returns an instantiated `ModelExtension` from a class or instance."""
+  if isinstance(ext, type) and issubclass(ext, ModelExtension):
+    return ext()
+  if isinstance(ext, ModelExtension):
+    return ext
+  raise TypeError(
+      f'Expected ModelExtension subclass or instance, got {type(ext).__name__}.'
+  )
+
+
+def register_model_extension(
+    model_types: str | Sequence[str] | None = None,
+    *,
+    override: bool = True,
+):
+  """Decorator or function to register a `ModelExtension` class or instance.
+
+  Built-in extensions in `model_ext/<arch>/extension.py` register with
+  `override=False` so out-of-tree extensions registered before or after import
+  can override them with the default `override=True`.
+
+  Usage as a decorator:
+    ```python
+    @register_model_extension(['my_arch', 'my_arch_text'])
+    class MyArchExtension(ModelExtension):
+      ...
+    ```
+
+  Or using `model_types` defined on the class:
+    ```python
+    @register_model_extension()
+    class MyArchExtension(ModelExtension):
+      model_types = ('my_arch',)
+    ```
+
+  Args:
+    model_types: Single `model_type` string or sequence of `model_type`
+      strings. If `None`, reads `cls.model_types`.
+    override: If True (default), overwrites any existing registration for the
+      same `model_type`; if False, preserves existing registrations.
+
+  Returns:
+    A decorator that registers the extension and returns the original class or
+    instance unchanged.
+  """
+
+  def wrapper(ext_cls_or_instance: ModelExtension | type[ModelExtension]):
+    instance = _coerce_extension(ext_cls_or_instance)
+    types = model_types
+    if types is None:
+      types = getattr(ext_cls_or_instance, 'model_types', ())
+    if isinstance(types, str):
+      types = (types,)
+    if not types:
+      raise ValueError(
+          'register_model_extension requires non-empty model_types either via'
+          ' argument or class attribute `model_types`.'
+      )
+    for mt in types:
+      if not override and mt in _EXTENSION_REGISTRY:
+        continue
+      _EXTENSION_REGISTRY[mt] = instance
+    return ext_cls_or_instance
+
+  return wrapper
+
+
+def unregister_model_extension(model_type: str) -> ModelExtension | None:
+  """Removes and returns the registered `ModelExtension` for `model_type`.
+
+  Primarily used in unit tests to clean up temporary extension registrations.
+
+  Args:
+    model_type: Registry key to remove.
+
+  Returns:
+    The removed `ModelExtension` instance, or `None` if `model_type` was not
+    registered.
+  """
+  return _EXTENSION_REGISTRY.pop(model_type, None)
+
+
+def registered_model_types() -> tuple[str, ...]:
+  """Returns the tuple of `model_type` keys currently in the registry."""
+  return tuple(_EXTENSION_REGISTRY.keys())
+
+
+def load_extension_modules(
+    modules: Sequence[str] | str | None,
+) -> None:
+  """Imports dotted Python module paths so their `@register_*` decorators run.
+
+  Invoked automatically when `--extension_modules` /
+  `ExportableModuleConfig.extension_modules` is provided.
+
+  Args:
+    modules: Comma-separated string or sequence of importable dotted Python
+      module paths, or `None` for a no-op.
+  """
+  if not modules:
+    return
+  if isinstance(modules, str):
+    module_list = [m.strip() for m in modules.split(',') if m.strip()]
+  else:
+    module_list = [m.strip() for m in modules if m and m.strip()]
+  for module_path in module_list:
+    importlib.import_module(module_path)
+
+
+def _load_entry_point_extensions(reload_entry_points: bool = False) -> None:
+  """Discovers and loads wheel plugins from `importlib.metadata` entry points."""
+  global _ENTRY_POINTS_LOADED
+  if _ENTRY_POINTS_LOADED and not reload_entry_points:
+    return
+  _ENTRY_POINTS_LOADED = True
+  try:
+    eps = importlib_metadata.entry_points(group=ENTRY_POINT_GROUP)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return
+
+  for ep in eps:
+    try:
+      loaded = ep.load()
+      if isinstance(loaded, type) and issubclass(loaded, ModelExtension):
+        if ep.name and ep.name not in _EXTENSION_REGISTRY:
+          register_model_extension(ep.name, override=False)(loaded)
+        elif getattr(loaded, 'model_types', ()):
+          register_model_extension(override=False)(loaded)
+      elif isinstance(loaded, ModelExtension):
+        if ep.name and ep.name not in _EXTENSION_REGISTRY:
+          register_model_extension(ep.name, override=False)(loaded)
+        elif getattr(loaded, 'model_types', ()):
+          register_model_extension(override=False)(loaded)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f'Warning: failed to load model extension entry point {ep}: {e}')
+
+
+def _try_lazy_import_builtin(model_type: str) -> None:
+  """Attempts to lazily import built-in `model_ext.<model_type>` modules."""
+  if not model_type or not model_type.isidentifier():
+    return
+  base_pkg = f'litert_torch.generative.export_hf.model_ext.{model_type}'
+  for suffix in ('extension', 'patch', ''):
+    mod_name = f'{base_pkg}.{suffix}' if suffix else base_pkg
+    try:
+      importlib.import_module(mod_name)
+    except ImportError:
+      continue
+
+
+def get_model_extension(model_type: str | None) -> ModelExtension | None:
+  """Looks up a registered `ModelExtension` by `model_type`.
+
+  Checks the in-memory registry first, then attempts lazy built-in module
+  import (`model_ext.<model_type>.extension`), and finally scans installed
+  Python wheel entry points under `litert_torch.model_extensions`.
+
+  Args:
+    model_type: Target `model_type` string, or `None`.
+
+  Returns:
+    The registered `ModelExtension` instance, or `None` if no extension is
+    registered for `model_type`.
+  """
+  if not model_type:
+    return None
+  if model_type in _EXTENSION_REGISTRY:
+    return _EXTENSION_REGISTRY[model_type]
+  _try_lazy_import_builtin(model_type)
+  if model_type in _EXTENSION_REGISTRY:
+    return _EXTENSION_REGISTRY[model_type]
+  _load_entry_point_extensions()
+  return _EXTENSION_REGISTRY.get(model_type)
+
+
+def _extract_model_types(
+    model_type_or_config: str | transformers.PretrainedConfig | None,
+) -> list[str]:
+  """Extracts candidate `model_type` strings from a config or string."""
+  if model_type_or_config is None:
+    return []
+  if isinstance(model_type_or_config, str):
+    return [model_type_or_config] if model_type_or_config else []
+  candidates: list[str] = []
+  top_mt = getattr(model_type_or_config, 'model_type', None)
+  if top_mt:
+    candidates.append(top_mt)
+  text_cfg = getattr(model_type_or_config, 'text_config', None)
+  if text_cfg is not None:
+    text_mt = getattr(text_cfg, 'model_type', None)
+    if text_mt and text_mt not in candidates:
+      candidates.append(text_mt)
+  return candidates
+
+
+def resolve_model_extension(
+    model_type_or_config: str | transformers.PretrainedConfig | None = None,
+    export_config: (
+        exportable_module_config.ExportableModuleConfig | None
+    ) = None,
+) -> ModelExtension | None:
+  """Resolves the active `ModelExtension` for a model and export config.
+
+  Resolution order:
+  1. Loads any `export_config.extension_modules` if specified.
+  2. Checks registered extensions for `model_config.model_type` (and
+     `model_config.text_config.model_type` if present).
+  3. If `export_config.model_extension` is provided:
+     - If a registered extension was also found, composes
+       `(registered_ext, explicit_ext)` so the explicit extension overrides any
+       hooks it implements while inheriting others.
+     - Otherwise returns the explicit `ModelExtension` (or
+       `CompositeModelExtension` if a list/tuple was passed).
+
+  Args:
+    model_type_or_config: Either a `model_type` string or a `PretrainedConfig`.
+    export_config: Optional `ExportableModuleConfig` carrying `model_extension`
+      and/or `extension_modules`.
+
+  Returns:
+    A `ModelExtension` instance, or `None` if no extension applies.
+  """
+  if export_config is not None and getattr(
+      export_config, 'extension_modules', None
+  ):
+    load_extension_modules(export_config.extension_modules)
+
+  found_extensions: list[ModelExtension] = []
+  for mt in _extract_model_types(model_type_or_config):
+    ext = get_model_extension(mt)
+    if ext is not None and ext not in found_extensions:
+      found_extensions.append(ext)
+
+  explicit_ext = (
+      getattr(export_config, 'model_extension', None)
+      if export_config is not None
+      else None
+  )
+  if explicit_ext is not None:
+    if isinstance(explicit_ext, (list, tuple)):
+      explicit_composed = compose_extensions(*explicit_ext)
+    else:
+      explicit_composed = compose_extensions(explicit_ext)
+    found_extensions.append(explicit_composed)
+
+  if not found_extensions:
+    return None
+  return compose_extensions(*found_extensions)
+
+
+def infer_model_type_from_extensions(
+    model_path: str,
+    task: Any = None,
+    config_dict: dict[str, Any] | None = None,
+    export_config: (
+        exportable_module_config.ExportableModuleConfig | None
+    ) = None,
+) -> str | None:
+  """Infers `model_type` for checkpoints without a standard HF `model_type`.
+
+  Queries `matches_checkpoint` on any explicit `export_config.model_extension`
+  first, then iterates over registered extensions (including wheel entry
+  points). Used for Diffusers pipelines and standalone TTS/Any2Any checkpoints;
+  see `model_ext/bonsai_flux2/extension.py`,
+  `model_ext/flux2_klein/extension.py`, and
+  `model_ext/kokoro_tts/extension.py`.
+
+  Args:
+    model_path: HuggingFace repo ID or local checkpoint directory path.
+    task: Export task enum or string (e.g. `'text_to_image'`).
+    config_dict: Optional parsed dictionary from `model_index.json` or
+      `config.json`.
+    export_config: Optional `ExportableModuleConfig` carrying `model_extension`
+      or `extension_modules`.
+
+  Returns:
+    The inferred `model_type` string, or `None` if no extension matched.
+  """
+  task_val = getattr(task, 'value', task)
+  if export_config is not None and getattr(
+      export_config, 'extension_modules', None
+  ):
+    load_extension_modules(export_config.extension_modules)
+  _load_entry_point_extensions()
+  explicit_ext = (
+      getattr(export_config, 'model_extension', None)
+      if export_config is not None
+      else None
+  )
+  if explicit_ext is not None:
+    ext = compose_extensions(*(
+        explicit_ext
+        if isinstance(explicit_ext, (list, tuple))
+        else (explicit_ext,)
+    ))
+    if ext.matches_checkpoint(
+        model_path, task=task_val, config_dict=config_dict
+    ):
+      if ext.model_types:
+        return ext.model_types[0]
+  for model_type, ext in _EXTENSION_REGISTRY.items():
+    if ext.matches_checkpoint(
+        model_path, task=task_val, config_dict=config_dict
+    ):
+      return model_type
+  return None
+
+
 def update_export_config(
-    export_config: exportable_module.ExportableModuleConfig,
+    export_config: exportable_module_config.ExportableModuleConfig,
     model_config: transformers.PretrainedConfig,
-) -> exportable_module.ExportableModuleConfig:
-  """Updates export config."""
+) -> exportable_module_config.ExportableModuleConfig:
+  """Resolves the active `ModelExtension` and runs `update_export_config`.
+
+  Args:
+    export_config: Current `ExportableModuleConfig` for the export run.
+    model_config: Loaded `PretrainedConfig` for the target checkpoint.
+
+  Returns:
+    The updated `ExportableModuleConfig` (unchanged if no extension applies).
+  """
+  ext = resolve_model_extension(model_config, export_config)
+  if ext is not None:
+    return ext.update_export_config(export_config, model_config)
   return export_config
