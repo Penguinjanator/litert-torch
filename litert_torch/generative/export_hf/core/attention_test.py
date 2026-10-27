@@ -34,20 +34,55 @@ def _adapt_inputs(
     attention_implementation: str,
     key: torch.Tensor,
     value: torch.Tensor,
-):
-  """Adapt torch.F.scaled_dot_product_attention inputs."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Converts [B, K, S, H] key/value to the lrt_transposed_attention layout."""
   if attention_implementation == 'lrt_transposed_attention':
     b, n, s, h = key.shape
     key = key.reshape(1, b * n, s, h)
     value = value.reshape(1, b * n, s, h).permute(0, 1, 3, 2)
-  elif attention_implementation == 'sdpa':
-    pass
   else:
     raise ValueError(
         f'Unsupported attention implementation: {attention_implementation}'
     )
 
   return key, value
+
+
+def _reference_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_key_value_groups: int,
+    scaling: float | None,
+    softcap: float | None,
+) -> torch.Tensor:
+  """Eager attention reference with optional logit softcapping.
+
+  HF's `sdpa` attention cannot be used as the reference: it ignores `softcap`
+  in older transformers releases and rejects it in newer ones.
+
+  Args:
+    query: Query tensor of shape [B, N, T, H].
+    key: Key tensor of shape [B, K, S, H].
+    value: Value tensor of shape [B, K, S, H].
+    attention_mask: Additive mask broadcastable to [B, N, T, S].
+    num_key_value_groups: Number of query heads per key/value head (N // K).
+    scaling: Logit scale; defaults to 1 / sqrt(H).
+    softcap: Optional logit softcap.
+
+  Returns:
+    The attention output of shape [B, T, N, H].
+  """
+  if scaling is None:
+    scaling = query.shape[-1] ** -0.5
+  key = key.repeat_interleave(num_key_value_groups, dim=1)
+  value = value.repeat_interleave(num_key_value_groups, dim=1)
+  logits = torch.matmul(query, key.transpose(-2, -1)) * scaling
+  if softcap is not None:
+    logits = torch.tanh(logits / softcap) * softcap
+  probs = torch.softmax(logits + attention_mask, dim=-1)
+  return torch.matmul(probs, value).transpose(1, 2)
 
 
 class DummyAttentionModule(torch.nn.Module):
@@ -63,8 +98,8 @@ class DummyAttentionModule(torch.nn.Module):
     """Initializes the dummy attention module.
 
     Args:
-      attention_implementation: The attention implementation to test, either
-        'sdpa' or 'lrt_transposed_attention'.
+      attention_implementation: The attention implementation to test. Only
+        'lrt_transposed_attention' is supported.
       num_key_value_groups: The number of key value groups.
       scaling: The scaling factor to pass to the attention layer.
       softcap: The softcap factor to pass to the attention layer.
@@ -112,12 +147,14 @@ class AttentionTest(parameterized.TestCase):
       ),
   )
   def test_attention(self, num_query_heads, num_key_value_heads):
+    torch.manual_seed(0)
     batch_size = [1, 3]
     seq_len = [1, 5]
     context_len = [10]
     head_dim = [8]
     scaling = [None, 0.5]
-    softcap = [None, 42]
+    # A small softcap visibly changes the outputs; a large one is near-identity.
+    softcap = [None, 1.0, 42.0]
 
     for b, t, s, h, scl, scp in itertools.product(
         batch_size, seq_len, context_len, head_dim, scaling, softcap
@@ -132,12 +169,6 @@ class AttentionTest(parameterized.TestCase):
         mask = torch.tensor(mask[None, None, :, :], dtype=torch.bool)
         mask = mask.logical_not() * -400.0
 
-        attn = DummyAttentionModule(
-            attention_implementation='sdpa',
-            num_key_value_groups=num_key_value_groups,
-            scaling=scl,
-            softcap=scp,
-        )
         test_attn = DummyAttentionModule(
             attention_implementation='lrt_transposed_attention',
             num_key_value_groups=num_key_value_groups,
@@ -148,14 +179,21 @@ class AttentionTest(parameterized.TestCase):
             'k_ts_idx': 2,
             'v_ts_idx': 3,
         }
-        expected = attn(query, key, value, mask)
-        actual = test_attn(query, key, value, mask, **attention_kwargs)
-        self.assertTrue(
-            torch.allclose(
-                expected, actual, rtol=1e-2, atol=1e-2, equal_nan=True
-            ),
-            f'Expected: {expected},  Actual: {actual}',
+        expected = _reference_attention(
+            query, key, value, mask, num_key_value_groups, scl, scp
         )
+        actual = test_attn(query, key, value, mask, **attention_kwargs)
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+        if scp == 1.0 and t > 1:
+          # Make sure this softcap meaningfully changes the result, so the
+          # comparison above actually covers softcapping. With t == 1 only one
+          # key is unmasked, so softcap cannot change the output.
+          uncapped = _reference_attention(
+              query, key, value, mask, num_key_value_groups, scl, None
+          )
+          self.assertFalse(
+              torch.allclose(expected, uncapped, rtol=1e-2, atol=1e-2)
+          )
 
 
 class TransposedAttentionIsCausalTest(parameterized.TestCase):
