@@ -38,8 +38,18 @@ class SdpaCompositeTest(parameterized.TestCase):
     self.assertFalse(config.externalize_weights)
     for flag_name in exportable_module_config._GPU_OPTIMIZATION_FLAGS:
       self.assertFalse(getattr(config, flag_name), msg=flag_name)
+    self.assertTrue(config.use_rope_composite)
     self.assertFalse(config.prefill_logits)
     self.assertEqual(config.cache_length, 4096)
+
+  def test_rope_composite_defaults_by_split_cache(self):
+    self.assertTrue(_config().use_rope_composite)
+    self.assertFalse(_config(use_rope_composite=False).use_rope_composite)
+    self.assertFalse(_config(split_cache=True).use_rope_composite)
+    self.assertFalse(_config(aot_backend="qualcomm").use_rope_composite)
+    self.assertTrue(
+        _config(split_cache=True, use_rope_composite=True).use_rope_composite
+    )
 
   def test_composite_implies_apply_gpu_composites(self):
     config = _config(use_sdpa_composite=True)
@@ -53,6 +63,7 @@ class SdpaCompositeTest(parameterized.TestCase):
     self.assertTrue(config.apply_gpu_composites)
     for flag_name in exportable_module_config._GPU_OPTIMIZATION_FLAGS:
       self.assertTrue(getattr(config, flag_name), msg=flag_name)
+    self.assertTrue(config.use_rope_composite)
     self.assertTrue(config.prefill_logits)
     self.assertGreater(config.cache_length, 4096)
     self.assertEqual(config.cache_lengths, [4096])
@@ -60,16 +71,17 @@ class SdpaCompositeTest(parameterized.TestCase):
   def test_apply_gpu_composites_respects_explicit_overrides(self):
     config = _config(
         apply_gpu_composites=True,
+        use_rope_composite=False,
         use_short_conv_composite=False,
         use_sdpa_composite=False,
         use_bool_mask=False,
     )
+    self.assertFalse(config.use_rope_composite)
     self.assertFalse(config.use_short_conv_composite)
     self.assertFalse(config.use_sdpa_composite)
     self.assertFalse(config.use_bool_mask)
     self.assertTrue(config.use_qkv_norm_rope_composite)
     self.assertTrue(config.use_swiglu_composite)
-    self.assertTrue(config.use_rope_composite)
 
   def test_apply_gpu_composites_respects_fusion_and_dynamic_shape_flags(self):
     config = _config(

@@ -178,7 +178,10 @@ def export(
       numbers) for prefill lengths.
     enable_gpu_dynamic_cache: Whether to enable GPU dynamic shapes (magic
       numbers) for cache length.
-    use_rope_composite: Whether to enable the RoPE composite.
+    use_rope_composite: Whether to enable the `odml.rope` composite. Defaults to
+      `True` when RoPE is not externalized (`split_cache=False`) so GPU fp16
+      inference computes rotary angles in fp32 past token position 2048, and
+      `False` when `split_cache=True`.
     use_qkv_norm_rope_composite: Whether to enable the QKV norm rope composite.
     use_sdpa_composite: Whether to enable the fused transposed SDPA composite in
       both prefill and decode signatures.

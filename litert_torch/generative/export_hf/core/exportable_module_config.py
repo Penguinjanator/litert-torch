@@ -62,10 +62,13 @@ _DEPRECATED_EXTRA_KWARGS = frozenset({
 
 # GPU composite and fusion flags that default to `True` when
 # `apply_gpu_composites=True` and `False` otherwise, unless explicitly set.
+# `use_rope_composite` is resolved separately: `odml.rope` keeps rotary angle
+# computation in fp32 on GPU (avoiding fp16 position rounding past token 2048)
+# while remaining compatible with CPU via its embedded decomposition, so it
+# defaults to `True` whenever RoPE is not externalized (`split_cache=False`).
 _GPU_OPTIMIZATION_FLAGS = (
     "fuse_gate_up",
     "fuse_qkv",
-    "use_rope_composite",
     "use_swiglu_composite",
     "use_qkv_norm_rope_composite",
     "use_short_conv_composite",
@@ -433,6 +436,11 @@ class ExportableModuleConfig:
       if self.cache_implementation is None:
         self.cache_implementation = "LiteRTLMSplitCache"
       self.moe_exports_implementation = "litert_moe_sequential"
+
+    if self.use_rope_composite is None:
+      self.use_rope_composite = bool(
+          self.apply_gpu_composites or not self.externalize_rope
+      )
 
     if self.enable_gpu_dynamic_prefill or self.enable_gpu_dynamic_cache:
       if self.enable_dynamic_shape:
