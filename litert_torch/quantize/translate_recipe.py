@@ -15,7 +15,7 @@
 
 from litert_torch.generative.quantize import quant_attrs
 from litert_torch.generative.quantize import quant_recipe
-from ai_edge_quantizer import quantizer
+from litert_quantizer import quantizer
 
 _ComputePrecision = quantizer.qtyping.ComputePrecision
 _QuantGranularity = quantizer.qtyping.QuantGranularity

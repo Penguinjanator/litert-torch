@@ -28,12 +28,12 @@ from litert_torch.generative.export_hf.experimental.calib import quant_utils
 from litert_torch.generative.export_hf.experimental.litertlm_bundle import litertlm_bundle as litertlm_utils
 import numpy as np
 
-from ai_edge_quantizer import algorithm_manager
-from ai_edge_quantizer import qtyping
-from ai_edge_quantizer import quantizer
-from ai_edge_quantizer.algorithms.uniform_quantize import naive_min_max_quantize
-from ai_edge_quantizer.utils import calibration_utils
 from litert_converter.tools import model_utils as mu
+from litert_quantizer import algorithm_manager
+from litert_quantizer import qtyping
+from litert_quantizer import quantizer
+from litert_quantizer.algorithms.uniform_quantize import naive_min_max_quantize
+from litert_quantizer.utils import calibration_utils
 
 gfile = None
 

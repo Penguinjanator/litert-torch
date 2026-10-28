@@ -29,15 +29,15 @@ import torch
 from torch import nn
 import transformers
 
+from litert_quantizer import qtyping
+from litert_quantizer import quantizer as quantizer_lib
+from litert_quantizer import recipe_manager as recipe_manager_lib
 try:
   from litert_lm_builder.runtime.proto import image_gen_model_type_pb2
   from litert_lm_builder.runtime.proto import text2image_metadata_pb2
 except ImportError:
   image_gen_model_type_pb2 = None
   text2image_metadata_pb2 = None
-from ai_edge_quantizer import qtyping
-from ai_edge_quantizer import quantizer as quantizer_lib
-from ai_edge_quantizer import recipe_manager as recipe_manager_lib
 from ai_edge_litert import schema_py_generated as schema_fb
 
 _DEFAULT_QWEN3_CONFIG = {

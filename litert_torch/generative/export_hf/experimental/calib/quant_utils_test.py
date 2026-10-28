@@ -25,8 +25,8 @@ from litert_torch.generative.export_hf.experimental.calib import tokenizer as to
 import numpy as np
 import transformers
 
-from ai_edge_quantizer import qtyping
-from ai_edge_quantizer import quantizer
+from litert_quantizer import qtyping
+from litert_quantizer import quantizer
 
 
 class QuantUtilsChatTemplateTest(absltest.TestCase):

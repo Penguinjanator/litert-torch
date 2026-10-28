@@ -24,10 +24,10 @@ from litert_torch.generative.export_hf.experimental.calib import tokenizer as to
 import numpy as np
 import torch
 
-from ai_edge_quantizer import calibrator
-from ai_edge_quantizer import qtyping
-from ai_edge_quantizer.algorithms.uniform_quantize import uniform_quantize_tensor
-from ai_edge_quantizer.utils import qsv_utils as qsu
+from litert_quantizer import calibrator
+from litert_quantizer import qtyping
+from litert_quantizer.algorithms.uniform_quantize import uniform_quantize_tensor
+from litert_quantizer.utils import qsv_utils as qsu
 
 TokenizerConfig = tokenizer_lib.TokenizerConfig
 Request = tokenizer_lib.Request

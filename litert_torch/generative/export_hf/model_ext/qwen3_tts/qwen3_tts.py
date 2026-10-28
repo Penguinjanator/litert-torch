@@ -36,7 +36,7 @@ import safetensors
 import safetensors.torch
 import torch
 
-from ai_edge_quantizer import recipe as recipe_lib
+from litert_quantizer import recipe as recipe_lib
 
 _TALKER_SYNTH_CONFIG = {
     "architectures": ["Qwen3ForCausalLM"],

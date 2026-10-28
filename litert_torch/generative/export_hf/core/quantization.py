@@ -21,9 +21,9 @@ import cycle.
 
 from litert_torch import progress
 
-from ai_edge_quantizer import quantizer as quantizer_lib
-from ai_edge_quantizer import recipe as recipe_lib
-from ai_edge_quantizer import recipe_manager
+from litert_quantizer import quantizer as quantizer_lib
+from litert_quantizer import recipe as recipe_lib
+from litert_quantizer import recipe_manager
 
 
 def _dynamic_wi8_emb4_afp32():
@@ -67,7 +67,7 @@ def maybe_quantize_model(
 
   Args:
     model_path: Path of the float .tflite model.
-    quantization_recipe: An `ai_edge_quantizer` recipe name, a local recipe name
+    quantization_recipe: A `litert_quantizer` recipe name, a local recipe name
       or a path to a `.json` recipe. `None`, `''`, `'none'`, `'null'` and
       `'false'` disable quantization.
 
@@ -97,7 +97,7 @@ def quantize_model(
 
   Args:
     model_path: Path of the float .tflite model.
-    quantization_recipe: An `ai_edge_quantizer` recipe name, a local recipe name
+    quantization_recipe: A `litert_quantizer` recipe name, a local recipe name
       or a path to a `.json` recipe.
 
   Returns:

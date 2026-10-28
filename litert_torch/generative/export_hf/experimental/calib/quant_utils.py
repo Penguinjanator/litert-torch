@@ -23,13 +23,13 @@ from typing import Any
 
 from litert_torch.generative.export_hf.experimental.calib import tokenizer as tokenizer_lib
 
-from ai_edge_quantizer import qtyping
-from ai_edge_quantizer import quantizer
-from ai_edge_quantizer.algorithms.uniform_quantize import naive_min_max_quantize
-from ai_edge_quantizer.algorithms.utils import common_utils
-from ai_edge_quantizer.utils import calibration_utils as cu
-from ai_edge_quantizer.utils import qsv_utils as qsu
-from ai_edge_quantizer.utils import tfl_flatbuffer_utils
+from litert_quantizer import qtyping
+from litert_quantizer import quantizer
+from litert_quantizer.algorithms.uniform_quantize import naive_min_max_quantize
+from litert_quantizer.algorithms.utils import common_utils
+from litert_quantizer.utils import calibration_utils as cu
+from litert_quantizer.utils import qsv_utils as qsu
+from litert_quantizer.utils import tfl_flatbuffer_utils
 class gfile:
   @staticmethod
   def Exists(path): return os.path.exists(path)
