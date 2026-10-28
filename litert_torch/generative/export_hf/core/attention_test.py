@@ -23,8 +23,10 @@ import litert_torch.generative.export_hf.core.attention  # pylint: disable=unuse
 from litert_torch.generative.export_hf.core import attention as attention_lib
 from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core import exportable_module_config
+from litert_torch.generative.export_hf.model_ext import extension as model_ext_extension
 import numpy as np
 import torch
+import transformers
 from transformers import modeling_utils
 
 from absl.testing import absltest as googletest
@@ -288,6 +290,65 @@ class TransposedAttentionIsCausalTest(parameterized.TestCase):
         export_config=config,
     )
     self.assertEqual(exportable.attention_kwargs()['sdpa_is_causal'], expected)
+
+  def test_extension_controls_is_causal_text_model(self):
+    class _OutOfTreeCausalExt(model_ext_extension.ModelExtension):
+      model_types = ('unseen_causal_arch',)
+      is_causal_text_model = True
+
+    class _OutOfTreeNonCausalExt(model_ext_extension.ModelExtension):
+      model_types = ('gemma3_text',)
+      is_causal_text_model = False
+
+    model_cfg = transformers.PretrainedConfig(
+        model_type='unseen_causal_arch',
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        hidden_size=32,
+    )
+    model = torch.nn.Module()
+    model.config = model_cfg
+
+    # Without extension: unseen arch is not causal-opted-in.
+    base_cfg = exportable_module_config.ExportableModuleConfig(model='dummy')
+    base_prefill = (
+        exportable_module.LiteRTExportableModuleForDecoderOnlyLMPrefill(
+            model=model,
+            export_config=base_cfg,
+        )
+    )
+    self.assertFalse(base_prefill.attention_kwargs()['sdpa_is_causal'])
+
+    # With out-of-tree extension: sdpa_is_causal activates.
+    ext_cfg = exportable_module_config.ExportableModuleConfig(
+        model='dummy',
+        model_extension=_OutOfTreeCausalExt(),
+    )
+    ext_prefill = (
+        exportable_module.LiteRTExportableModuleForDecoderOnlyLMPrefill(
+            model=model,
+            export_config=ext_cfg,
+        )
+    )
+    self.assertTrue(ext_prefill.attention_kwargs()['sdpa_is_causal'])
+
+    # Explicit False on an extension overrides core's built-in allowlist.
+    override_model = torch.nn.Module()
+    override_model.config = transformers.PretrainedConfig(
+        model_type='gemma3_text'
+    )
+    override_prefill = (
+        exportable_module.LiteRTExportableModuleForDecoderOnlyLMPrefill(
+            model=override_model,
+            export_config=exportable_module_config.ExportableModuleConfig(
+                model='dummy',
+                model_extension=_OutOfTreeNonCausalExt(),
+            ),
+        )
+    )
+    self.assertFalse(override_prefill.attention_kwargs()['sdpa_is_causal'])
 
 
 if __name__ == '__main__':

@@ -313,6 +313,65 @@ class HFCheckpointWeightsLoaderTest(absltest.TestCase):
           self.create_tempdir().full_path
       )
 
+  def test_extension_extra_prefixes_and_fused_specs_and_resolver(self):
+    ckpt_dir = self.create_tempdir().full_path
+    tensors = {
+        "backbone.embed_tokens.weight": torch.randn(8, 4),
+        "backbone.layers.0.mlp.w1.weight": torch.randn(6, 4),
+        "backbone.layers.0.mlp.w3.weight": torch.randn(6, 4),
+        "backbone.layers.0.attn.col_a.weight": torch.randn(4, 2),
+        "backbone.layers.0.attn.col_b.weight": torch.randn(4, 2),
+        "raw_packed.proj_t": torch.randn(3, 5),
+    }
+    safetensors.torch.save_file(
+        tensors, os.path.join(ckpt_dir, "model.safetensors")
+    )
+
+    def _custom_resolver(param_name, try_load):
+      if param_name.endswith("transposed_proj.weight"):
+        raw = try_load("raw_packed.proj_t")
+        return raw.t().contiguous() if raw is not None else None
+      return None
+
+    loader = weights_loader_lib.HFCheckpointWeightsLoader(
+        ckpt_dir,
+        tie_word_embeddings=True,
+        extra_prefixes=("backbone",),
+        extra_fused_specs=(
+            ("w13", ("w1", "w3")),
+            ("col_ab", ("col_a", "col_b"), 1),
+        ),
+        tensor_resolver=_custom_resolver,
+    )
+    torch.testing.assert_close(
+        loader("model.lm_head.weight"),
+        tensors["backbone.embed_tokens.weight"],
+    )
+    torch.testing.assert_close(
+        loader("model.layers.0.mlp.w13.weight"),
+        torch.cat(
+            [
+                tensors["backbone.layers.0.mlp.w1.weight"],
+                tensors["backbone.layers.0.mlp.w3.weight"],
+            ],
+            dim=0,
+        ),
+    )
+    torch.testing.assert_close(
+        loader("model.layers.0.attn.col_ab.weight"),
+        torch.cat(
+            [
+                tensors["backbone.layers.0.attn.col_a.weight"],
+                tensors["backbone.layers.0.attn.col_b.weight"],
+            ],
+            dim=1,
+        ),
+    )
+    torch.testing.assert_close(
+        loader("model.layers.0.transposed_proj.weight"),
+        tensors["raw_packed.proj_t"].t(),
+    )
+
 
 class ResolveCheckpointDirTest(absltest.TestCase):
 

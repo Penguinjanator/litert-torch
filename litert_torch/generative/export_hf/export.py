@@ -21,14 +21,132 @@ import shutil
 import tempfile
 from typing import Any
 import warnings
+
 from litert_torch import progress
 from litert_torch.generative.export_hf import export_utils
+from litert_torch.generative.export_hf import model_ext as _
 from litert_torch.generative.export_hf.core import export_lib
 from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.core import litert_lm_builder
+from litert_torch.generative.export_hf.model_ext import extension as model_ext_extension
 
 ExportTask = exportable_module_config.ExportTask
+
+
+def _build_export_tasks(
+    export_config: exportable_module.ExportableModuleConfig,
+) -> tuple[list[Any], bool]:
+  """Builds the ordered export pipeline stage list from `export_config`.
+
+  Extracted as a pure helper so `run_export_tasks` can recompute the task list
+  automatically when `ModelExtension.update_export_config` toggles flags such
+  as `externalize_embedder`, `split_cache`, or `export_vision_encoder`.
+
+  Args:
+    export_config: Current `ExportableModuleConfig`.
+
+  Returns:
+    A 2-tuple `(export_tasks, legacy_compile_triggered)` containing the ordered
+    stage callables and whether the deprecated pre-package AOT path was added.
+  """
+  task = export_config.task
+  export_tasks = []
+  legacy_compile_triggered = False
+
+  if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
+    if export_config.bundle_litert_lm:
+      export_tasks.append(export_lib.export_text_prefill_decode_model)
+      if export_config.externalize_embedder:
+        export_tasks.append(export_lib.export_embedder_model)
+      if export_config.export_audio_encoder:
+        export_tasks.append(export_lib.export_audio_encoder_models)
+      export_tasks.append(export_lib.export_tokenizer)
+      export_tasks.append(litert_lm_builder.package_model)
+    else:
+      export_tasks.append(export_lib.export_asr_models)
+      if export_config.aot_backend is not None:
+        export_tasks.append(export_lib.aot_compile_model)
+        legacy_compile_triggered = True
+  elif task == ExportTask.TEXT_TO_SPEECH:
+    export_tasks.append(export_lib.export_tts_models)
+    if export_config.aot_backend is not None:
+      export_tasks.append(export_lib.aot_compile_model)
+      legacy_compile_triggered = True
+  elif task == ExportTask.TEXT_TO_IMAGE:
+    export_tasks.append(export_lib.export_image_gen_models)
+    export_tasks.append(export_lib.export_tokenizer)
+    if export_config.bundle_litert_lm:
+      export_tasks.append(litert_lm_builder.package_model)
+  elif task == ExportTask.ANY_TO_ANY:
+    export_tasks.append(export_lib.export_any2any_models)
+    export_tasks.append(export_lib.export_tokenizer)
+    if export_config.bundle_litert_lm:
+      export_tasks.append(litert_lm_builder.package_model)
+  else:
+    # Submodule exports must run before prefill/decode: with Converter V2 and
+    # `delete_in_memory_params`, prefill/decode frees the model's parameters.
+    if export_config.externalize_embedder:
+      export_tasks.append(export_lib.export_embedder_model)
+    export_tasks.append(export_lib.export_additional_models)
+    if export_config.export_vision_encoder:
+      export_tasks.append(export_lib.export_vision_encoder_models)
+    if export_config.export_audio_encoder:
+      export_tasks.append(export_lib.export_audio_encoder_models_for_llm)
+    export_tasks.append(export_lib.export_text_prefill_decode_model)
+    if (
+        export_config.aot_backend is not None
+        and not export_config.use_litert_lm_compiler
+    ):
+      export_tasks.append(export_lib.aot_compile_model)
+      legacy_compile_triggered = True
+    if export_config.split_cache:
+      export_tasks.append(export_lib.export_auxiliary_model)
+    export_tasks.append(export_lib.export_tokenizer)
+    if export_config.bundle_litert_lm:
+      export_tasks.append(litert_lm_builder.package_model)
+
+  return export_tasks, legacy_compile_triggered
+
+
+def _should_run_compilation_pipeline(
+    export_config: exportable_module.ExportableModuleConfig,
+) -> bool:
+  """Returns whether the post-export NPU compilation/calibration pipeline runs."""
+  return (
+      export_config.aot_backend is not None
+      and export_config.use_litert_lm_compiler
+  ) or export_config.calibration_dataset_dir is not None
+
+
+def _warn_if_legacy_compile(
+    task: ExportTask | str, legacy_compile_triggered: bool
+) -> None:
+  """Prints a deprecation warning when the legacy AOT compile task is scheduled."""
+  if not legacy_compile_triggered:
+    return
+  if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
+    print(
+        '\nWARNING: The legacy AOT compiler path (compiling individual models'
+        ' before packaging) is deprecated and will be removed soon. ASR task'
+        ' compilation will be migrated to the new package-based compiler'
+        ' path in a future release.\n'
+    )
+  elif task == ExportTask.TEXT_TO_SPEECH:
+    print(
+        '\nWARNING: The legacy AOT compiler path (compiling individual models'
+        ' before packaging) is deprecated and will be removed soon. TTS task'
+        ' compilation will be migrated to the new package-based compiler'
+        ' path in a future release.\n'
+    )
+  else:
+    print(
+        '\nWARNING: The legacy AOT compiler path (compiling individual models'
+        ' before packaging) is deprecated and will be removed soon. Please'
+        ' switch to the new LiteRT-LM compiler by passing'
+        ' --use_litert_lm_compiler=True, or use the unified PTQ calibration'
+        ' pipeline by passing --dataset_dir.\n'
+    )
 
 
 @progress.task('LiteRT GenAI Export')
@@ -48,9 +166,20 @@ def run_export_tasks(
       auto_model_override=auto_model_override,
       task=task,
   )
-  export_config = export_lib.update_export_config(
+  prev_default_tasks, prev_legacy_compile = _build_export_tasks(export_config)
+  updated_config = export_lib.update_export_config(
       export_config, source_model_artifacts
   )
+  if updated_config is not export_config:
+    for field in dataclasses.fields(export_config):
+      setattr(export_config, field.name, getattr(updated_config, field.name))
+    export_utils.validate_pipeline_config(export_config)
+    if _should_run_compilation_pipeline(export_config):
+      export_config.keep_temporary_files = True
+  if export_tasks == prev_default_tasks:
+    export_tasks, new_legacy_compile = _build_export_tasks(export_config)
+    if new_legacy_compile and not prev_legacy_compile:
+      _warn_if_legacy_compile(export_config.task, new_legacy_compile)
 
   exported_model_artifacts = export_lib.ExportedModelArtifacts()
 
@@ -273,8 +402,9 @@ def export(
       sequence of extensions) customizing patching, exportables, and metadata
       for this export run (see `model_ext/extension.py`).
     extension_modules: Optional comma-separated string or list of dotted Python
-      module paths to import before export so `@register_model_extension`
-      decorators run (e.g. `['my_pkg.my_arch_extension']`).
+      module paths or `.py` file paths to import before export so custom
+      `ModelExtension` subclasses and their `extra_kwargs_keys` CLI flags are
+      registered (e.g. `['my_pkg.my_ext']` or `'./my_arch_extension.py'`).
     **kwargs: Additional keyword arguments to pass to the exportable module
       config.
 
@@ -293,6 +423,10 @@ def export(
     work_dir = tempfile.mkdtemp(dir=output_dir)
   else:
     work_dir = output_dir
+
+  if extension_modules:
+    model_ext_extension.load_extension_modules(extension_modules)
+  model_ext_extension.discover_entry_point_extensions()
 
   valid_fields = {
       f.name
@@ -323,89 +457,10 @@ def export(
   export_utils.validate_pipeline_config(export_config)
 
   # TODO(weiyiw): Move this to the exportable module config.
-  export_tasks = []
-  legacy_compile_triggered = False
+  export_tasks, legacy_compile_triggered = _build_export_tasks(export_config)
+  _warn_if_legacy_compile(task, legacy_compile_triggered)
 
-  if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
-    if export_config.bundle_litert_lm:
-      export_tasks.append(export_lib.export_text_prefill_decode_model)
-      if export_config.externalize_embedder:
-        export_tasks.append(export_lib.export_embedder_model)
-      if export_config.export_audio_encoder:
-        export_tasks.append(export_lib.export_audio_encoder_models)
-      export_tasks.append(export_lib.export_tokenizer)
-      export_tasks.append(litert_lm_builder.package_model)
-    else:
-      export_tasks.append(export_lib.export_asr_models)
-      if export_config.aot_backend is not None:
-        export_tasks.append(export_lib.aot_compile_model)
-        legacy_compile_triggered = True
-  elif task == ExportTask.TEXT_TO_SPEECH:
-    export_tasks.append(export_lib.export_tts_models)
-    if export_config.aot_backend is not None:
-      export_tasks.append(export_lib.aot_compile_model)
-      legacy_compile_triggered = True
-  elif task == ExportTask.TEXT_TO_IMAGE:
-    export_tasks.append(export_lib.export_image_gen_models)
-    export_tasks.append(export_lib.export_tokenizer)
-    if export_config.bundle_litert_lm:
-      export_tasks.append(litert_lm_builder.package_model)
-  elif task == ExportTask.ANY_TO_ANY:
-    export_tasks.append(export_lib.export_any2any_models)
-    export_tasks.append(export_lib.export_tokenizer)
-    if export_config.bundle_litert_lm:
-      export_tasks.append(litert_lm_builder.package_model)
-  else:
-    # Submodule exports must run before prefill/decode: with Converter V2 and
-    # `delete_in_memory_params`, prefill/decode frees the model's parameters.
-    if export_config.externalize_embedder:
-      export_tasks.append(export_lib.export_embedder_model)
-    export_tasks.append(export_lib.export_additional_models)
-    if export_config.export_vision_encoder:
-      export_tasks.append(export_lib.export_vision_encoder_models)
-    if export_config.export_audio_encoder:
-      export_tasks.append(export_lib.export_audio_encoder_models_for_llm)
-    export_tasks.append(export_lib.export_text_prefill_decode_model)
-    if (
-        export_config.aot_backend is not None
-        and not export_config.use_litert_lm_compiler
-    ):
-      export_tasks.append(export_lib.aot_compile_model)
-      legacy_compile_triggered = True
-    if export_config.split_cache:
-      export_tasks.append(export_lib.export_auxiliary_model)
-    export_tasks.append(export_lib.export_tokenizer)
-    if export_config.bundle_litert_lm:
-      export_tasks.append(litert_lm_builder.package_model)
-
-  if legacy_compile_triggered:
-    if task == ExportTask.AUTOMATIC_SPEECH_RECOGNITION:
-      print(
-          '\nWARNING: The legacy AOT compiler path (compiling individual models'
-          ' before packaging) is deprecated and will be removed soon. ASR task'
-          ' compilation will be migrated to the new package-based compiler'
-          ' path in a future release.\n'
-      )
-    elif task == ExportTask.TEXT_TO_SPEECH:
-      print(
-          '\nWARNING: The legacy AOT compiler path (compiling individual models'
-          ' before packaging) is deprecated and will be removed soon. TTS task'
-          ' compilation will be migrated to the new package-based compiler'
-          ' path in a future release.\n'
-      )
-    else:
-      print(
-          '\nWARNING: The legacy AOT compiler path (compiling individual models'
-          ' before packaging) is deprecated and will be removed soon. Please'
-          ' switch to the new LiteRT-LM compiler by passing'
-          ' --use_litert_lm_compiler=True, or use the unified PTQ calibration'
-          ' pipeline by passing --dataset_dir.\n'
-      )
-
-  run_compilation_pipeline = (
-      export_config.aot_backend is not None
-      and export_config.use_litert_lm_compiler
-  ) or export_config.calibration_dataset_dir is not None
+  run_compilation_pipeline = _should_run_compilation_pipeline(export_config)
 
   orig_keep_temp = export_config.keep_temporary_files
   if run_compilation_pipeline:
@@ -415,6 +470,8 @@ def export(
       export_tasks,
       export_config,
   )
+
+  run_compilation_pipeline = _should_run_compilation_pipeline(export_config)
 
   if run_compilation_pipeline:
     temp_litertlm = exported_model_artifacts.litert_lm_model_path

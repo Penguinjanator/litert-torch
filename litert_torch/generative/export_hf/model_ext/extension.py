@@ -17,27 +17,39 @@
 This module defines the `ModelExtension` interface and discovery/registration
 utilities that decouple model-specific customization from the core `export_hf`
 pipeline. Both built-in architectures under `model_ext/<arch>/extension.py` and
-out-of-tree user plugins implement `ModelExtension` to customize stages of the
-export lifecycle:
+zero-touch out-of-tree user plugins implement `ModelExtension` to customize
+every stage of the export lifecycle:
 
-1. **Checkpoint & Config Resolution**:
+1. **Checkpoint, Config & CLI Flag Resolution**:
+   - `extra_kwargs_keys` registers architecture-specific CLI / `export(...)`
+     keyword arguments (see `model_ext/gemma4/extension.py`).
    - `match_checkpoint` / `is_matching_tts_checkpoint` identify checkpoints
      that omit a standard HuggingFace `model_type` (e.g. Diffusers pipelines in
      `model_ext/bonsai_flux2/extension.py` or typeless TTS checkpoints in
      `model_ext/kokoro_tts/extension.py`).
+   - `load_config` loads custom `PretrainedConfig` objects for architectures
+     not registered in `transformers.AutoConfig`.
    - `update_export_config` validates or mutates `ExportableModuleConfig` flags
-     once the model config is loaded.
+     once the model config is loaded (rebuilding default export tasks when
+     flags change).
 2. **Model Loading & Runtime Patching**:
-   - `patch_context` applies class-level patches around model construction so
-     custom layer classes are instantiated (see `model_ext/gemma3/patch.py` and
-     `model_ext/qwen3/patch.py`).
-   - Task-specific model wrapper selectors (`get_speech_model_cls`,
-     `get_tts_model_cls`, `get_image_gen_model_cls`, `get_any2any_model_cls`)
-     provide custom wrappers for non-causal-LM tasks.
-3. **Graph Tracing & Exportable Selection**:
+   - `patch_context` applies class-level patches around config and model
+     construction so custom layer classes are instantiated (see
+     `model_ext/gemma3/patch.py` and `model_ext/qwen3/patch.py`).
+   - `get_hf_model_cls` supplies custom `PreTrainedModel` or plain
+     `torch.nn.Module(config)` classes for text/multimodal LLM export when not
+     in `transformers` `AutoModel*` tables; task-specific selectors
+     (`get_speech_model_cls`, `get_tts_model_cls`, `get_image_gen_model_cls`,
+     `get_any2any_model_cls`) cover ASR, TTS, ImageGen, and Any2Any tasks.
+   - `checkpoint_key_prefixes`, `fused_weight_specs`, and
+     `resolve_checkpoint_tensor` customize Converter V2 (`use_v2=True`)
+     safetensors streaming without editing `core/weights_loader.py`.
+3. **Graph Tracing, Attention Semantics & Exportable Selection**:
    - `patch_model` applies instance-level module replacements around
      `torch.export` tracing (e.g. fusing QKV/MLP projections or injecting HLFB
      composites; see `model_ext/gemma3/patch.py` and `model_ext/lfm2/patch.py`).
+   - `is_causal_text_model` opts causal decoders into or out of `sdpa_is_causal`
+     GPU composite masks.
    - Exportable selectors (`get_prefill_decode_exportables`,
      `get_vision_exportables`, `get_audio_exportables`,
      `get_additional_exportables`, `get_speech_exportables`) supply the
@@ -52,8 +64,10 @@ export lifecycle:
 Extensions can be activated in three ways:
 - **In-process Python**: Pass `model_extension=MyExtension` (or a sequence of
   extensions) to `export.export(...)` or `ExportableModuleConfig`.
-- **CLI / dynamic import**: Decorate a subclass with
-  `@register_model_extension` and pass `--extension_modules=my_pkg.my_ext`.
+- **CLI / dynamic import**: Pass `--extension_modules=my_pkg.my_ext` or a
+  standalone `.py` path `--extension_modules=/path/to/my_ext.py` (subclasses
+  with non-empty `model_types` or `@register_model_extension` register
+  automatically).
 - **Installed wheel entry points**: Declare an entry point under group
   `litert_torch.model_extensions` in `pyproject.toml`.
 
@@ -62,16 +76,50 @@ are registered via `model_ext/builtin_extensions.py` with `override=False` so
 explicit user registrations take precedence.
 """
 
+from collections.abc import Callable, Sequence
 import contextlib
+import hashlib
 import importlib
 from importlib import metadata as importlib_metadata
-from typing import Any, Callable, ClassVar, NamedTuple, Sequence
+from importlib import util as importlib_util
+import os
+import sys
+import types
+from typing import Any, ClassVar, NamedTuple
 
 from litert_torch.generative.export_hf.core import exportable_module_config
 import transformers
 
 
 ENTRY_POINT_GROUP = 'litert_torch.model_extensions'
+
+
+class FusedWeightSpec(NamedTuple):
+  """Declares how a fused parameter is concatenated from checkpoint tensors.
+
+  Used by `ModelExtension.fused_weight_specs` and
+  `core.weights_loader.HFCheckpointWeightsLoader` during Converter V2
+  (`use_v2=True`) weight streaming when a runtime patch replaces separate
+  linear projections in a checkpoint with a single fused `nn.Linear`.
+
+  Example:
+    `FusedWeightSpec('w13_proj', ('w1_proj', 'w3_proj'), dim=0)` instructs
+    `HFCheckpointWeightsLoader` to materialize `...w13_proj.weight` (and
+    `.bias`) by concatenating `...w1_proj.weight` and `...w3_proj.weight` along
+    dimension 0.
+
+  Attributes:
+    fused_name: Submodule or attribute name of the fused projection in the
+      patched export model (matched as `*.{fused_name}.{suffix}`).
+    part_names: Ordered tuple of unfused checkpoint submodule names whose
+      tensors are concatenated to form `fused_name`.
+    dim: Dimension along which `part_names` tensors are concatenated (defaults
+      to `0`, the output-features axis of `torch.nn.Linear.weight`).
+  """
+
+  fused_name: str
+  part_names: tuple[str, ...]
+  dim: int = 0
 
 
 class VisionExportablesSpec(NamedTuple):
@@ -157,9 +205,35 @@ class ModelExtension:
   Attributes:
     model_types: Tuple or sequence of `config.json` `model_type` strings (or
       Diffusers `_class_name` identifiers) handled by this extension.
+    extra_kwargs_keys: Architecture-specific flag names accepted in
+      `ExportableModuleConfig.extra_kwargs` and `--<flag>` CLI arguments (see
+      `model_ext/gemma4/extension.py` for an example).
+    is_causal_text_model: Optional boolean controlling `sdpa_is_causal` on
+      text-generation exports. Set to `True` on out-of-tree causal decoder-only
+      models so GPU composite SDPA (`sdpa_is_causal`) is enabled automatically,
+      or `False` for prefix/bidirectional text models; `None` defers to core.
+    sliding_window_layers: Optional sliding-window attention layer policy when
+      `config.sliding_window` is set without `config.layer_types`. Set to
+      `'all'` when every decoder layer uses sliding-window attention (e.g.
+      Mistral-style uniform sliding window), or `'none'` to disable sliding
+      window masks even when `sliding_window` is present on `config`; `None`
+      defers to `config.layer_types` inspection.
+    checkpoint_key_prefixes: Additional key prefixes (e.g. `('backbone.',)`)
+      probed by `HFCheckpointWeightsLoader` when streaming safetensors weights
+      with `use_v2=True`.
+    fused_weight_specs: Sequence of `FusedWeightSpec` entries (or `(fused_name,
+      part_names)` 2-tuples) describing fused projections for Converter V2
+      weight streaming.
   """
 
   model_types: ClassVar[Sequence[str]] = ()
+  extra_kwargs_keys: ClassVar[Sequence[str]] = ()
+  is_causal_text_model: ClassVar[bool | None] = None
+  sliding_window_layers: ClassVar[str | None] = None
+  checkpoint_key_prefixes: ClassVar[Sequence[str]] = ()
+  fused_weight_specs: ClassVar[
+      Sequence[FusedWeightSpec | tuple[str, Sequence[str]]]
+  ] = ()
 
   def update_export_config(
       self,
@@ -168,10 +242,11 @@ class ModelExtension:
   ) -> exportable_module_config.ExportableModuleConfig:
     """Validates or updates `export_config` once `model_config` is loaded.
 
-    Invoked by the export pipeline after loading `model_config` and before
-    constructing or tracing exportable modules. Override this hook to enforce
-    architecture-specific invariants (e.g. requiring `externalize_embedder`) or
-    adjust default export flags based on model hyperparameters.
+    Invoked by the export pipeline after `load_model` (once `model_config` is
+    available) and before constructing or tracing exportable modules. Override
+    this hook to enforce architecture-specific invariants (e.g. requiring
+    `externalize_embedder`) or adjust default export flags based on model
+    hyperparameters.
 
     Args:
       export_config: Current `ExportableModuleConfig` for the export run.
@@ -594,6 +669,92 @@ class ModelExtension:
     del model_config
     return None
 
+  def resolve_checkpoint_tensor(
+      self,
+      param_name: str,
+      try_load: Callable[[str], Any],
+  ) -> Any | None:
+    """Resolves a custom parameter tensor during Converter V2 weight streaming.
+
+    Invoked by `core.weights_loader.HFCheckpointWeightsLoader` (`use_v2=True`
+    with `delete_in_memory_params=True`) before standard direct-name and
+    `fused_weight_specs` lookups. Use this hook when a patched module splits,
+    slices, transposes, or rescales checkpoint tensors in ways not expressible
+    via `checkpoint_key_prefixes` or `fused_weight_specs` (compare
+    `_MiniCpmOLlmWeightsLoader` in `model_ext/minicpm_o/minicpm_o.py`).
+
+    Args:
+      param_name: Export module parameter name requested by the converter.
+      try_load: Helper callable `(key_or_param_name) -> Tensor | None` that
+        searches candidate checkpoint prefixes in safetensors shards.
+
+    Returns:
+      A materialized `torch.Tensor` if handled by this extension, or `None` to
+      fall back to standard `HFCheckpointWeightsLoader` resolution.
+    """
+    del param_name, try_load
+    return None
+
+  def load_config(
+      self,
+      model_path: str,
+      export_config: exportable_module_config.ExportableModuleConfig,
+      trust_remote_code: bool = False,
+  ) -> transformers.PretrainedConfig | None:
+    """Loads a custom `PretrainedConfig` for out-of-tree architectures.
+
+    Invoked by `core/export_lib.py` before `transformers.AutoConfig` when an
+    active extension is resolved from `export_config` or `config.json`
+    `model_type`. Override this when exporting a new or custom architecture
+    whose config class is not registered in `transformers` and does not ship
+    `auto_map` remote code.
+
+    Args:
+      model_path: Local checkpoint directory or HuggingFace repo ID.
+      export_config: Active `ExportableModuleConfig`.
+      trust_remote_code: Whether remote code execution is enabled.
+
+    Returns:
+      A `transformers.PretrainedConfig` instance, or `None` to use standard
+      `AutoConfig.from_pretrained` loading.
+    """
+    del model_path, export_config, trust_remote_code
+    return None
+
+  def get_hf_model_cls(
+      self,
+      task: exportable_module_config.ExportTask | str,
+      model_config: transformers.PretrainedConfig,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ) -> Any | None:
+    """Returns a custom PyTorch/HF model class for LLM or multimodal tasks.
+
+    Invoked by `core/export_lib.py` during `load_model` for `text_generation`,
+    `image_text_to_text`, and `multimodal_lm` exports before falling back to
+    `transformers.AutoModelForCausalLM` / `AutoModelForImageTextToText`. The
+    returned class may be:
+    - An `AutoModel*`-style class exposing `.from_pretrained(...)` and
+      `.from_config(...)`,
+    - A `transformers.PreTrainedModel` subclass (loaded via `.from_pretrained`
+      or `._from_config`), or
+    - A plain `torch.nn.Module` subclass constructible as `cls(model_config)`
+      (weights are loaded automatically from `.safetensors` checkpoints via
+      `HFCheckpointWeightsLoader` when `delete_in_memory_params=False`, or
+      streamed on meta device when `use_v2=True` and
+      `delete_in_memory_params=True`).
+
+    Args:
+      task: Active export task (e.g. `ExportTask.TEXT_GENERATION`).
+      model_config: Loaded `PretrainedConfig`.
+      export_config: Active `ExportableModuleConfig`.
+
+    Returns:
+      A custom model class to instantiate, or `None` to use standard
+      `transformers.AutoModelFor*` classes.
+    """
+    del task, model_config, export_config
+    return None
+
 
 class CompositeModelExtension(ModelExtension):
   """Chains multiple `ModelExtension` instances in priority order.
@@ -623,6 +784,52 @@ class CompositeModelExtension(ModelExtension):
   def extensions(self) -> tuple[ModelExtension, ...]:
     """Returns the ordered tuple of underlying `ModelExtension` instances."""
     return self._extensions
+
+  @property
+  def is_causal_text_model(self) -> bool | None:  # pyrefly: ignore[bad-override]
+    """Returns the highest-priority non-`None` `is_causal_text_model` flag."""
+    for ext in reversed(self._extensions):
+      if ext.is_causal_text_model is not None:
+        return ext.is_causal_text_model
+    return None
+
+  @property
+  def sliding_window_layers(self) -> str | None:  # pyrefly: ignore[bad-override]
+    """Returns the highest-priority non-`None` `sliding_window_layers` policy."""
+    for ext in reversed(self._extensions):
+      if ext.sliding_window_layers is not None:
+        return ext.sliding_window_layers
+    return None
+
+  @property
+  def extra_kwargs_keys(self) -> tuple[str, ...]:  # pyrefly: ignore[bad-override]
+    """Returns the deduplicated union of `extra_kwargs_keys` across members."""
+    keys: list[str] = []
+    for ext in self._extensions:
+      for key in ext.extra_kwargs_keys:
+        if key and key not in keys:
+          keys.append(key)
+    return tuple(keys)
+
+  @property
+  def checkpoint_key_prefixes(self) -> tuple[str, ...]:  # pyrefly: ignore[bad-override]
+    """Returns the deduplicated union of `checkpoint_key_prefixes`."""
+    prefixes: list[str] = []
+    for ext in self._extensions:
+      for prefix in ext.checkpoint_key_prefixes:
+        if prefix and prefix not in prefixes:
+          prefixes.append(prefix)
+    return tuple(prefixes)
+
+  @property
+  def fused_weight_specs(  # pyrefly: ignore[bad-override]
+      self,
+  ) -> tuple[FusedWeightSpec | tuple[str, Sequence[str]], ...]:
+    """Returns `fused_weight_specs` ordered from highest to lowest priority."""
+    specs: list[FusedWeightSpec | tuple[str, Sequence[str]]] = []
+    for ext in reversed(self._extensions):
+      specs.extend(ext.fused_weight_specs)
+    return tuple(specs)
 
   def update_export_config(
       self,
@@ -812,6 +1019,46 @@ class CompositeModelExtension(ModelExtension):
         return res
     return None
 
+  def resolve_checkpoint_tensor(
+      self,
+      param_name: str,
+      try_load: Callable[[str], Any],
+  ) -> Any | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.resolve_checkpoint_tensor(param_name, try_load)
+      if res is not None:
+        return res
+    return None
+
+  def load_config(
+      self,
+      model_path: str,
+      export_config: exportable_module_config.ExportableModuleConfig,
+      trust_remote_code: bool = False,
+  ) -> transformers.PretrainedConfig | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.load_config(
+          model_path, export_config, trust_remote_code=trust_remote_code
+      )
+      if res is not None:
+        return res
+    return None
+
+  def get_hf_model_cls(
+      self,
+      task: exportable_module_config.ExportTask | str,
+      model_config: transformers.PretrainedConfig,
+      export_config: exportable_module_config.ExportableModuleConfig,
+  ) -> Any | None:
+    """See base class."""
+    for ext in reversed(self._extensions):
+      res = ext.get_hf_model_cls(task, model_config, export_config)
+      if res is not None:
+        return res
+    return None
+
 
 def compose_extensions(
     *extensions: ModelExtension | type[ModelExtension] | None,
@@ -859,6 +1106,16 @@ def compose_extensions(
 # Map of model_type -> ModelExtension instance.
 _EXTENSION_REGISTRY: dict[str, ModelExtension] = {}
 _ENTRY_POINTS_LOADED = False
+
+
+def _sync_registered_extra_kwargs() -> None:
+  """Synchronizes `exportable_module_config` extra_kwargs keys with registry."""
+  keys: list[str] = []
+  for ext in _EXTENSION_REGISTRY.values():
+    for key in getattr(ext, 'extra_kwargs_keys', ()):
+      if key and key not in keys:
+        keys.append(key)
+  exportable_module_config.reset_registered_extra_kwargs(keys)
 
 
 def _coerce_extension(
@@ -912,20 +1169,26 @@ def register_model_extension(
 
   def wrapper(ext_cls_or_instance: ModelExtension | type[ModelExtension]):
     instance = _coerce_extension(ext_cls_or_instance)
-    types = model_types
-    if types is None:
-      types = getattr(ext_cls_or_instance, 'model_types', ())
-    if isinstance(types, str):
-      types = (types,)
-    if not types:
+    types_to_register = model_types
+    if types_to_register is None:
+      types_to_register = getattr(ext_cls_or_instance, 'model_types', ())
+    if isinstance(types_to_register, str):
+      types_to_register = (types_to_register,)
+    if not types_to_register:
       raise ValueError(
           'register_model_extension requires non-empty model_types either via'
           ' argument or class attribute `model_types`.'
       )
-    for mt in types:
+    registered_any = False
+    for mt in types_to_register:
       if not override and mt in _EXTENSION_REGISTRY:
         continue
       _EXTENSION_REGISTRY[mt] = instance
+      registered_any = True
+    if registered_any and getattr(instance, 'extra_kwargs_keys', ()):
+      exportable_module_config.register_extra_kwargs_keys(
+          instance.extra_kwargs_keys
+      )
     return ext_cls_or_instance
 
   return wrapper
@@ -934,7 +1197,9 @@ def register_model_extension(
 def unregister_model_extension(model_type: str) -> ModelExtension | None:
   """Removes and returns the registered `ModelExtension` for `model_type`.
 
-  Primarily used in unit tests to clean up temporary extension registrations.
+  Also resynchronizes `ExportableModuleConfig`'s allowed `extra_kwargs_keys`
+  when the removed extension declared custom flags. Primarily used in unit
+  tests to clean up temporary registrations.
 
   Args:
     model_type: Registry key to remove.
@@ -943,7 +1208,10 @@ def unregister_model_extension(model_type: str) -> ModelExtension | None:
     The removed `ModelExtension` instance, or `None` if `model_type` was not
     registered.
   """
-  return _EXTENSION_REGISTRY.pop(model_type, None)
+  removed = _EXTENSION_REGISTRY.pop(model_type, None)
+  if removed is not None and getattr(removed, 'extra_kwargs_keys', ()):
+    _sync_registered_extra_kwargs()
+  return removed
 
 
 def registered_model_types() -> tuple[str, ...]:
@@ -951,17 +1219,105 @@ def registered_model_types() -> tuple[str, ...]:
   return tuple(_EXTENSION_REGISTRY.keys())
 
 
+def is_extension_file_path(spec: str) -> bool:
+  """Returns True if `spec` is a filesystem `.py` path rather than module name.
+
+  Args:
+    spec: Single entry from `extension_modules` (e.g. `'./my_ext.py'` or
+      `'my_pkg.my_ext'`).
+
+  Returns:
+    True when `spec` should be loaded via `load_extension_file` instead of
+    `importlib.import_module`.
+  """
+  if not spec:
+    return False
+  if spec.endswith('.py') or spec.startswith(('.', '~')):
+    return True
+  if os.sep in spec or (os.altsep and os.altsep in spec):
+    return True
+  return os.path.isfile(os.path.expanduser(spec))
+
+
+def load_extension_file(file_path: str) -> types.ModuleType:
+  """Loads a standalone Python extension `.py` file idempotently by path.
+
+  Assigns a deterministic synthetic module name derived from the canonical
+  absolute path so repeated calls return the cached module in `sys.modules`
+  without re-executing top-level registration side effects.
+
+  Args:
+    file_path: Relative, `~`-prefixed, or absolute path to an extension `.py`
+      file.
+
+  Returns:
+    The imported `types.ModuleType` object.
+
+  Raises:
+    FileNotFoundError: If `file_path` does not exist on disk.
+    ImportError: If `importlib` cannot construct a module spec for `file_path`.
+  """
+  abs_path = os.path.abspath(os.path.expanduser(file_path))
+  if not os.path.isfile(abs_path):
+    raise FileNotFoundError(
+        f'Extension module file not found: {file_path!r} (resolved to'
+        f' {abs_path!r}).'
+    )
+  stem = os.path.splitext(os.path.basename(abs_path))[0]
+  safe_stem = ''.join(
+      ch if ch.isidentifier() or ch.isdigit() else '_' for ch in stem
+  )
+  safe_stem = safe_stem or 'ext'
+  digest = hashlib.sha256(abs_path.encode('utf-8')).hexdigest()[:12]
+  mod_name = f'_litert_torch_ext_file_{safe_stem}_{digest}'
+  existing = sys.modules.get(mod_name)
+  if existing is not None:
+    return existing
+
+  spec = importlib_util.spec_from_file_location(mod_name, abs_path)
+  if spec is None or spec.loader is None:
+    raise ImportError(
+        f'Could not create module spec from extension file: {abs_path!r}.'
+    )
+  module = importlib_util.module_from_spec(spec)
+  sys.modules[mod_name] = module
+  try:
+    spec.loader.exec_module(module)
+  except Exception:
+    sys.modules.pop(mod_name, None)
+    raise
+  return module
+
+
+def _auto_register_module_extensions(mod: types.ModuleType) -> None:
+  """Registers any `ModelExtension` subclasses with `model_types` in `mod`."""
+  for obj in vars(mod).values():
+    if (
+        isinstance(obj, type)
+        and issubclass(obj, ModelExtension)
+        and obj is not ModelExtension
+        and obj is not CompositeModelExtension
+        and getattr(obj, '__module__', None) == mod.__name__
+        and getattr(obj, 'model_types', ())
+    ):
+      register_model_extension(override=True)(obj)
+
+
 def load_extension_modules(
     modules: Sequence[str] | str | None,
 ) -> None:
-  """Imports dotted Python module paths so their `@register_*` decorators run.
+  """Imports dotted Python modules or `.py` files to register extensions.
 
   Invoked automatically when `--extension_modules` /
-  `ExportableModuleConfig.extension_modules` is provided.
+  `ExportableModuleConfig.extension_modules` is provided. After importing each
+  module or standalone `.py` file, any `ModelExtension` subclass defined in
+  that module with non-empty `model_types` is also auto-registered with
+  `override=True` so user-supplied extension modules take precedence over
+  built-in registrations.
 
   Args:
     modules: Comma-separated string or sequence of importable dotted Python
-      module paths, or `None` for a no-op.
+      module names or filesystem paths to `.py` files, or `None` for a no-op.
   """
   if not modules:
     return
@@ -969,8 +1325,18 @@ def load_extension_modules(
     module_list = [m.strip() for m in modules.split(',') if m.strip()]
   else:
     module_list = [m.strip() for m in modules if m and m.strip()]
-  for module_path in module_list:
-    importlib.import_module(module_path)
+  for module_spec in module_list:
+    if is_extension_file_path(module_spec):
+      mod = load_extension_file(module_spec)
+    else:
+      mod = importlib.import_module(module_spec)
+    if isinstance(mod, types.ModuleType):
+      _auto_register_module_extensions(mod)
+
+
+def discover_entry_point_extensions(reload_entry_points: bool = False) -> None:
+  """Discovers and loads wheel plugins from `importlib.metadata` entry points."""
+  _load_entry_point_extensions(reload_entry_points=reload_entry_points)
 
 
 def _load_entry_point_extensions(reload_entry_points: bool = False) -> None:
@@ -1049,12 +1415,12 @@ def _extract_model_types(
     return [model_type_or_config] if model_type_or_config else []
   candidates: list[str] = []
   top_mt = getattr(model_type_or_config, 'model_type', None)
-  if top_mt:
+  if isinstance(top_mt, str) and top_mt:
     candidates.append(top_mt)
   text_cfg = getattr(model_type_or_config, 'text_config', None)
   if text_cfg is not None:
     text_mt = getattr(text_cfg, 'model_type', None)
-    if text_mt and text_mt not in candidates:
+    if isinstance(text_mt, str) and text_mt and text_mt not in candidates:
       candidates.append(text_mt)
   return candidates
 

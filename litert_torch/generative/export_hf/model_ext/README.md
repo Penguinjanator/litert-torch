@@ -7,7 +7,8 @@ A `ModelExtension` encapsulates every architecture-specific customization needed
 to export a Hugging Face (or custom PyTorch/Diffusers) checkpoint to LiteRT
 (`.tflite`) and LiteRT-LM (`.litertlm`) across text generation, multimodal
 (vision/audio), speech recognition (ASR), text-to-speech (TTS), text-to-image
-diffusion, and Any2Any multimodal tasks.
+diffusion, and Any2Any multimodal tasks—**without modifying `litert_torch` core
+code**.
 
 ---
 
@@ -15,7 +16,7 @@ diffusion, and Any2Any multimodal tasks.
 
 ```text
 model_ext/
-├── __init__.py            # Public API exports & eager registration of built-ins
+├── __init__.py            # Public API exports & registration of built-ins
 ├── builtin_extensions.py  # Imports & registers built-in <arch>/extension.py
 ├── extension.py           # ModelExtension contract, composition, and registry
 ├── exportables.py         # Exportable dispatchers delegating to ModelExtension
@@ -59,155 +60,618 @@ supports lazy fallback imports for `model_ext.<model_type>.extension`:
 
 ---
 
-## The `ModelExtension` Contract
+## Quick Start: Writing an Out-of-Tree `ModelExtension`
 
-Subclasses of `ModelExtension` (`model_ext/extension.py`) only need to override
-the hooks relevant to their architecture. All unimplemented hooks default to a
-no-op or `None`.
-
-### 1. Configuration & Patching Lifecycle
-
-* **`model_types: Sequence[str]`** — Tuple of HF `config.model_type` (or
-  pipeline class) strings handled by this extension.
-* **`update_export_config(export_config, model_config)`** — Validates or updates
-  `ExportableModuleConfig` before model loading/export (e.g., enabling
-  `externalize_embedder=True` for multimodal models).
-* **`patch_context()`** *(context manager)* — Entered around
-  `AutoModel.from_pretrained(...)` for class-level runtime patches on
-  `transformers` modules.
-* **`patch_model(model, export_config)`** *(context manager)* — Entered around
-  `torch.export` / `litert_torch.convert` for instance-level module replacement
-  or rotary embedding adjustments.
-
-### 2. Text & Multimodal Exportable Modules
-
-* **`get_prefill_decode_exportables(model_config, export_config)`** — Returns
-  `(prefill_exportable_cls, decode_exportable_cls)` or `None` to use the
-  standard decoder-only exportables.
-* **`get_vision_exportables(model_config, export_config=None)`** — Returns a
-  `VisionExportablesSpec(encoder_cls, adapter_cls, eoi_cls)` (or 3-tuple) for
-  vision encoders.
-* **`get_audio_exportables(model_config, export_config=None)`** — Returns an
-  `AudioExportablesSpec(encoder_cls, adapter_cls, eoa_cls)` (or 3-tuple) for
-  audio encoders.
-* **`get_additional_exportables(model_config, export_config=None)`** — Returns
-  `dict[str, type]` mapping auxiliary submodel names (e.g.,
-  `'per_layer_embedder'`) to exportable module classes.
-
-### 3. Non-Text-Generation Task Hooks (ASR, TTS, ImageGen, Any2Any)
-
-* **`get_speech_exportables(model_config, export_config=None)`** — Returns ASR
-  encoder/decoder exportable module classes.
-* **`get_speech_model_cls(model_type)`** — Returns the ASR `SourceSpeechModel`
-  subclass.
-* **`get_tts_model_cls(model_type)`** — Returns the TTS model wrapper class.
-* **`get_image_gen_model_cls(model_type)`** — Returns the Text-to-Image model
-  wrapper class.
-* **`get_any2any_model_cls(model_type)`** — Returns the Any2Any multimodal model
-  wrapper class.
-* **`match_checkpoint(model_path, task=None, config_dict=None) -> bool`** —
-  Infers `model_type` for checkpoints that lack a standard Hugging Face
-  `model_type` field in `config.json` (such as Kokoro TTS or Diffusers
-  pipelines with `model_index.json`).
-
-### 4. `.litertlm` Packaging & Metadata Hooks
-
-* **`get_litert_lm_section_types() -> dict[str, Any]`** — Maps custom
-  `additional_model_paths` keys to `.litertlm` TFLite section types.
-* **`get_llm_model_type_proto(model_config, export_config)`** — Returns an
-  `LlmModelType` protobuf message or `None` to fall back to `GenericModel`.
-* **`build_llm_metadata(...)`** — Mutates and returns the `LlmMetadata` protobuf
-  (stop tokens, prompt templates, channels, etc.) given
-  `(source_model_artifacts, export_config, exported_model_artifacts,
-  llm_metadata)`.
-* **`get_executor_metadata_builder(model_config)`** — Returns an optional
-  callable `(source_model_artifacts, export_config, exported_model_artifacts)
-  -> ExecutorMetadata`.
-
----
-
-## Using or Registering a Custom `ModelExtension`
-
-### 1. Pass an Extension Instance Directly in Python
-
-Users and agents can prototype or override behavior inline without registering
-anything globally:
+Subclass `ModelExtension` in a standalone `.py` file (or Python package), set
+`model_types` to match `model_type` in the checkpoint's `config.json`, and
+override only the hooks your architecture needs:
 
 ```python
+# my_arch_extension.py
+import contextlib
 import dataclasses
-from litert_torch.generative.export_hf import export
-from litert_torch.generative.export_hf import model_ext
+from litert_torch.generative.export_hf.model_ext import extension
+from litert_torch.generative.layers import normalization
+import torch
 
 
-class MyCustomExtension(model_ext.ModelExtension):
-  model_types = ('my_custom_arch',)
+@extension.register_model_extension()
+class MyArchExtension(extension.ModelExtension):
+  model_types = ('my_arch',)
+  is_causal_text_model = True
+  extra_kwargs_keys = ('key_ts_idx',)
 
   def update_export_config(self, export_config, model_config):
-    return dataclasses.replace(export_config, externalize_embedder=True)
+    del model_config
+    if 'key_ts_idx' in export_config.extra_kwargs:
+      export_config = dataclasses.replace(
+          export_config, k_ts_idx=int(export_config.extra_kwargs['key_ts_idx'])
+      )
+    return export_config
 
-
-export.export(
-    model='/path/to/checkpoint',
-    output_dir='/tmp/out',
-    model_extension=MyCustomExtension(),
-)
+  @contextlib.contextmanager
+  def patch_model(self, model, export_config):
+    del model, export_config
+    yield
 ```
 
-### 2. Compose on Top of a Built-in Extension
-
-If `model_config.model_type` already matches a registered built-in extension
-(e.g. `'gemma3'`) and you also pass `model_extension=MyOverrideExtension()`,
-`resolve_model_extension` automatically wraps them in a
-`CompositeModelExtension((builtin_ext, user_ext))`:
-
-* Context managers (`patch_context`, `patch_model`) and transforms
-  (`update_export_config`, `build_llm_metadata`) run sequentially in order.
-* Selector hooks (`get_*`) use last-non-`None`-wins priority, so `user_ext`
-  cleanly overrides only the hooks it implements while inheriting the rest.
-* Dictionary hooks (`get_additional_exportables`,
-  `get_litert_lm_section_types`) merge keys with later extensions taking
-  precedence.
-
-### 3. Load Extension Modules by Dotted Path (CLI)
-
-For CLI runs (`export_main`), pass `--extension_modules` with comma-separated
-Python module paths that execute `@register_model_extension` at import time:
+Then run `export_main` pointing `--extension_modules` at your `.py` file (or
+importable dotted module name):
 
 ```bash
 python -m litert_torch.generative.export_hf.export_main \
   --model=/path/to/checkpoint \
-  --output_dir=/tmp/out \
-  --extension_modules=my_package.my_arch_extension
-```
-
-### 4. Wheel Entry-Point Discovery (`pyproject.toml`)
-
-Third-party Python packages can register extensions automatically via standard
-Python entry points without needing `--extension_modules`:
-
-```toml
-[project.entry-points."litert_torch.model_extensions"]
-my_custom_arch = "my_package.my_arch_extension:MyCustomExtension"
+  --output_dir=$HOME/export_out \
+  --extension_modules=./my_arch_extension.py \
+  --trust_remote_code \
+  --split_cache \
+  --key_ts_idx=3 \
+  --v_ts_idx=2
 ```
 
 ---
 
-## Testing a `ModelExtension`
+## Authoring Guide & Examples by Feature
 
-Use `ModelExtensionTestMixin` from `model_ext/testing.py` to automatically test
-the contract of any `ModelExtension` subclass (`model_types`,
-`update_export_config`, `patch_context`, `patch_model`, and `LlmModelType` /
-`LlmMetadata` hooks):
+### 1. Custom CLI Flags (`extra_kwargs_keys`) & `update_export_config`
+
+By default, `ExportableModuleConfig` rejects unrecognized CLI flags with a
+`ValueError` so mistyped flags are caught immediately. To add custom CLI flags
+or override export settings for your model:
+
+* **`extra_kwargs_keys: Sequence[str]`** — Declares custom CLI / `export(...)`
+  keyword argument names accepted in `export_config.extra_kwargs`.
+* **`update_export_config(self, export_config, model_config)`** — Inspects
+  `export_config` (including `export_config.extra_kwargs`) and `model_config`
+  after config loading and returns an updated `ExportableModuleConfig` via
+  `dataclasses.replace(...)`. If `update_export_config` toggles pipeline stage
+  flags (`externalize_embedder`, `split_cache`, `export_vision_encoder`,
+  `export_audio_encoder`, etc.), `run_export_tasks` automatically rebuilds the
+  export stage list.
+
+**Built-in examples:** `model_ext/gemma4/extension.py`,
+`model_ext/lfm2_vl/extension.py`.
+
+```python
+@extension.register_model_extension()
+class MyVlmExtension(extension.ModelExtension):
+  model_types = ('my_vlm',)
+  # Allows passing `--my_vision_tokens=256` on the CLI or to `export.export()`.
+  extra_kwargs_keys = ('my_vision_tokens',)
+
+  def update_export_config(self, export_config, model_config):
+    has_vision = getattr(model_config, 'vision_config', None) is not None
+    # Automatically enable externalized embedder when exporting vision encoder.
+    if has_vision and export_config.export_vision_encoder:
+      export_config = dataclasses.replace(
+          export_config,
+          externalize_embedder=True,
+          single_token_embedder=True,
+      )
+    return export_config
+```
+
+### 2. Custom Config Loading, Model Class & Attention Semantics
+
+For architectures with custom Hugging Face config/model classes, causal SDPA, or
+uniform sliding-window attention, configure them on the `ModelExtension`
+subclass using these attributes and hooks:
+
+* **`is_causal_text_model: bool | None`** — Controls whether text-generation
+  prefill/decode exportables set `sdpa_is_causal = True` when GPU SDPA
+  composites (`use_sdpa_composite` / `apply_gpu_composites`) are enabled:
+  * `True`: Always treat this architecture as a causal decoder.
+  * `False`: Disable `sdpa_is_causal` (e.g. for bidirectional or custom mask
+    architectures).
+  * `None` *(default)*: Defer to `core/exportable_module.py`'s default check.
+* **`sliding_window_layers: str | None`** — Controls sliding-window attention
+  mask generation when `config.sliding_window` is set without a per-layer
+  `config.layer_types` list:
+  * `'all'`: Treat every decoder layer as using sliding-window attention (e.g.
+    Mistral-style uniform sliding window).
+  * `'none'`: Disable sliding-window masks even when `sliding_window` is
+    present on `config`.
+  * `None` *(default)*: Inspect `config.layer_types` (with built-in fallback).
+* **`load_config(self, model_path, export_config, trust_remote_code=False)`** —
+  Loads a custom `transformers.PretrainedConfig` when `transformers.AutoConfig`
+  cannot resolve the checkpoint's config class (return `None` to fall back to
+  `AutoConfig.from_pretrained`).
+* **`get_hf_model_cls(self, task, model_config, export_config)`** — Returns a
+  custom model class for `text_generation`, `image_text_to_text`, or
+  `multimodal_lm` exports when not in `transformers` `AutoModel*` tables. Can be
+  an `AutoModel*` class, a `PreTrainedModel` subclass, or a plain
+  `torch.nn.Module(model_config)` class (weights are loaded from `.safetensors`
+  via `HFCheckpointWeightsLoader`).
+
+```python
+@extension.register_model_extension()
+class CustomMultimodalExtension(extension.ModelExtension):
+  model_types = ('custom_vlm',)
+  is_causal_text_model = True
+  sliding_window_layers = 'all'
+
+  def load_config(self, model_path, export_config, trust_remote_code=False):
+    del export_config, trust_remote_code
+    return CustomVlmConfig.from_pretrained(model_path)
+
+  def get_hf_model_cls(self, task, model_config, export_config):
+    del task, model_config, export_config
+    return CustomVlmForConditionalGeneration
+```
+
+### 3. Runtime Model Patching (`patch_context` vs. `patch_model`)
+
+`ModelExtension` provides two context-manager hooks so you never need to modify
+modeling files inside a checkpoint directory:
+
+* **`patch_context(self)`** — Entered **before** `AutoModel.from_pretrained` /
+  `from_config`. Use this to monkey-patch classes or functions in `transformers`
+  that run during model construction (`__init__`).
+* **`patch_model(self, model, export_config)`** — Entered **after** the model is
+  instantiated and **around** tracing/conversion (`export_embedder_model` and
+  `export_text_prefill_decode_model`). Use this to replace submodule methods,
+  emit LiteRT HLFB composite ops, or adapt rotary embeddings on `model`
+  (including `trust_remote_code` classes loaded dynamically from the
+  checkpoint).
+
+**Built-in examples:** `model_ext/qwen3_5/patch.py`,
+`model_ext/gemma3/patch.py`, `model_ext/lfm2/patch.py`.
+
+#### Example: Patching `RMSNorm` Composite & Dual RoPE for `split_cache`
+
+Many `trust_remote_code` checkpoints define their own `RMSNorm` class (without
+`@use_kernel_forward_from_hub("RMSNorm")`) and separate 2-argument
+`rotary_emb_full` / `rotary_emb_sliding` modules, whereas LiteRT's `split_cache`
+(`externalize_rope`) pipeline expects `model.model.rotary_emb(x, pos, type)` to
+accept 3 arguments (`'full_attention'` and `'sliding_attention'`). Both can be
+adapted in `patch_model` without editing the checkpoint:
+
+```python
+def _rms_norm_with_hlfb_forward(self, hidden_states: torch.Tensor):
+  dtype = hidden_states.dtype
+  hidden_states = hidden_states.to(torch.float32)
+  hidden_states = normalization.rms_norm_with_hlfb(
+      hidden_states,
+      self.weight,
+      self.variance_epsilon,
+      torch.ones(
+          (self.weight.shape[0],),
+          dtype=torch.float32,
+          device=hidden_states.device,
+      ),
+  )
+  return hidden_states.to(dtype)
+
+
+class _DualRotaryWrapper(torch.nn.Module):
+
+  def __init__(self, full_rope, sliding_rope=None):
+    super().__init__()
+    self.rotary_emb_full = full_rope
+    self.rotary_emb_sliding = sliding_rope
+
+  def forward(self, x, position_ids, attention_type=None):
+    if (
+        attention_type == 'sliding_attention'
+        and self.rotary_emb_sliding is not None
+    ):
+      return self.rotary_emb_sliding(x, position_ids)
+    return self.rotary_emb_full(x, position_ids)
+
+
+@extension.register_model_extension()
+class Kanana2Extension(extension.ModelExtension):
+  model_types = ('kanana2_tiny',)
+  is_causal_text_model = True
+
+  @contextlib.contextmanager
+  def patch_model(self, model, export_config):
+    del export_config
+    # 1. Patch custom RMSNorm to emit the `odml.rms_norm` HLFB composite.
+    patched_cls = {}
+    for module in model.modules():
+      cls = type(module)
+      if cls.__name__ == 'Kanana2TinyRMSNorm' and cls not in patched_cls:
+        patched_cls[cls] = cls.forward
+        cls.forward = _rms_norm_with_hlfb_forward
+
+    # 2. Wrap `rotary_emb_full` and `rotary_emb_sliding` into a 3-arg wrapper
+    # for `inject_rotary_position_embedding` and `RoPEEmbedder`.
+    inner = getattr(model, 'model', model)
+    orig_full = getattr(inner, 'rotary_emb_full', None)
+    orig_sliding = getattr(inner, 'rotary_emb_sliding', None)
+    orig_rotary_emb = getattr(inner, 'rotary_emb', None)
+    if isinstance(orig_full, torch.nn.Module):
+      delattr(inner, 'rotary_emb_full')
+      if hasattr(inner, 'rotary_emb_sliding'):
+        delattr(inner, 'rotary_emb_sliding')
+      inner.rotary_emb = _DualRotaryWrapper(orig_full, orig_sliding)
+      inner.__dict__['rotary_emb_full'] = (
+          lambda x, pos: inner.rotary_emb(x, pos, 'full_attention')
+      )
+      inner.__dict__['rotary_emb_sliding'] = (
+          (lambda x, pos: inner.rotary_emb(x, pos, 'sliding_attention'))
+          if orig_sliding is not None
+          else None
+      )
+    try:
+      yield
+    finally:
+      for cls, orig_fn in patched_cls.items():
+        cls.forward = orig_fn
+      if isinstance(orig_full, torch.nn.Module):
+        inner.__dict__.pop('rotary_emb_full', None)
+        inner.__dict__.pop('rotary_emb_sliding', None)
+        inner.rotary_emb_full = orig_full
+        inner.rotary_emb_sliding = orig_sliding
+        if not hasattr(inner, 'original_rotary_emb'):
+          if hasattr(inner, 'rotary_emb'):
+            delattr(inner, 'rotary_emb')
+          inner.rotary_emb = orig_rotary_emb
+```
+
+#### Example: Fusing MLP (`gate_up_proj`) & QKV (`qkv_proj`) Projections + SwiGLU Composite
+
+For NPU and GPU delegates, fusing `gate_proj` + `up_proj` into a single
+`gate_up_proj` (and optionally emitting the `odml.swiglu` composite via
+`swiglu_composite.apply_swiglu`) or fusing `q_proj` + `k_proj` + `v_proj` into
+`qkv_proj` eliminates redundant input broadcasts and separate matmul dispatches.
+When replacing submodules in `patch_model`, always record `(parent, child_name,
+original_child)` and restore them in `finally`:
+
+```python
+import contextlib
+from litert_torch.generative.export_hf.experimental.composites import swiglu as swiglu_composite
+from litert_torch.generative.export_hf.model_ext import extension
+import torch
+
+
+class FusedMLP(torch.nn.Module):
+  """Replaces separate `gate_proj` + `up_proj` with a fused `gate_up_proj`."""
+
+  def __init__(self, orig_mlp: torch.nn.Module, use_swiglu: bool = False):
+    super().__init__()
+    self.act_fn = orig_mlp.act_fn
+    self.down_proj = orig_mlp.down_proj
+    self.use_swiglu = use_swiglu
+
+    gate_w = orig_mlp.gate_proj.weight
+    up_w = orig_mlp.up_proj.weight
+    in_features = gate_w.shape[1]
+    out_features = gate_w.shape[0] + up_w.shape[0]
+    self.gate_up_proj = torch.nn.Linear(
+        in_features,
+        out_features,
+        bias=False,
+        device=gate_w.device,
+        dtype=gate_w.dtype,
+    )
+    if not gate_w.is_meta:
+      self.gate_up_proj.weight = torch.nn.Parameter(
+          torch.cat([gate_w.data, up_w.data], dim=0)
+      )
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    gate_up = self.gate_up_proj(x)
+    if self.use_swiglu:
+      return self.down_proj(swiglu_composite.apply_swiglu(gate_up))
+    gate, up = gate_up.chunk(2, dim=-1)
+    return self.down_proj(self.act_fn(gate) * up)
+
+
+@extension.register_model_extension()
+class MyFusedArchExtension(extension.ModelExtension):
+  model_types = ('my_arch',)
+  # Note: `'gate_up_proj'` <- `('gate_proj', 'up_proj')` and `'qkv_proj'` <-
+  # `('q_proj', 'k_proj', 'v_proj')` are built into `HFCheckpointWeightsLoader`.
+  # If your fused attribute uses custom names (e.g. `w13` <- `('w1', 'w3')`),
+  # declare `fused_weight_specs` so Converter V2 (`--use_v2`) streams and
+  # concatenates the checkpoint tensors automatically:
+  fused_weight_specs = (
+      extension.FusedWeightSpec('w13', ('w1', 'w3'), dim=0),
+  )
+
+  @contextlib.contextmanager
+  def patch_model(self, model, export_config):
+    fuse_mlp = getattr(export_config, 'fuse_gate_up', False) or getattr(
+        export_config, 'use_swiglu_composite', False
+    )
+    use_swiglu = getattr(export_config, 'use_swiglu_composite', False)
+    replaced = []
+
+    def _replace(parent: torch.nn.Module):
+      for name, child in parent.named_children():
+        if fuse_mlp and hasattr(child, 'gate_proj') and hasattr(child, 'up_proj'):
+          setattr(parent, name, FusedMLP(child, use_swiglu=use_swiglu))
+          replaced.append((parent, name, child))
+        else:
+          _replace(child)
+
+    _replace(model)
+    try:
+      yield
+    finally:
+      for parent, name, orig_child in reversed(replaced):
+        setattr(parent, name, orig_child)
+```
+
+### 4. Converter V2 Weights (`checkpoint_key_prefixes`, `fused_weight_specs` & `resolve_checkpoint_tensor`)
+
+When exporting with Converter V2 and meta-device weight streaming (`--use_v2`
+and `--delete_in_memory_params`), `HFCheckpointWeightsLoader`
+(`core/weights_loader.py`) maps PyTorch parameter names on the traced module to
+tensor names inside the checkpoint's `.safetensors` files.
+
+If your model uses non-standard checkpoint wrapper prefixes or custom fused
+projections, use these three hooks:
+
+* **`checkpoint_key_prefixes: Sequence[str]`** — Additional leading module/key
+  prefixes stripped and prepended when `HFCheckpointWeightsLoader` generates
+  candidate safetensors keys (on top of the built-in `'model.'`,
+  `'model.language_model.'`, and `'language_model.'` prefixes).
+* **`fused_weight_specs: Sequence[FusedWeightSpec]`** — Declarative specs
+  `FusedWeightSpec(fused_name, part_names, dim=0)` telling
+  `HFCheckpointWeightsLoader` how to concatenate separate checkpoint tensors
+  into a fused `nn.Linear` parameter (built-in defaults already cover
+  `gate_up_proj <- (gate_proj, up_proj)` and
+  `qkv_proj <- (q_proj, k_proj, v_proj)`).
+* **`resolve_checkpoint_tensor(self, param_name, try_load) -> Tensor | None`** —
+  Called by `HFCheckpointWeightsLoader` when a parameter needs arbitrary custom
+  reconstruction (such as interleaving heads, slicing, or transposing).
+  `try_load(candidate_name)` looks up any candidate parameter name through the
+  loader's prefix-matching table and returns a `torch.Tensor` or `None`.
+
+```python
+@extension.register_model_extension()
+class CustomWeightsExtension(extension.ModelExtension):
+  model_types = ('my_custom_llm',)
+  # Strips/adds 'backbone.' or 'decoder.' when matching safetensors keys.
+  checkpoint_key_prefixes = ('backbone.', 'decoder.')
+  # Declaratively concatenate `.w1.weight` + `.w3.weight` into `.w13.weight`:
+  fused_weight_specs = (
+      extension.FusedWeightSpec('w13', ('w1', 'w3'), dim=0),
+  )
+
+  def resolve_checkpoint_tensor(self, param_name, try_load):
+    # Arbitrary tensor transform (e.g. splitting or transposing a weight):
+    if param_name.endswith('.custom_proj.weight'):
+      prefix = param_name[: -len('.custom_proj.weight')]
+      raw = try_load(f'{prefix}.raw_proj.weight')
+      if raw is not None:
+        return raw.transpose(0, 1).contiguous()
+    return None
+```
+
+### 5. Custom Exportables & `.litertlm` Packaging Metadata
+
+To export custom subgraphs (vision/audio encoders, per-layer embedders, or
+specialized prefill/decode signatures) and package them into `.litertlm`:
+
+* **`get_prefill_decode_exportables(self, model_config, export_config)`** —
+  Returns `(prefill_cls, decode_cls)` or `None` to use the standard decoder-only
+  exportables.
+* **`get_vision_exportables(self, model_config, export_config=None)`** — Returns
+  `VisionExportablesSpec(encoder_cls, adapter_cls=..., eoi_cls=...)` for
+  `export_vision_encoder_models`.
+* **`get_audio_exportables(self, model_config, export_config=None)`** — Returns
+  `AudioExportablesSpec(encoder_cls, adapter_cls=..., eoa_cls=...)` for
+  `export_audio_encoder_models_for_llm`.
+* **`get_additional_exportables(self, model_config, export_config=None)`** —
+  Returns `{submodel_name: exportable_cls}` (e.g. `{'per_layer_embedder': ...}`)
+  exported as `<submodel_name>.tflite` into
+  `exported_model_artifacts.additional_model_paths`.
+* **`get_litert_lm_section_types(self)`** — Maps keys from
+  `additional_model_paths` to `.litertlm` section types (such as
+  `litert_lm_builder.TFLiteModelType.TF_LITE_PER_LAYER_EMBEDDER`).
+* **`get_llm_model_type_proto(self, model_config, export_config)`** — Returns a
+  custom `llm_model_type_pb2.LlmModelType` protobuf message (or `None` to fall
+  back to `GenericModel`).
+* **`build_llm_metadata(self, ...)`** — Populates stop tokens, prompt templates,
+  or modality tokens on `LlmMetadata` given `(source_model_artifacts,
+  export_config, exported_model_artifacts, llm_metadata)`.
+* **`update_executor_metadata(self, ...)`** — Returns an `ExecutorMetadata`
+  protobuf given `(source_model_artifacts, export_config,
+  exported_model_artifacts)` when packaging `.litertlm`.
+
+**Built-in examples:** `model_ext/gemma3/extension.py`,
+`model_ext/gemma3n/extension.py`, `model_ext/gemma4/extension.py`,
+`model_ext/bonsai_flux2/extension.py`.
+
+### 6. Non-Text Tasks (ASR, TTS, ImageGen, Any2Any) & `match_checkpoint`
+
+Some checkpoints (such as Diffusers pipelines with `model_index.json` or
+standalone TTS checkpoints like Kokoro) do not have a standard Hugging Face
+`model_type` field in `config.json`.
+
+* **`match_checkpoint(cls, model_path, task=None, config_dict=None) -> bool`** —
+  Classmethod inspected by `infer_model_type_from_extensions` when `config.json`
+  has no `model_type`. When it returns `True`, `cls.model_types[0]` is used as
+  the resolved `model_type`.
+* **Task model/exportable hooks:**
+  * **ASR (`automatic_speech_recognition`)**: `get_speech_model_cls(model_type)`
+    and `get_speech_exportables(model_config, export_config)` (see
+    `model_ext/whisper/extension.py`, `model_ext/parakeet/extension.py`).
+  * **TTS (`text_to_speech`)**: `get_tts_model_cls(model_type)` and
+    `is_matching_tts_checkpoint(config_dict, model_path)` (see
+    `model_ext/kokoro_tts/extension.py`, `model_ext/qwen3_tts/extension.py`).
+  * **Text-to-Image (`text_to_image`)**: `get_image_gen_model_cls(model_type)`
+    (see `model_ext/bonsai_flux2/extension.py`,
+    `model_ext/flux2_klein/extension.py`).
+  * **Any2Any (`any_to_any`)**: `get_any2any_model_cls(model_type)` (see
+    `model_ext/minicpm_o/extension.py`).
+
+```python
+@extension.register_model_extension()
+class MyDiffusionExtension(extension.ModelExtension):
+  model_types = ('my_diffusion_pipeline',)
+
+  @classmethod
+  def match_checkpoint(cls, model_path, task=None, config_dict=None) -> bool:
+    del model_path
+    return (
+        task == 'text_to_image'
+        and isinstance(config_dict, dict)
+        and config_dict.get('_class_name') == 'MyDiffusionPipeline'
+    )
+
+  def get_image_gen_model_cls(self, model_type: str):
+    del model_type
+    return MyDiffusionImageGenModel
+```
+
+---
+
+## Using, Composing & Distributing Extensions
+
+### 1. Pass an Extension Directly in Python (`model_extension=...`)
+
+Prototype or override behavior inline without global registration:
+
+```python
+from litert_torch.generative.export_hf import export
+
+export.export(
+    model='/path/to/checkpoint',
+    output_dir='/path/to/output',
+    model_extension=MyArchExtension(),
+)
+```
+
+### 2. Layer on Top of a Built-in Extension (`CompositeModelExtension`)
+
+If `model_config.model_type` matches a registered extension (e.g. `'gemma3'`)
+and you also pass `model_extension=MyOverrideExtension()`,
+`resolve_model_extension` composes them as
+`CompositeModelExtension((builtin_ext, user_ext))`:
+
+* Context managers (`patch_context`, `patch_model`) and transforms
+  (`update_export_config`, `build_llm_metadata`) run sequentially in order.
+* Selector hooks (`get_*`, `resolve_checkpoint_tensor`) use last-non-`None`-wins
+  priority, so `user_ext` overrides only the hooks it implements while
+  inheriting everything else.
+* Sequence attributes (`extra_kwargs_keys`, `checkpoint_key_prefixes`) and
+  dictionary hooks (`get_additional_exportables`, `get_litert_lm_section_types`)
+  are merged automatically.
+
+### 3. Load via `--extension_modules` (CLI or Python)
+
+Pass comma-separated dotted module names **or `.py` file paths** to
+`--extension_modules`. Any `ModelExtension` subclass in the loaded module/file
+with non-empty `model_types` is registered automatically before CLI flag
+validation runs:
+
+```bash
+python -m litert_torch.generative.export_hf.export_main \
+  --model=/path/to/checkpoint \
+  --output_dir=/path/to/output \
+  --extension_modules=/path/to/my_arch_extension.py
+```
+
+### 4. Wheel Entry-Point Discovery (`pyproject.toml`)
+
+Third-party Python packages can register extensions automatically on import via
+standard Python entry points without needing `--extension_modules`:
+
+```toml
+[project.entry-points."litert_torch.model_extensions"]
+my_arch = "my_package.my_arch_extension:MyArchExtension"
+```
+
+---
+
+## Inspecting a Checkpoint & Testing a `ModelExtension`
+
+### 1. Architecture Inspector & Dry-Run Diagnostic CLI (`model_ext/inspector.py`)
+
+Before writing a `ModelExtension` (or to verify one you just wrote), run the
+Architecture Inspector on a checkpoint directory or model ID. It shrinks the
+config to a tiny 2-layer CPU model with random weights, inspects RMSNorm/MLP/
+Attention/RoPE classes and `.safetensors` key prefixes, runs `torch.export`
+prefill/decode dry runs in `<5s`, and prints actionable recommendations plus a
+ready-to-edit `ModelExtension` skeleton:
+
+```bash
+bazel run //third_party/py/litert_torch/generative/export_hf/model_ext:inspector -- \
+  --model=/path/to/checkpoint \
+  --trust_remote_code \
+  --split_cache
+```
+
+Pass `--extension_modules=/path/to/my_arch_extension.py` (or `--format=json`) to
+verify that your extension resolves all dry-run checks before running a full
+multi-gigabyte export. You can also call `inspect_model_architecture(...)`
+directly from Python (`from litert_torch.generative.export_hf.model_ext import
+inspector`).
+
+### 2. Contract & Fast-Inner-Loop Verification (`model_ext/testing.py`)
+
+`model_ext/testing.py` provides both a reusable `unittest.TestCase` mixin and
+standalone fast-inner-loop helpers that verify numerical parity and
+`torch.export.export` graph capture on tiny 2-layer models in `<2s` on CPU:
+
+* **`ModelExtensionTestMixin`** — Tests all `ModelExtension` hook contracts
+  (`model_types`, `update_export_config`, `patch_context` / `patch_model`
+  re-entrancy, exportable selectors, and `LlmModelType` / `LlmMetadata` hooks).
+* **`assert_patch_numerical_parity(ext, model, ...)`** — Runs eager inference
+  before and during `patch_model`, asserts output tensors match within `(atol,
+  rtol)`, and verifies that submodule classes and `.forward` methods are
+  cleanly restored after exiting `patch_model`.
+* **`assert_tiny_prefill_decode_torch_export(ext, model, ...)`** — Wraps a tiny
+  2-layer causal LM in the resolved prefill/decode `ExportableModule` classes
+  (and `RoPEEmbedder` when `split_cache=True` / `externalize_rope=True`) and
+  runs `torch.export.export` across all sample signatures.
 
 ```python
 from absl.testing import absltest
+from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.model_ext import testing as ext_testing
+import torch
+import transformers
 
 
-class MyCustomExtensionTest(
+class MyArchExtensionTest(
     ext_testing.ModelExtensionTestMixin, absltest.TestCase
 ):
-  extension_cls = MyCustomExtension
+  extension_cls = MyArchExtension
+
+  def test_patch_numerical_parity_and_tiny_export(self):
+    ext = self.get_extension()
+    tiny_cfg = transformers.AutoConfig.for_model(
+        'qwen3',
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+    )
+    tiny_model = transformers.AutoModelForCausalLM.from_config(tiny_cfg).eval()
+    export_cfg = exportable_module_config.ExportableModuleConfig(
+        model='dummy',
+        prefill_lengths=[8],
+        cache_length=16,
+        cache_lengths=[16],
+        fuse_gate_up=True,
+        fuse_qkv=True,
+    )
+    # 1. Verify eager numerical parity & clean unpatching after exiting context:
+    self.assert_patch_numerical_parity(
+        tiny_model,
+        sample_kwargs={
+            'input_ids': torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+            'use_cache': False,
+        },
+        export_config=export_cfg,
+    )
+    # 2. Verify prefill + decode torch.export graph capture in <2s on CPU:
+    exported = self.assert_tiny_prefill_decode_torch_export(
+        tiny_model,
+        model_config=tiny_cfg,
+        export_config=export_cfg,
+    )
+    self.assertIn('prefill_8', exported)
+    self.assertIn('decode', exported)
 
 
 if __name__ == '__main__':

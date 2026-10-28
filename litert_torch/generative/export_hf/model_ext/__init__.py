@@ -46,6 +46,7 @@ except (ImportError, AttributeError):
 
 AudioExportablesSpec = extension.AudioExportablesSpec
 CompositeModelExtension = extension.CompositeModelExtension
+FusedWeightSpec = extension.FusedWeightSpec
 ModelExtension = extension.ModelExtension
 VisionExportablesSpec = extension.VisionExportablesSpec
 compose_extensions = extension.compose_extensions

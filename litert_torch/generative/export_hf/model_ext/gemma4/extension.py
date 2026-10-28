@@ -15,6 +15,8 @@
 """Built-in `ModelExtension` for Gemma 4 (`gemma4`, `gemma4_text`).
 
 Full-featured multimodal extension illustrating:
+- Custom architecture-specific export flag registration via `extra_kwargs_keys`
+  (`'gemma4_vision_max_soft_tokens'`).
 - Conditional custom prefill/decode exportables (both standard and split-cache)
   and `'per_layer_embedder'` auxiliary submodel when
   `hidden_size_per_layer_input` is active (`gemma4/exportable_module.py`,
@@ -45,6 +47,7 @@ class Gemma4Extension(extension_lib.ModelExtension):
       'gemma4',
       'gemma4_text',
   )
+  extra_kwargs_keys = ('gemma4_vision_max_soft_tokens',)
 
   def get_prefill_decode_exportables(self, model_config, export_config):
     """See base class."""

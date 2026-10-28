@@ -14,6 +14,7 @@
 # ==============================================================================
 """Exportable modules."""
 
+from collections.abc import Sequence
 import dataclasses
 import difflib
 import enum
@@ -43,7 +44,6 @@ _KNOWN_EXTRA_KWARGS = frozenset({
     "audio_include_mask_inputs",
     "audio_mel_frames",
     "audio_num_layers",
-    "gemma4_vision_max_soft_tokens",
     "litert_samples_conversion_dir",
     "llm_intermediate_size",
     "llm_num_layers",
@@ -58,6 +58,41 @@ _DEPRECATED_EXTRA_KWARGS = frozenset({
     "use_sdpa_composite",
     "use_sdpa_composite_for_prefill",
 })
+
+# Additional `extra_kwargs` flag names declared by registered `ModelExtension`s.
+_REGISTERED_EXTRA_KWARGS: set[str] = set()
+
+
+def register_extra_kwargs_keys(keys: Sequence[str]) -> None:
+  """Registers extra CLI / `extra_kwargs` keys declared by a `ModelExtension`.
+
+  Called when a `ModelExtension` with `extra_kwargs_keys` is registered (see
+  `model_ext/gemma4/extension.py` for an example) so `ExportableModuleConfig`
+  accepts those flags without raising an unknown-argument `ValueError`.
+
+  Args:
+    keys: Sequence of flag names to allow in `ExportableModuleConfig`.
+  """
+  for key in keys:
+    if key:
+      _REGISTERED_EXTRA_KWARGS.add(key)
+
+
+def get_registered_extra_kwargs() -> frozenset[str]:
+  """Returns the `extra_kwargs` flag names registered by `ModelExtension`s."""
+  return frozenset(_REGISTERED_EXTRA_KWARGS)
+
+
+def reset_registered_extra_kwargs(keys: Sequence[str] = ()) -> None:
+  """Replaces dynamically registered `extra_kwargs` keys with `keys`.
+
+  Used when unregistering a `ModelExtension` or resetting state between tests.
+
+  Args:
+    keys: Replacement sequence of allowed `extra_kwargs` flag names.
+  """
+  _REGISTERED_EXTRA_KWARGS.clear()
+  _REGISTERED_EXTRA_KWARGS.update(k for k in keys if k)
 
 
 # GPU composite and fusion flags that default to `True` when
@@ -232,8 +267,9 @@ class ExportableModuleConfig:
   # Optional `ModelExtension` subclass/instance (or sequence of extensions)
   # layered over any registered extension for the target `model_type`.
   model_extension: Any = None
-  # Optional dotted Python module path(s) imported before model loading so
-  # `@register_model_extension` / `@register_patch` decorators execute.
+  # Optional dotted Python module path(s) or `.py` file path(s) imported before
+  # model loading so `@register_model_extension` / `@register_patch` decorators
+  # execute.
   extension_modules: list[str] | tuple[str, ...] | str | None = None
 
   extra_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -308,6 +344,37 @@ class ExportableModuleConfig:
     self.extra_kwargs["apply_gpu_composites"] = self.apply_gpu_composites
     self.extra_kwargs["use_bool_mask"] = self.use_bool_mask
 
+  def _collect_model_extension_extra_kwargs(self) -> set[str]:
+    """Collects `extra_kwargs_keys` declared on `self.model_extension`."""
+    collected: set[str] = set()
+
+    def _visit(ext: Any) -> None:
+      if ext is None:
+        return
+      if isinstance(ext, (list, tuple)):
+        for item in ext:
+          _visit(item)
+        return
+      nested = getattr(ext, "extensions", None)
+      if isinstance(nested, (list, tuple)):
+        for item in nested:
+          _visit(item)
+      extra_keys = getattr(ext, "extra_kwargs_keys", ())
+      if isinstance(extra_keys, (list, tuple, set, frozenset)):
+        collected.update(k for k in extra_keys if k)
+
+    _visit(self.model_extension)
+    return collected
+
+  def _known_extra_kwargs(self) -> set[str]:
+    return (
+        set(_KNOWN_EXTRA_KWARGS)
+        | set(_DEPRECATED_EXTRA_KWARGS)
+        | _REGISTERED_EXTRA_KWARGS
+        | self._collect_model_extension_extra_kwargs()
+        | {f.name for f in dataclasses.fields(self)}
+    )
+
   def _validate_extra_kwargs(self):
     """Rejects unrecognized `extra_kwargs` keys.
 
@@ -315,11 +382,7 @@ class ExportableModuleConfig:
     so without this check a mistyped flag is silently ignored and the model is
     exported without the requested optimization.
     """
-    known = (
-        _KNOWN_EXTRA_KWARGS
-        | _DEPRECATED_EXTRA_KWARGS
-        | {f.name for f in dataclasses.fields(self)}
-    )
+    known = self._known_extra_kwargs()
     unknown = sorted(set(self.extra_kwargs) - known)
     if not unknown:
       return
@@ -336,6 +399,13 @@ class ExportableModuleConfig:
 
   def __post_init__(self):
     """Refines configuration based on task-specific rules."""
+    if isinstance(self.extension_modules, str):
+      self.extension_modules = [
+          x.strip() for x in self.extension_modules.split(",") if x.strip()
+      ]
+    elif isinstance(self.extension_modules, tuple):
+      self.extension_modules = list(self.extension_modules)
+
     self._validate_extra_kwargs()
     self._normalize_sdpa_composite()
     if self.prefill_logits is None:
@@ -372,13 +442,6 @@ class ExportableModuleConfig:
 
     if not self.cache_lengths:
       self.cache_lengths = [self.cache_length]
-
-    if isinstance(self.extension_modules, str):
-      self.extension_modules = [
-          x.strip() for x in self.extension_modules.split(",") if x.strip()
-      ]
-    elif isinstance(self.extension_modules, tuple):
-      self.extension_modules = list(self.extension_modules)
 
     if self.enable_dynamic_shape and len(self.cache_lengths) > 1:
       raise ValueError(

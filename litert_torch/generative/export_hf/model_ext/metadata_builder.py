@@ -151,7 +151,18 @@ try:
     num_shared_layers = getattr(text_config, 'num_kv_shared_layers', 0)
     num_layers -= num_shared_layers
     if layer_types is None:
-      layer_types = ['full_attention'] * num_layers
+      ext = extension_lib.resolve_model_extension(
+          source_model_artifacts.model_config, export_config
+      )
+      use_sliding_window = (
+          ext is not None
+          and ext.sliding_window_layers == 'all'
+          and bool(sliding_window_size)
+      )
+      default_layer_type = (
+          'sliding_attention' if use_sliding_window else 'full_attention'
+      )
+      layer_types = [default_layer_type] * num_layers
 
     apply_gpu_composites = (
         getattr(export_config, 'apply_gpu_composites', False)

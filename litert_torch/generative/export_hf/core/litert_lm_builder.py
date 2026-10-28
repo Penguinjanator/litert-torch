@@ -767,11 +767,17 @@ def package_model(
         litertlm_builder.TfLiteModelType.AUX,
     )
   if exported_model_artifacts.additional_model_paths:
+    ext = extension_lib.resolve_model_extension(model_cfg, export_config)
+    ext_section_types = (
+        ext.get_litert_lm_section_types() if ext is not None else {}
+    )
     for (
         name,
         model_path,
     ) in exported_model_artifacts.additional_model_paths.items():
-      if name == 'per_layer_embedder':
+      if name in ext_section_types:
+        model_type = ext_section_types[name]
+      elif name == 'per_layer_embedder':
         model_type = litertlm_builder.TfLiteModelType.PER_LAYER_EMBEDDER
       else:
         raise ValueError(f'Unsupported additional model type: {name}')

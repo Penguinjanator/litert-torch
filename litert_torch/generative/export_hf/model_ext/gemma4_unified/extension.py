@@ -32,6 +32,7 @@ class Gemma4UnifiedExtension(extension_lib.ModelExtension):
   """Built-in extension for Gemma 4 Unified vision-language models."""
 
   model_types = ('gemma4_unified',)
+  extra_kwargs_keys = ('gemma4_vision_max_soft_tokens',)
 
   def get_vision_exportables(self, model_config, export_config=None):
     """See base class."""

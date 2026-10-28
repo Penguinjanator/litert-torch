@@ -350,8 +350,16 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     v_ts_idx = export_config.v_ts_idx
     num_kv_heads = model_config.num_key_value_heads
     layer_type = "full_attention"
-    if hasattr(model_config, "layer_types"):
+    if getattr(model_config, "layer_types", None) is not None:
       layer_type = model_config.layer_types[layer_index]
+    elif getattr(model_config, "sliding_window", None):
+      from litert_torch.generative.export_hf.model_ext import extension as model_ext_extension  # pylint: disable=g-import-not-at-top
+
+      ext = model_ext_extension.resolve_model_extension(
+          model_config, export_config
+      )
+      if ext is not None and ext.sliding_window_layers == "all":
+        layer_type = "sliding_attention"
     if layer_type == "sliding_attention":
       cache_length = (
           export_config.sliding_window_ring_buffer_size or cache_length
