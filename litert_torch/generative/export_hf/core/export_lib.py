@@ -464,6 +464,9 @@ def _build_checkpoint_weights_loader(
     model_path: str,
     model: nn.Module,
     resolved_ext: model_ext_extension.ModelExtension | None,
+    *,
+    config: Any,
+    export_config: exportable_module.ExportableModuleConfig,
 ) -> weights_loader_lib.HFCheckpointWeightsLoader:
   """Builds an `HFCheckpointWeightsLoader` wired to `ModelExtension` hooks.
 
@@ -475,6 +478,10 @@ def _build_checkpoint_weights_loader(
     model_path: Local checkpoint directory or HuggingFace repo ID.
     model: Meta-device model instance being exported.
     resolved_ext: Active `ModelExtension` for `model`, or `None`.
+    config: Loaded HuggingFace model config, used for architecture-specific
+      weight layout adjustments (e.g. Qwen3.5 `odml.qkv_norm_rope`).
+    export_config: Active `ExportableModuleConfig`, which selects composite
+      weight transformations.
 
   Returns:
     Configured `HFCheckpointWeightsLoader` instance.
@@ -511,6 +518,8 @@ def _build_checkpoint_weights_loader(
           if resolved_ext is not None
           else None
       ),
+      config=config,
+      export_config=export_config,
   )
 
 
@@ -719,7 +728,11 @@ def load_model(
             trust_remote_code=trust_remote_code,
         )
       weights_loader = _build_checkpoint_weights_loader(
-          model_path, model, resolved_ext
+          model_path,
+          model,
+          resolved_ext,
+          config=config,
+          export_config=export_config,
       )
       weights_loader_lib.load_persistent_buffers_(model, weights_loader)
       # `from_config` only initializes `generation_config` from `config.json`.
@@ -753,7 +766,11 @@ def load_model(
             trust_remote_code=trust_remote_code,
         )
         with _build_checkpoint_weights_loader(
-            model_path, model, resolved_ext
+            model_path,
+            model,
+            resolved_ext,
+            config=config,
+            export_config=export_config,
         ) as ckpt_loader:
           with torch.no_grad():
             for name, param in model.named_parameters():

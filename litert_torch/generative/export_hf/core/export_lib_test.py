@@ -388,6 +388,12 @@ class ExportLibTest(parameterized.TestCase):
     )
     artifacts = export_lib.load_model("dummy_model", export_config)
 
+    mock_weights_loader_lib.HFCheckpointWeightsLoader.assert_called_once()
+    loader_kwargs = (
+        mock_weights_loader_lib.HFCheckpointWeightsLoader.call_args.kwargs
+    )
+    self.assertIs(loader_kwargs["config"], mock_config)
+    self.assertIs(loader_kwargs["export_config"], export_config)
     mock_transformers.GenerationConfig.from_pretrained.assert_called_once_with(
         "dummy_model",
         trust_remote_code=False,
