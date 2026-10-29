@@ -51,11 +51,37 @@ def _dynamic_fc_weight_only_conv_wi8_afp32():
   return rp_manager.get_quantization_recipe()
 
 
+def _dynamic_wi4b32_octav_afp32():
+  """Local recipe with 4-bit blockwise-32 OCTAV FC weights and float32 activations."""
+  return recipe_lib.dynamic_wi4b32_afp32() + recipe_lib.dynamic_wi4b32_afp32(
+      algorithm_key=recipe_lib.AlgorithmName.OCTAV,
+      operation_name=recipe_lib.TFLOperationName.FULLY_CONNECTED,
+  )
+
+
+def _gemma4_mixed48_b32_octav():
+  """Local recipe with 4-bit blockwise-32 OCTAV FC weights and 8-bit OCTAV per-layer FC."""
+  return (
+      recipe_lib.dynamic_wi4b32_afp32()
+      + recipe_lib.dynamic_wi4b32_afp32(
+          algorithm_key=recipe_lib.AlgorithmName.OCTAV,
+          operation_name=recipe_lib.TFLOperationName.FULLY_CONNECTED,
+      )
+      + recipe_lib.dynamic_wi8c_afp32(
+          algorithm_key=recipe_lib.AlgorithmName.OCTAV,
+          regex='per_layer',
+          operation_name=recipe_lib.TFLOperationName.FULLY_CONNECTED,
+      )
+  )
+
+
 _LOCAL_QUANTIZATION_RECIPES = {
     'dynamic_wi8_emb4_afp32': _dynamic_wi8_emb4_afp32,
     'dynamic_fc_weight_only_conv_wi8_afp32': (
         _dynamic_fc_weight_only_conv_wi8_afp32
     ),
+    'dynamic_wi4b32_octav_afp32': _dynamic_wi4b32_octav_afp32,
+    'gemma4_mixed48_b32_octav': _gemma4_mixed48_b32_octav,
 }
 
 
