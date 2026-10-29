@@ -48,17 +48,19 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class MtpStep(nn.Module):
-  """One MTP decode step (all tensors rank <= 4)."""
+  """One MTP decode step (all tensors rank <= 4).
+
+  Returns the final normalized hidden state instead of logits; the per-codebook
+  LM heads are exported separately as `MtpHead` signatures so that each step
+  evaluates only the single head it needs.
+  """
 
   def __init__(self, weights: dict[str, torch.Tensor]):
     super().__init__()
     for key, tensor in weights.items():
       if key == "heads":
-        self.register_buffer(
-            "heads_2d", tensor.reshape(-1, 1024).contiguous(), persistent=False
-        )
-      else:
-        self.register_buffer(key.replace(".", "_"), tensor, persistent=False)
+        continue
+      self.register_buffer(key.replace(".", "_"), tensor, persistent=False)
     inv_freq = 1.0 / (
         THETA ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
     )
@@ -179,14 +181,31 @@ class MtpStep(nn.Module):
 
     w_final_norm = getattr(self, "norm_weight")
     x = _rms_norm(x, w_final_norm)
-    logits_all = F.linear(
-        x.reshape(1, 1024), getattr(self, "heads_2d")
-    ).reshape(15, VOCAB)
     return {
-        "logits": logits_all,
+        "hidden": x.reshape(1, 1024),
         **{f"kv_cache_k_{i}": k_new_list[i] for i in range(LAYERS)},
         **{f"kv_cache_v_{i}": v_new_list[i] for i in range(LAYERS)},
     }
+
+
+class MtpHead(nn.Module):
+  """LM head of a single MTP codebook.
+
+  Exported as one TFLite signature per codebook (`head_0` .. `head_14`) so the
+  runtime only evaluates the head it needs at each MTP step instead of all 15.
+  """
+
+  def __init__(self, weight: torch.Tensor):
+    super().__init__()
+    self.register_buffer("weight", weight.contiguous(), persistent=False)
+
+  def forward(self, hidden: torch.Tensor) -> torch.Tensor:  # [1, 1024]
+    return F.linear(hidden, self.weight)  # [1, VOCAB]
+
+
+def head_signature_name(index: int) -> str:
+  """Returns the TFLite signature name of the MTP LM head `index`."""
+  return f"head_{index}"
 
 
 # Backwards compatibility alias

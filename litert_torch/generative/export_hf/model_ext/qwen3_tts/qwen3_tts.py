@@ -84,8 +84,29 @@ def setup_talker_recipe():
 
 
 def get_mtp_quant_config():
-  """Returns the LiteRT quantization recipe for MTP."""
-  return quant_recipes.full_fp16_recipe()
+  """Returns the LiteRT quantization recipe for MTP.
+
+  INT8 dynamic-range weights: the MTP step runs 16 times per 80 ms audio frame
+  and is memory-bandwidth bound, so weight bytes dominate its latency (fp16
+  weights are upcast to fp32 by the CPU delegate at load time).
+  """
+  return quant_recipes.full_dynamic_recipe()
+
+
+# Name of the MTP decode-step signature. It is always signature index 0; the
+# per-codebook LM heads follow as `exportable_module.head_signature_name(i)`.
+MTP_STEP_SIGNATURE = "mtp_step"
+
+# Codec decoder window sizes (in 12.5 Hz frames) exported as separate
+# signatures. 64 is the steady-state window (25 frames of overlap context +
+# 39 new frames); the smaller ones render the first audio chunk early and the
+# tail cheaply.
+CODEC_DECODER_WINDOWS = (16, 32, 64)
+
+
+def codec_window_signature_name(num_frames: int) -> str:
+  """Returns the codec decoder signature name for a `num_frames` window."""
+  return f"decode_{num_frames}"
 
 
 class Qwen3Tts(tts_model.TtsModel):
@@ -348,10 +369,30 @@ class Qwen3Tts(tts_model.TtsModel):
         return self.dec(codes)
 
     out_path = os.path.join(output_dir, "codec_decoder_fp32.tflite")
-    sample_input = (torch.zeros(1, 16, 64, dtype=torch.int32),)
-    litert_torch.convert(CodecDecode(decoder).eval(), sample_input).export(
-        out_path
+    codec_module = CodecDecode(decoder).eval()
+    # One signature per decode window size. The codec is causal, so the
+    # runtime renders the first audio chunk through a small window (zero
+    # right-padded) for low latency and switches to the largest window for
+    # steady-state throughput. Signature 0 keeps the largest window so that
+    # single-signature consumers see the same model as before. Identical
+    # constant buffers are shared across signatures in the flatbuffer.
+    windows = sorted(CODEC_DECODER_WINDOWS, reverse=True)
+    converter = litert_torch.signature(
+        codec_window_signature_name(windows[0]),
+        codec_module,
+        sample_kwargs={
+            "codes": torch.zeros(1, 16, windows[0], dtype=torch.int32)
+        },
     )
+    for window in windows[1:]:
+      converter.add_signature(
+          codec_window_signature_name(window),
+          codec_module,
+          sample_kwargs={
+              "codes": torch.zeros(1, 16, window, dtype=torch.int32)
+          },
+      )
+    converter.convert().export(out_path)
     print(f"Codec decoder exported to: {out_path}")
     return out_path
 
@@ -439,11 +480,23 @@ class Qwen3Tts(tts_model.TtsModel):
         },
     }
 
-    out_path = os.path.join(output_dir, "mtp_fp32.tflite")
+    # Signature 0 is the decode step (the runtime addresses it by index); the
+    # 15 codebook LM heads follow as `head_<i>` signatures so that each step
+    # only evaluates the single head it needs.
+    converter = litert_torch.signature(
+        MTP_STEP_SIGNATURE, mtp_module, sample_kwargs=sample_inputs
+    )
+    heads = weights["heads"]
+    for i in range(heads.shape[0]):
+      converter.add_signature(
+          exportable_module.head_signature_name(i),
+          exportable_module.MtpHead(heads[i]).eval(),
+          sample_kwargs={"hidden": torch.zeros(1, 1024, dtype=torch.float32)},
+      )
+
+    out_path = os.path.join(output_dir, "mtp.tflite")
     quant_cfg = get_mtp_quant_config()
-    litert_torch.convert(
-        mtp_module, sample_kwargs=sample_inputs, quant_config=quant_cfg
-    ).export(out_path)
+    converter.convert(quant_config=quant_cfg).export(out_path)
     print(f"MTP model exported to: {out_path}")
     return out_path
 
