@@ -271,7 +271,12 @@ def gated_delta_update(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Reference PyTorch implementation of Gated Delta Update."""
   del mode
-  _, num_v_heads, _, _ = v_t.shape
+  batch_size, num_v_heads, _, _ = v_t.shape
+  if valid_len is not None and valid_len.shape != (batch_size,):
+    raise ValueError(
+        f"valid_len must be a 1D tensor of shape [{batch_size}], got"
+        f" {tuple(valid_len.shape)}"
+    )
   num_k_heads = q_t.shape[1]
   if num_v_heads != num_k_heads:
     g_ratio = num_v_heads // num_k_heads
@@ -295,8 +300,13 @@ def _gated_delta_update_fake(
     mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Fake implementation for shape inference."""
-  del k_t, beta_t, g_t, valid_len, mode
+  del k_t, beta_t, g_t, mode
   batch_size, num_v_heads, seq_len, head_v_dim = v_t.shape
+  if valid_len is not None and valid_len.shape != (batch_size,):
+    raise ValueError(
+        f"valid_len must be a 1D tensor of shape [{batch_size}], got"
+        f" {tuple(valid_len.shape)}"
+    )
   out1 = torch.empty(
       (batch_size, num_v_heads, seq_len, head_v_dim),
       dtype=q_t.dtype,

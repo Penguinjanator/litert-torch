@@ -206,7 +206,7 @@ class Qwen3_5StaticGatedDeltaNet(nn.Module):
       num_real = valid_mask[0].to(torch.float32).sum().to(torch.int32)
       num_valid_tokens = num_real.reshape(1)
       valid_len = (
-          num_real
+          num_valid_tokens
           if batch_size == 1
           else valid_mask.to(torch.float32).sum(dim=-1).to(torch.int32)
       )
