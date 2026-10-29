@@ -122,6 +122,28 @@ def _snapshot_module_hierarchy(
   }
 
 
+def _has_low_precision_floats(model: torch.nn.Module) -> bool:
+  """Returns True if any parameter or buffer on `model` is bfloat16/float16."""
+  for tensor in list(model.parameters()) + list(model.buffers()):
+    if tensor.dtype in (torch.bfloat16, torch.float16):
+      return True
+  return False
+
+
+def _cast_low_precision_tree_to_fp32(tree: Any) -> Any:
+  """Casts bfloat16/float16 tensors in `tree` to float32."""
+
+  def _cast_leaf(x: Any) -> Any:
+    if isinstance(x, torch.Tensor) and x.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+      return x.to(torch.float32)
+    return x
+
+  return pytree.tree_map(_cast_leaf, tree)
+
+
 def assert_patch_numerical_parity(
     ext: extension.ModelExtension,
     model: torch.nn.Module,
@@ -133,6 +155,7 @@ def assert_patch_numerical_parity(
     atol: float = 1e-4,
     rtol: float = 1e-4,
     check_restoration: bool = True,
+    cast_to_float32: bool = True,
 ) -> tuple[Any, Any]:
   """Verifies numerical parity before/during `patch_model` and state restoration.
 
@@ -152,6 +175,11 @@ def assert_patch_numerical_parity(
     rtol: Relative tolerance for `torch.testing.assert_close`.
     check_restoration: Whether to assert submodule types and `.forward`
       attributes are restored after exiting `patch_model`.
+    cast_to_float32: When `True` (default), if `model` has `bfloat16` or
+      `float16` parameters (common when `from_config` reads `"dtype":
+      "bfloat16"` from `config.json`), runs numerical comparison on a `float32`
+      copy to avoid `~1e-2` low-precision rounding noise while still checking
+      hierarchy restoration on `model`.
 
   Returns:
     A 2-tuple `(baseline_output, patched_output)`.
@@ -175,12 +203,32 @@ def assert_patch_numerical_parity(
   )
   before_snapshot = _snapshot_module_hierarchy(model)
 
+  use_fp32_copy = cast_to_float32 and _has_low_precision_floats(model)
+  eval_model = (
+      copy.deepcopy(model).to(torch.float32).eval() if use_fp32_copy else model
+  )
+  eval_args = (
+      _cast_low_precision_tree_to_fp32(sample_args)
+      if use_fp32_copy
+      else sample_args
+  )
+  eval_kwargs = (
+      _cast_low_precision_tree_to_fp32(kwargs) if use_fp32_copy else kwargs
+  )
+
   with torch.no_grad():
-    baseline_out = model(*copy.deepcopy(sample_args), **copy.deepcopy(kwargs))
+    baseline_out = eval_model(
+        *copy.deepcopy(eval_args), **copy.deepcopy(eval_kwargs)
+    )
     with model_ext_patches.get_patch_context(model_type, export_config):
-      with model_ext_patches.patch_model(model, model_type, export_config):
-        patched_out = model(
-            *copy.deepcopy(sample_args), **copy.deepcopy(kwargs)
+      if use_fp32_copy:
+        # Also exercise `patch_model` on the caller's `model` to verify
+        # restoration on the original instance.
+        with model_ext_patches.patch_model(model, model_type, export_config):
+          pass
+      with model_ext_patches.patch_model(eval_model, model_type, export_config):
+        patched_out = eval_model(
+            *copy.deepcopy(eval_args), **copy.deepcopy(eval_kwargs)
         )
 
   if check_restoration:
@@ -275,6 +323,8 @@ def assert_tiny_prefill_decode_torch_export(
     `'prefill_rope_8'`, `'decode_rope'`) to `torch.export.ExportedProgram`s.
   """
   traced_model: Any = copy.deepcopy(model).eval()
+  if _has_low_precision_floats(traced_model):
+    traced_model = traced_model.to(torch.float32)
   if hasattr(traced_model, 'get_text_model'):
     traced_model = traced_model.get_text_model()
 
@@ -306,6 +356,19 @@ def assert_tiny_prefill_decode_torch_export(
     )
 
   export_config = ext.update_export_config(export_config, model_config)
+
+  if (
+      export_config.sliding_window_ring_buffer_size is not None
+      and not export_config.split_cache
+      and not export_config.apply_gpu_composites
+  ):
+    merged_extra = dict(export_config.extra_kwargs or {})
+    merged_extra.setdefault('use_bool_mask', True)
+    export_config = dataclasses.replace(
+        export_config,
+        apply_gpu_composites=True,
+        extra_kwargs=merged_extra,
+    )
   text_model_config = getattr(model_config, 'text_config', model_config)
 
   if hasattr(model_config, 'allow_global_per_layer_attribute_access'):
@@ -482,6 +545,7 @@ class ModelExtensionTestMixin:
       atol: float = 1e-4,
       rtol: float = 1e-4,
       check_restoration: bool = True,
+      cast_to_float32: bool = True,
   ) -> tuple[Any, Any]:
     """Verifies eager numerical parity before/during `patch_model` and state restoration."""
     target_model = model if model is not None else self.get_sample_model()
@@ -499,6 +563,7 @@ class ModelExtensionTestMixin:
         atol=atol,
         rtol=rtol,
         check_restoration=check_restoration,
+        cast_to_float32=cast_to_float32,
     )
 
   def assert_tiny_prefill_decode_torch_export(

@@ -53,6 +53,7 @@ import glob
 import inspect
 import json
 import os
+import re
 import traceback
 from typing import Any
 
@@ -111,6 +112,8 @@ class ArchitectureInspectionReport:
   dry_run_results: list[DryRunCheckResult]
   recommendations: list[str]
   skeleton_code: str
+  conv_classes: list[str] = dataclasses.field(default_factory=list)
+  unpatched_conv_classes: list[str] = dataclasses.field(default_factory=list)
 
   def to_dict(self) -> dict[str, Any]:
     """Returns a JSON-serializable dictionary representation of the report."""
@@ -151,6 +154,10 @@ class ArchitectureInspectionReport:
         (
             f'- **Attention classes**: `{self.attention_classes}` (uses'
             f' `ALL_ATTENTION_FUNCTIONS`: `{self.attention_uses_interface}`)'
+        ),
+        (
+            f'- **ShortConv / Conv classes**: `{self.conv_classes}`'
+            f' (unpatched: `{self.unpatched_conv_classes}`)'
         ),
         (
             f'- **Rotary embedding attributes**: `{self.rotary_attributes}`'
@@ -245,26 +252,54 @@ def _inspect_safetensors_keys(model_path: str) -> tuple[list[str], list[str]]:
 def _shrink_config_for_tiny_model(
     config: transformers.PretrainedConfig,
 ) -> transformers.PretrainedConfig:
-  """Returns a deep copy of `config` shrunk to 2 layers for fast CPU tracing."""
+  """Returns a deep copy of `config` shrunk to 2+ layers for fast CPU tracing."""
   tiny_cfg = copy.deepcopy(config)
 
+  def _clamp_token_id(val: Any, vocab_size: int, fallback: int) -> Any:
+    if isinstance(val, int):
+      return fallback if (val < 0 or val >= vocab_size) else val
+    if isinstance(val, list):
+      return [
+          fallback if (isinstance(v, int) and (v < 0 or v >= vocab_size)) else v
+          for v in val
+      ]
+    return val
+
   def _shrink_single(cfg: Any):
-    if hasattr(cfg, 'num_hidden_layers'):
-      cfg.num_hidden_layers = min(int(getattr(cfg, 'num_hidden_layers', 2)), 2)
+    orig_num_layers = int(getattr(cfg, 'num_hidden_layers', 2) or 2)
+    target_layers = min(orig_num_layers, 2)
     if hasattr(cfg, 'layer_types') and isinstance(cfg.layer_types, list):
       orig_types = list(cfg.layer_types)
-      num_layers = getattr(cfg, 'num_hidden_layers', 2)
-      if len(orig_types) > num_layers:
-        # Preserve both sliding_attention and full_attention in the 2-layer
-        # slice when the original model mixes both.
-        if (
-            num_layers >= 2
-            and 'sliding_attention' in orig_types
-            and 'full_attention' in orig_types
-        ):
-          cfg.layer_types = ['sliding_attention', 'full_attention'][:num_layers]
-        else:
-          cfg.layer_types = orig_types[:num_layers]
+      # Preserve at least one instance of every distinct layer type in order of
+      # first appearance (e.g. ['conv', 'sliding_attention', 'full_attention']
+      # for tri-hybrid models like LFM3 where layers 0-1 are ['conv', 'conv']).
+      unique_types = list(dict.fromkeys(orig_types))
+      target_layers = max(target_layers, len(unique_types))
+      target_layers = min(
+          target_layers, max(orig_num_layers, len(unique_types))
+      )
+      if len(orig_types) > target_layers:
+        combined: list[str] = list(unique_types)
+        for lt in orig_types:
+          if len(combined) >= target_layers:
+            break
+          combined.append(lt)
+        cfg.layer_types = combined[:target_layers]
+    if hasattr(cfg, 'num_hidden_layers'):
+      cfg.num_hidden_layers = target_layers
+    if hasattr(cfg, 'vocab_size') and isinstance(cfg.vocab_size, int):
+      vocab_size = int(cfg.vocab_size)
+      for attr, fallback in (
+          ('pad_token_id', 0),
+          ('bos_token_id', min(1, max(vocab_size - 1, 0))),
+          ('eos_token_id', min(2, max(vocab_size - 1, 0))),
+      ):
+        if hasattr(cfg, attr):
+          setattr(
+              cfg,
+              attr,
+              _clamp_token_id(getattr(cfg, attr), vocab_size, fallback),
+          )
     if hasattr(cfg, 'dtype'):
       cfg.dtype = torch.float32
     if hasattr(cfg, 'torch_dtype'):
@@ -285,27 +320,61 @@ def _generate_extension_skeleton(
     has_dual_rope_attrs: bool,
     rotary_accepts_layer_type: bool,
     has_dual_rope_parameters: bool,
+    has_auto_map: bool = False,
+    architectures: Sequence[str] = (),
+    mlp_proj_names: Sequence[str] = (),
 ) -> str:
   """Generates a tailored `ModelExtension` Python skeleton from findings."""
+  safe_model_type = re.sub(
+      r'[^0-9a-zA-Z_]', '_', model_type or 'custom_arch'
+  ).lower()
+  if safe_model_type and safe_model_type[0].isdigit():
+    safe_model_type = f'_{safe_model_type}'
   cls_prefix = ''.join(
-      part.capitalize() for part in (model_type or 'CustomArch').split('_')
+      part.capitalize()
+      for part in re.split(r'[^0-9a-zA-Z]+', model_type or 'CustomArch')
+      if part
   )
+  if not cls_prefix or cls_prefix[0].isdigit():
+    cls_prefix = f'Model{cls_prefix}'
   ext_cls_name = f'{cls_prefix}Extension'
   needs_rmsnorm_patch = bool(unpatched_rmsnorm_classes)
   needs_dual_rope_patch = (
       has_dual_rope_parameters or has_dual_rope_attrs
   ) and not rotary_accepts_layer_type
+  needs_w1_w3_fusion = 'w1' in mlp_proj_names and 'w3' in mlp_proj_names
+  arch_cls_name = (
+      architectures[0] if architectures else f'{cls_prefix}ForCausalLM'
+  )
 
   lines = [
       'import contextlib',
-      'from litert_torch.generative.export_hf.model_ext import extension',
   ]
+  if has_auto_map:
+    lines.append('import sys')
+  lines.append(
+      'from litert_torch.generative.export_hf.model_ext import extension'
+  )
   if needs_rmsnorm_patch:
     lines.append('from litert_torch.generative.layers import normalization')
   if needs_rmsnorm_patch or needs_dual_rope_patch:
     lines.append('import torch')
   lines.append('')
   lines.append('')
+
+  if has_auto_map:
+    lines.extend([
+        f'def _find_{safe_model_type}_modeling_module():',
+        '  for mod_name, mod in list(sys.modules.items()):',
+        (
+            f'    if mod_name.endswith("modeling_{safe_model_type}") and'
+            f' hasattr(mod, {arch_cls_name!r}):'
+        ),
+        '      return mod',
+        '  return None',
+        '',
+        '',
+    ])
 
   if needs_rmsnorm_patch:
     lines.extend([
@@ -357,6 +426,23 @@ def _generate_extension_skeleton(
   if unrecognized_prefixes:
     prefixes_tuple = ', '.join(repr(p) for p in unrecognized_prefixes)
     lines.append(f'  checkpoint_key_prefixes = ({prefixes_tuple},)')
+  if needs_w1_w3_fusion:
+    lines.extend([
+        '  fused_weight_specs = (',
+        "      extension.FusedWeightSpec('gate_up_proj', ('w1', 'w3'), dim=0),",
+        '  )',
+    ])
+  if has_auto_map:
+    lines.extend([
+        '',
+        '  def get_hf_model_cls(self, task, config, export_config):',
+        '    del task, config, export_config',
+        f'    mod = _find_{safe_model_type}_modeling_module()',
+        (
+            f'    return getattr(mod, {arch_cls_name!r}, None) if mod is not'
+            ' None else None'
+        ),
+    ])
 
   if needs_rmsnorm_patch or needs_dual_rope_patch:
     lines.extend([
@@ -561,6 +647,8 @@ def inspect_model_architecture(
   mlp_proj_names: set[str] = set()
   attention_classes: set[str] = set()
   attention_uses_interface = True
+  conv_classes: set[str] = set()
+  unpatched_conv_classes: set[str] = set()
   rotary_attributes: list[str] = []
   rotary_accepts_layer_type = True
   dry_run_results: list[DryRunCheckResult] = []
@@ -673,6 +761,23 @@ def inspect_model_architecture(
           except (OSError, TypeError):
             pass
 
+        if (
+            cls_name.endswith('Conv')
+            and not issubclass(cls, torch.nn.modules.conv._ConvNd)  # pylint: disable=protected-access
+            and not cls_name.startswith('LiteRT')
+        ):
+          conv_classes.add(cls_name)
+          try:
+            conv_src = inspect.getsource(cls.forward)
+          except (OSError, TypeError):
+            conv_src = ''
+          if (
+              'apply_short_conv_step' not in conv_src
+              and 'short_conv_composite' not in conv_src
+              and 'short_conv(' not in conv_src
+          ):
+            unpatched_conv_classes.add(cls_name)
+
     if run_dry_run_export:
       modes_to_check = [('default_prefill_decode', False)]
       if split_cache or has_dual_rope_parameters:
@@ -754,6 +859,26 @@ def inspect_model_architecture(
         ' in `patch_model` to call the registered LiteRT attention interface.'
     )
 
+  if unpatched_conv_classes:
+    recommendations.append(
+        f'ShortConv class(es) `{sorted(unpatched_conv_classes)}` do not use'
+        ' `short_conv.apply_short_conv_step` / `short_conv.short_conv`: patch'
+        ' `.forward` in `patch_model` to read/write'
+        ' `past_key_values.layers[layer_idx].conv_states`, pass'
+        ' `self.in_proj(hidden_states)` to `short_conv`, and ensure'
+        ' `causal_mask_mapping.setdefault("conv", None)` and `valid_mask`'
+        ' (`**kwargs`) are forwarded in the model/decoder layers.'
+    )
+
+  if 'w1' in mlp_proj_names and 'w3' in mlp_proj_names:
+    recommendations.append(
+        'MLP uses `w1`/`w3` projections: when fusing into `gate_up_proj`,'
+        ' declare `fused_weight_specs ='
+        ' (extension.FusedWeightSpec("gate_up_proj", ("w1", "w3"), dim=0),)` on'
+        ' your `ModelExtension` so Converter V2 (`--use_v2`) concatenates them'
+        ' from `.safetensors`.'
+    )
+
   for res in dry_run_results:
     if not res.passed:
       recommendations.append(
@@ -768,6 +893,9 @@ def inspect_model_architecture(
       has_dual_rope_attrs='rotary_emb_full' in rotary_attributes,
       rotary_accepts_layer_type=rotary_accepts_layer_type,
       has_dual_rope_parameters=has_dual_rope_parameters,
+      has_auto_map=has_auto_map,
+      architectures=architectures,
+      mlp_proj_names=sorted(mlp_proj_names),
   )
 
   return ArchitectureInspectionReport(
@@ -798,6 +926,8 @@ def inspect_model_architecture(
       dry_run_results=dry_run_results,
       recommendations=recommendations,
       skeleton_code=skeleton_code,
+      conv_classes=sorted(conv_classes),
+      unpatched_conv_classes=sorted(unpatched_conv_classes),
   )
 
 

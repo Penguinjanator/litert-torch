@@ -933,6 +933,126 @@ class ModelExtensionTest(googletest.TestCase):
     )
     self.assertFalse(mod._has_sliding_window(cfg_no_ext))
 
+  def test_shrink_config_preserves_distinct_layer_types_and_clamps_token_ids(
+      self,
+  ):
+    tri_hybrid_cfg = transformers.PretrainedConfig.from_dict({
+        'model_type': 'lfm3_like',
+        'vocab_size': 256,
+        'pad_token_id': 124893,
+        'bos_token_id': 124800,
+        'eos_token_id': [124801, 124809],
+        'num_hidden_layers': 24,
+        'layer_types': (
+            [
+                'conv',
+                'conv',
+                'sliding_attention',
+                'conv',
+                'full_attention',
+            ]
+            + ['conv'] * 19
+        ),
+        'dtype': 'bfloat16',
+    })
+    shrunk = inspector._shrink_config_for_tiny_model(tri_hybrid_cfg)  # pylint: disable=protected-access
+    self.assertEqual(shrunk.num_hidden_layers, 3)
+    self.assertEqual(
+        shrunk.layer_types,
+        ['conv', 'sliding_attention', 'full_attention'],
+    )
+    self.assertEqual(shrunk.pad_token_id, 0)
+    self.assertEqual(shrunk.bos_token_id, 1)
+    self.assertEqual(shrunk.eos_token_id, [2, 2])
+    self.assertEqual(shrunk.dtype, torch.float32)
+
+  def test_assert_patch_numerical_parity_casts_bfloat16_models_to_fp32(self):
+    ext = builtin_extensions.Qwen3Extension()
+    qwen3_cfg = transformers.Qwen3Config(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+    )
+    with ext.patch_context():
+      bf16_model = (
+          transformers.Qwen3ForCausalLM(qwen3_cfg).to(torch.bfloat16).eval()
+      )
+    export_cfg = ExportableModuleConfig(
+        model='dummy',
+        externalize_embedder=True,
+        fuse_gate_up=True,
+        fuse_qkv=True,
+    )
+    sample_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    ext_testing.assert_patch_numerical_parity(
+        ext=ext,
+        model=bf16_model,
+        sample_kwargs={'input_ids': sample_ids, 'use_cache': False},
+        export_config=export_cfg,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    # Original model remains in bfloat16 after parity check and restoration.
+    self.assertEqual(next(bf16_model.parameters()).dtype, torch.bfloat16)
+
+  def test_generate_extension_skeleton_sanitizes_hyphenated_model_type(self):
+    skeleton = inspector._generate_extension_skeleton(  # pylint: disable=protected-access
+        model_type='qwen2-vl',
+        unrecognized_prefixes=(),
+        unpatched_rmsnorm_classes=('Qwen2VLTextRMSNorm',),
+        has_dual_rope_attrs=False,
+        rotary_accepts_layer_type=True,
+        has_dual_rope_parameters=False,
+        has_auto_map=True,
+        architectures=('Qwen2VLForConditionalGeneration',),
+        mlp_proj_names=('w1', 'w2', 'w3'),
+    )
+    # Must be syntactically valid Python even with a hyphenated model_type.
+    compile(skeleton, '<skeleton>', 'exec')
+    self.assertIn('class Qwen2VlExtension(extension.ModelExtension):', skeleton)
+    self.assertIn('def _find_qwen2_vl_modeling_module():', skeleton)
+    self.assertIn('mod = _find_qwen2_vl_modeling_module()', skeleton)
+
+  def test_tiny_prefill_decode_export_auto_enables_gpu_composites_after_update_export_config(
+      self,
+  ):
+    class _RingBufferInUpdateConfigExt(builtin_extensions.Gemma3Extension):
+      model_types = ('gemma3_text_ring_test',)
+
+      def update_export_config(self, export_config, model_config):
+        del model_config
+        return dataclasses.replace(
+            export_config, sliding_window_ring_buffer_size=32
+        )
+
+    ext = _RingBufferInUpdateConfigExt()
+    gemma3_cfg = transformers.Gemma3TextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        sliding_window=8,
+        layer_types=['sliding_attention', 'full_attention'],
+        max_position_embeddings=64,
+    )
+    with ext.patch_context():
+      tiny_model = transformers.Gemma3ForCausalLM(gemma3_cfg).eval()
+    # Default export_config=None; `sliding_window_ring_buffer_size` is only set
+    # inside `ext.update_export_config`.
+    exported = ext_testing.assert_tiny_prefill_decode_torch_export(
+        ext=ext,
+        model=tiny_model,
+    )
+    self.assertIn('decode', exported)
+
 
 class BuiltinQwen3ExtensionContractTest(
     ext_testing.ModelExtensionTestMixin, googletest.TestCase

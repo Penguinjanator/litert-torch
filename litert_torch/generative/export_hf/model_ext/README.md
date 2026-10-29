@@ -395,6 +395,40 @@ class MyFusedArchExtension(extension.ModelExtension):
         setattr(parent, name, orig_child)
 ```
 
+#### LiteRT-Torch Composite Ops & Import Cheat-Sheet
+
+When authoring `patch_model` or `patch_context`, use the exact import paths and
+call contracts below:
+
+| Operator | Import Path | Call Signature & Tensor Shape Contract |
+| :--- | :--- | :--- |
+| **RMSNorm (`odml.rms_norm`)** | `from litert_torch.generative.layers import normalization` | `normalization.rms_norm_with_hlfb(hidden_states, weight, eps, torch.ones((hidden_size,), dtype=torch.float32, device=hidden_states.device))` — takes **4 positional arguments** (including the 4th `ones` tensor). |
+| **SwiGLU (`odml.swiglu`)** | `from litert_torch.generative.export_hf.experimental.composites import swiglu` | `swiglu.apply_swiglu(gate_up)` — takes concatenated `[gate, up]` (`[B, T, 2 * D_ff]`) from `gate_up_proj(x)` and returns `[B, T, D_ff]` **before** `down_proj` / `w2`. |
+| **ShortConv (`odml.short_conv`)** | `from litert_torch.generative.export_hf.experimental.composites import short_conv` | `short_conv.apply_short_conv_step(in_proj_out, conv_state, conv_weight, conv_bias, num_valid_tokens, conv_L_cache)` (or `short_conv.short_conv(...)`) — takes `in_proj_out = self.in_proj(hidden_states)` (`[B, T, 3 * D]`) and returns `(y, new_conv_state)` **before** `self.out_proj(y)`. |
+| **Attention (`ALL_ATTENTION_FUNCTIONS`)** | `from litert_torch.generative.export_hf.core import attention as _` | Dispatch via `modeling_utils.ALL_ATTENTION_FUNCTIONS[config._attn_implementation]`. Note that `lrt_transposed_attention` returns `attn_output` as `[B, T, num_heads, head_dim]` on CPU/prefill, whereas `gpu_sdpa` decode returns `[B, 1, num_heads * head_dim]`. Always reshape via `attn_output.reshape(*input_shape, self.num_heads, self.head_dim)` before applying per-head post-SDPA gates (e.g. `LFM3`'s `gate_proj`). |
+
+#### Hybrid Architectures (`conv` + `sliding_attention` + `full_attention`) & `trust_remote_code`
+
+For hybrid models (such as `LiquidAI/LFM3-1.7B`) that combine short-convolution
+(`"conv"`), sliding-window attention (`"sliding_attention"`), and full causal
+attention (`"full_attention"`) in `config.layer_types`:
+
+1. **`trust_remote_code` Dynamic Module Lookup**: When loaded with
+   `trust_remote_code=True`, the modeling module resides in `sys.modules` under
+   `transformers_modules.<repo>.modeling_<arch>`. Scan `sys.modules` in a
+   helper (`_find_<arch>_modeling_module()`) and return the `ForCausalLM` class
+   from `get_hf_model_cls` so Converter V2 (`use_v2=True`) and `patch_context`
+   can locate it.
+2. **Mask Mapping for `"conv"` Layers**: When `sliding_window` is set,
+   `exportable_module.adapt_inputs` passes `attention_mask = {'full_attention':
+   ..., 'sliding_attention': ...}`. Ensure your patched `Model.forward` calls
+   `causal_mask_mapping.setdefault('conv', None)` (or `.get(layer_type)`) and
+   forwards `**kwargs` (`valid_mask`) through `DecoderLayer.forward` into
+   `ShortConv.forward`.
+3. **Reasoning / Thinking Channels (`<think>...</think>`)**: Override
+   `build_llm_metadata` to set `llm_metadata.supports_thinking = True` and add
+   a `'thought'` channel (`start='<think>'`, `end='</think>'`).
+
 ### 4. Converter V2 Weights (`checkpoint_key_prefixes`, `fused_weight_specs` & `resolve_checkpoint_tensor`)
 
 When exporting with Converter V2 and meta-device weight streaming (`--use_v2`
