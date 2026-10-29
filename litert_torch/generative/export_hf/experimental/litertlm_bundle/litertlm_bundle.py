@@ -327,25 +327,33 @@ def pack_litertlm(
 
   builder.add_tflite_model(
       tflite_model_path=prefilldecode_model_path,
-      model_type=litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+      model_type=llm_metadata_pb2.LlmMetadata.TfLiteModelType.Name(
+          llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+      ).lower(),
   )
 
   if embedder_model_path:
     builder.add_tflite_model(
         tflite_model_path=embedder_model_path,
-        model_type=litertlm_builder.TfLiteModelType.EMBEDDER,
+        model_type=llm_metadata_pb2.LlmMetadata.TfLiteModelType.Name(
+            llm_metadata_pb2.LlmMetadata.TF_LITE_EMBEDDER
+        ).lower(),
     )
 
   if auxiliary_model_path:
     builder.add_tflite_model(
         tflite_model_path=auxiliary_model_path,
-        model_type=litertlm_builder.TfLiteModelType.AUX,
+        model_type=llm_metadata_pb2.LlmMetadata.TfLiteModelType.Name(
+            llm_metadata_pb2.LlmMetadata.TF_LITE_AUX
+        ).lower(),
     )
 
   if ple_model_path:
     builder.add_tflite_model(
         tflite_model_path=ple_model_path,
-        model_type=litertlm_builder.TfLiteModelType.PER_LAYER_EMBEDDER,
+        model_type=llm_metadata_pb2.LlmMetadata.TfLiteModelType.Name(
+            llm_metadata_pb2.LlmMetadata.TF_LITE_PER_LAYER_EMBEDDER
+        ).lower(),
     )
 
   if spm_path:

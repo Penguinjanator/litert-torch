@@ -26,6 +26,7 @@ from litert_torch.generative.export_hf.experimental.litert_lm_npu_compiler impor
 
 from ai_edge_litert.aot.core import aot_types
 import litert_lm_builder as litertlm_builder
+from litert_lm_builder.runtime.proto import embedding_metadata_pb2
 from litert_lm_builder.runtime.proto import llm_metadata_pb2
 from tensorflow.lite.python import schema_py_generated as schema_fb
 
@@ -210,10 +211,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        main_model_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
+        main_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
     )
     builder.add_tflite_model(
-        aux_model_path, litertlm_builder.TfLiteModelType.AUX
+        aux_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_AUX
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -328,10 +329,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        main_model_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
+        main_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
     )
     builder.add_tflite_model(
-        aux_model_path, litertlm_builder.TfLiteModelType.AUX
+        aux_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_AUX
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -414,10 +415,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        main_model_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
+        main_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
     )
     builder.add_tflite_model(
-        aux_model_path, litertlm_builder.TfLiteModelType.AUX
+        aux_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_AUX
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -486,10 +487,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        main_model_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
+        main_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
     )
     builder.add_tflite_model(
-        aux_model_path, litertlm_builder.TfLiteModelType.AUX
+        aux_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_AUX
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -538,10 +539,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        main_model_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
+        main_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
     )
     builder.add_tflite_model(
-        aux_model_path, litertlm_builder.TfLiteModelType.AUX
+        aux_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_AUX
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -603,10 +604,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        main_model_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
+        main_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
     )
     builder.add_tflite_model(
-        aux_model_path, litertlm_builder.TfLiteModelType.AUX
+        aux_model_path, llm_metadata_pb2.LlmMetadata.TF_LITE_AUX
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -681,16 +682,19 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        text_enc_path, litertlm_builder.TfLiteModelType.TEXT_ENCODER
+        text_enc_path,
+        embedding_metadata_pb2.EmbeddingMetadata.TfLiteModelType.Name(
+            embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_TEXT_ENCODER
+        ).lower(),
     )
     builder.add_tflite_model(
         audio_enc_path,
-        litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW,
         backend_constraint='cpu',
     )
     builder.add_tflite_model(
         vision_enc_path,
-        litertlm_builder.TfLiteModelType.VISION_ENCODER,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER,
         prefer_activation_type='fp16',
     )
     builder.add_llm_metadata(metadata_path)
@@ -772,16 +776,19 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        text_enc_path, litertlm_builder.TfLiteModelType.TEXT_ENCODER
+        text_enc_path,
+        embedding_metadata_pb2.EmbeddingMetadata.TfLiteModelType.Name(
+            embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_TEXT_ENCODER
+        ).lower(),
     )
     builder.add_tflite_model(
         audio_enc_path,
-        litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW,
         backend_constraint='cpu',
     )
     builder.add_tflite_model(
         vision_enc_path,
-        litertlm_builder.TfLiteModelType.VISION_ENCODER,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER,
         prefer_activation_type='fp16',
     )
     builder.add_llm_metadata(metadata_path)
@@ -875,7 +882,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        text_enc_path, litertlm_builder.TfLiteModelType.TEXT_ENCODER
+        text_enc_path,
+        embedding_metadata_pb2.EmbeddingMetadata.TfLiteModelType.Name(
+            embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_TEXT_ENCODER
+        ).lower(),
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -935,7 +945,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        text_enc_path, litertlm_builder.TfLiteModelType.TEXT_ENCODER
+        text_enc_path,
+        embedding_metadata_pb2.EmbeddingMetadata.TfLiteModelType.Name(
+            embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_TEXT_ENCODER
+        ).lower(),
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -1009,10 +1022,13 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        text_enc_path, litertlm_builder.TfLiteModelType.TEXT_ENCODER
+        text_enc_path,
+        embedding_metadata_pb2.EmbeddingMetadata.TfLiteModelType.Name(
+            embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_TEXT_ENCODER
+        ).lower(),
     )
     builder.add_tflite_model(
-        vision_enc_path, litertlm_builder.TfLiteModelType.VISION_ENCODER
+        vision_enc_path, llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)
@@ -1082,7 +1098,10 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
     input_litertlm_path = os.path.join(self.test_dir, 'input.litertlm')
     builder = litertlm_builder.LitertLmFileBuilder()
     builder.add_tflite_model(
-        text_enc_path, litertlm_builder.TfLiteModelType.TEXT_ENCODER
+        text_enc_path,
+        embedding_metadata_pb2.EmbeddingMetadata.TfLiteModelType.Name(
+            embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_TEXT_ENCODER
+        ).lower(),
     )
     builder.add_llm_metadata(metadata_path)
     builder.add_sentencepiece_tokenizer(tokenizer_path)

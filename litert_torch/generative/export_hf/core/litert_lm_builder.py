@@ -718,53 +718,53 @@ def package_model(
   if export_config.experimental_use_fp16:
     builder.add_tflite_model(
         exported_model_artifacts.prefill_decode_model_path,  # pyrefly: ignore[bad-argument-type]
-        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE,
         prefer_activation_type='fp32_fp16',
     )
   else:
     builder.add_tflite_model(
         exported_model_artifacts.prefill_decode_model_path,  # pyrefly: ignore[bad-argument-type]
-        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE,
     )
   if exported_model_artifacts.embedder_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.embedder_model_path,
-        litertlm_builder.TfLiteModelType.EMBEDDER,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_EMBEDDER,
     )
   if exported_model_artifacts.vision_encoder_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.vision_encoder_model_path,
-        litertlm_builder.TfLiteModelType.VISION_ENCODER,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER,
     )
   if exported_model_artifacts.vision_adapter_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.vision_adapter_model_path,
-        litertlm_builder.TfLiteModelType.VISION_ADAPTER,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ADAPTER,
     )
   if exported_model_artifacts.eoi_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.eoi_model_path,
-        litertlm_builder.TfLiteModelType.END_OF_VISION,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_END_OF_VISION,
     )
   if exported_model_artifacts.audio_encoder_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.audio_encoder_model_path,
-        litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW,
     )
   if exported_model_artifacts.audio_adapter_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.audio_adapter_model_path,
-        litertlm_builder.TfLiteModelType.AUDIO_ADAPTER,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ADAPTER,
     )
   if exported_model_artifacts.eoa_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.eoa_model_path,
-        litertlm_builder.TfLiteModelType.END_OF_AUDIO,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_END_OF_AUDIO,
     )
   if exported_model_artifacts.auxiliary_model_path:
     builder.add_tflite_model(
         exported_model_artifacts.auxiliary_model_path,
-        litertlm_builder.TfLiteModelType.AUX,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUX,
     )
   if exported_model_artifacts.additional_model_paths:
     ext = extension_lib.resolve_model_extension(model_cfg, export_config)
@@ -778,7 +778,7 @@ def package_model(
       if name in ext_section_types:
         model_type = ext_section_types[name]
       elif name == 'per_layer_embedder':
-        model_type = litertlm_builder.TfLiteModelType.PER_LAYER_EMBEDDER
+        model_type = llm_metadata_pb2.LlmMetadata.TF_LITE_PER_LAYER_EMBEDDER
       else:
         raise ValueError(f'Unsupported additional model type: {name}')
       builder.add_tflite_model(
