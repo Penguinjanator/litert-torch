@@ -611,6 +611,7 @@ class Qwen3_5StaticForCausalLM(nn.Module):
       past_key_values: Optional[Any] = None,
       valid_mask: Optional[torch.Tensor] = None,
       inputs_embeds: Optional[torch.Tensor] = None,
+      logits_to_keep: Union[int, torch.Tensor] = 0,
       **kwargs,
   ) -> Tuple[torch.Tensor, Optional[Any]]:
     hidden_states, past_key_values = self.model(
@@ -621,6 +622,14 @@ class Qwen3_5StaticForCausalLM(nn.Module):
         inputs_embeds=inputs_embeds,
         **kwargs,
     )
+    # Same semantics as `logits_to_keep` in HF `*ForCausalLM`: 0 keeps every
+    # position, an int N keeps the last N positions and a 1D tensor selects
+    # positions. Prefill exports pass 1, so the vocabulary-sized `lm_head` runs
+    # on the final position only instead of on every prefill position.
+    if isinstance(logits_to_keep, torch.Tensor):
+      hidden_states = hidden_states[:, logits_to_keep, :]
+    elif logits_to_keep > 0:
+      hidden_states = hidden_states[:, -logits_to_keep:, :]
     logits = self.lm_head(hidden_states)
     return logits, past_key_values
 

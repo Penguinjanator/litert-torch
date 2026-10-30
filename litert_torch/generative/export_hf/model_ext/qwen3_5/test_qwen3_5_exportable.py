@@ -243,5 +243,72 @@ class Qwen35ExportableTest(absltest.TestCase):
         torch.equal(export_generated[:, : hf_generated.shape[1]], hf_generated)
     )
 
+  def test_c_static_model_logits_to_keep(self):
+    static_model = (
+        modeling_qwen3_5_static.Qwen3_5StaticForCausalLM.from_hf_model(
+            self.hf_model
+        ).eval()
+    )
+    seq_len = 16
+    tokens = torch.randint(
+        1, self.config.vocab_size, (1, seq_len), dtype=torch.int32
+    )
+    positions = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+    keep_indices = torch.tensor([0, 5, seq_len - 1])
+
+    with torch.no_grad():
+      all_logits, _ = static_model(tokens, positions)
+      last_logits, _ = static_model(tokens, positions, logits_to_keep=1)
+      selected_logits, _ = static_model(
+          tokens, positions, logits_to_keep=keep_indices
+      )
+
+    self.assertEqual(all_logits.shape, (1, seq_len, self.config.vocab_size))
+    self.assertEqual(last_logits.shape, (1, 1, self.config.vocab_size))
+    torch.testing.assert_close(last_logits, all_logits[:, -1:, :])
+    torch.testing.assert_close(selected_logits, all_logits[:, keep_indices, :])
+
+  def test_d_prefill_logits_for_last_position_only(self):
+    export_config = exportable_module_config.ExportableModuleConfig(
+        model="qwen3_5_dummy",
+        task=exportable_module_config.ExportTask.TEXT_GENERATION,
+        batch_size=1,
+        cache_length=512,
+        prefill_lengths=[128],
+        prefill_logits=True,
+    )
+    prefill_mod = qwen3_5_exportable.LiteRTExportableModuleForQwen3_5Prefill(
+        self.hf_model, export_config
+    )
+    sample_prefill_inputs = prefill_mod.get_sample_inputs(self.config)[
+        "prefill_128"
+    ][0]
+    # Token 0 is the pad token, so keep every prompt token valid.
+    tokens = torch.randint(
+        1, self.config.vocab_size, (1, 128), dtype=torch.int32
+    )
+    input_pos = torch.arange(128, dtype=torch.int64)
+    # The sample mask is built for placeholder positions; use a causal mask for
+    # the real ones.
+    mask = qwen3_5_exportable.create_qwen3_5_attention_mask(128, 512, input_pos)
+
+    with torch.no_grad():
+      hf_out = self.hf_model(input_ids=tokens.long(), use_cache=False)
+      prefill_out = prefill_mod(
+          tokens=tokens,
+          input_pos=input_pos,
+          kv_cache=sample_prefill_inputs["kv_cache"],
+          mask=mask,
+      )
+
+    # Only the final position's logits are computed and returned.
+    self.assertEqual(
+        prefill_out["logits"].shape, (1, 1, self.config.vocab_size)
+    )
+    torch.testing.assert_close(
+        prefill_out["logits"], hf_out.logits[:, -1:, :], rtol=5e-3, atol=5e-3
+    )
+
+
 if __name__ == "__main__":
   absltest.main()
