@@ -17,9 +17,9 @@
 import litert_torch.generative.export_hf  # pylint: disable=unused-import
 from litert_torch.generative.export_hf.core import weights_loader as weights_loader_lib
 from litert_torch.generative.export_hf.model_ext import extension as extension_lib
+from litert_torch.generative.export_hf.model_ext import patches
+from litert_torch.generative.export_hf.model_ext import testing as ext_testing
 from litert_torch.generative.export_hf.model_ext.lfm2 import extension as lfm2_extension
-from litert_torch.generative.export_hf.model_ext.lfm2 import patch
-import torch
 import transformers
 from transformers.models.lfm2 import modeling_lfm2
 
@@ -59,29 +59,15 @@ class Lfm2ExtensionTest(googletest.TestCase):
         [tuple(spec) for spec in ext.fused_weight_specs],
     )
 
-  def test_weights_loader_streams_fused_gate_up_proj(self):
-    torch.manual_seed(0)
-    model = modeling_lfm2.Lfm2ForCausalLM(_get_dummy_lfm2_config()).eval()
-    ckpt_dir = self.create_tempdir().full_path
-    model.save_pretrained(ckpt_dir, safe_serialization=True)
-
-    original_mlp = model.model.layers[0].feed_forward
-    fused_mlp = patch.FusedLfm2MLP(original_mlp)
-
-    loader = weights_loader_lib.HFCheckpointWeightsLoader(
-        ckpt_dir,
-        extra_fused_specs=lfm2_extension.Lfm2Extension.fused_weight_specs,
+  def test_v2_weights_resolvable_with_all_fusions(self):
+    ext = lfm2_extension.Lfm2Extension()
+    with patches.get_patch_context("lfm2"):
+      model = modeling_lfm2.Lfm2ForCausalLM(_get_dummy_lfm2_config()).eval()
+    resolved = ext_testing.assert_v2_weights_resolvable(ext, model)
+    self.assertIn(
+        "model.model.layers.0.feed_forward.gate_up_proj.weight", resolved
     )
-    with loader:
-      # Converter V2 prefixes export-time names with the wrapper attribute.
-      torch.testing.assert_close(
-          loader("model.model.layers.0.feed_forward.gate_up_proj.weight"),
-          fused_mlp.gate_up_proj.weight.detach(),
-      )
-      torch.testing.assert_close(
-          loader("model.model.layers.0.feed_forward.w2.weight"),
-          original_mlp.w2.weight.detach(),
-      )
+    self.assertIn("model.model.layers.1.self_attn.qkv_proj.weight", resolved)
 
   def test_weights_loader_without_extension_spec_raises(self):
     model = modeling_lfm2.Lfm2ForCausalLM(_get_dummy_lfm2_config())
